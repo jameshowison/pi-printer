@@ -2,79 +2,71 @@
 
 ## Architecture
 
-- **Configured Mac/Linux clients**: filter + GS installed locally; pre-render PDF → PCL XL
-  via `gs -sDEVICE=pxlmono`; send raw PCL XL to Pi; Pi wraps with PJL header only.
-- **AirPrint / visitors**: send PDF, PostScript, or PWG Raster; Pi converts via GS
-  (`pxlmono`) and wraps with PJL header.
+- **Configured Mac/Linux clients**: filter + GS installed locally; pre-render
+  PDF → PCL 5e via `gs -sDEVICE=ljet4`; send raw PCL 5e to Pi; Pi wraps with
+  PJL header only (cost 0 passthrough via `application/vnd.hp-PCL`).
+- **AirPrint / visitors**: send PDF, PostScript, or PWG Raster; Pi converts
+  via GS (`ljet4`) and wraps with PJL header.
 
-## Open Question: PCL XL vs PCL 5e
+## PCL 5e vs PCL XL — Resolved
 
-**This is the most important unresolved issue.**
+**Resolution: PCL 5e only.** Searching the Brother PCL/PJL Technical Reference
+Manual for `PCLXL`, `PCL XL`, `PCL6`, or `Enhanced` returns zero hits in either
+chapter. Every `ENTER LANGUAGE` example uses `PCL` or `POSTSCRIPT`. Ch2 is
+titled "PCL Printer Control Language" (singular) and uses escape-sequence
+syntax (`<ESC>E` reset). The OpenPrinting "PCL6" tag for this printer means
+PCL 6 Standard = PCL 5e.
 
-The filter and PPD are built around PCL XL (PCL 6 Enhanced), using Ghostscript's `pxlmono`
-device. But "PCL6" as listed on OpenPrinting may mean PCL 6 Standard (= PCL 5e), which is
-a completely different protocol.
+Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
 
-**To verify:** Check `Tech_Manual_Ch2_PCL.md` for the HL-5070N's supported PDL.
-Specifically look for whether `@PJL ENTER LANGUAGE=PCLXL` is listed as a valid language
-value. The PJL language-switching section (Ch5 §4.6, "Printer Language Switching") will
-list accepted `ENTER LANGUAGE=` values for this printer family.
+## Implementation State
 
-**If PCL 5e only (not PCL XL):**
-- Change GS device from `pxlmono` to `ljet4` (PCL 5e)
-- PJL SET commands for PAPER/TRAY/MEDIA/COPIES remain valid
-- GS_RES reverts to plain integers (no `1200x600`)
-- PPD MIME type reverts from `application/vnd.hp-PCLXL` to something appropriate
+### Filter (`brother-hl5070n-pjl`)
 
-## Completed Fixes
+- GS device: `ljet4` (PCL 5e), resolution as plain integer (300 / 600 / 1200).
+- PJL header: `@PJL SET RESOLUTION/ECONOMODE/DUPLEX/BINDING`, then
+  `@PJL ENTER LANGUAGE=PCL`, then `<ESC>E` reset, then in-band PCL 5e
+  escapes for tray / paper / media / copies (`<ESC>&l#H/A/M/X`).
+- PJL trailer: `<ESC>E` page eject + UEL + `@PJL` + final UEL.
+- Input detection by hex magic via `od -An -tx1` (PostScript `%!`, PDF `%PDF`,
+  PWG raster `RaS2`, PCL `0x1B`).
+- AirPrint/PWG raster pipeline: `pwgtoraster` → `rastertopdf` → `gs -sDEVICE=ljet4`.
+- Working directory variable `WORK_DIR` (does not shadow `$TMPDIR`).
 
-All implemented in commit `db5ec63`:
+### PPD (`Brother-HL5070N-PCL.ppd`)
 
-| # | Severity | Fix | Status |
-|---|----------|-----|--------|
-| 1 | Critical | Replace PCL5 escape sequences + `ENTER LANGUAGE=PCL` in PJL header with `@PJL SET` commands; remove `ESC E` from trailer | Done |
-| 2 | Critical | Replace PCL5 numeric codes for paper/tray/media with PJL string values (`LETTER`, `MPTRAY`, `ENVELOPE`, etc.) | Done |
-| 3 | Critical | PPD: swap `cups-raster` for `hp-PCLXL` (cost 0) + add `pwg-raster`; filter: fix PWG raster pipeline (`pwgtoraster`→`rastertopdf`→GS); fix PCL detection with `od` hex | Done |
-| 4 | Significant | Rename `TMPDIR` → `WORK_DIR` to avoid shadowing system env var | Done |
-| 5 | Minor | `GS_RES="1200x600"` for HQ1200 mode (matches printer's 1200×600 raster geometry) | Done |
-| 6 | Minor | Remove unused `bc` dependency from filter header | Done |
-| 7 | Minor | Update README caveat: replace stale "double-reset" note with PJL SET ordering note | Done |
-
-## PJL SET Values to Verify
-
-From `Tech_Manual_Ch5_PJL.md` — confirm these string values are correct for HL-5070N:
-
-| Setting | PJL Variable | Values used in filter |
-|---------|-------------|----------------------|
-| Paper size | `PAPER` | `LETTER`, `LEGAL`, `EXECUTIVE`, `A4`, `A5`, `A6`, `COM10`, `MONARCH`, `DL`, `C5`, `B5ENVELOPE` |
-| Input tray | `SOURCETRAY` | `MPTRAY`, `TRAY1`, `TRAY2`, `MANUALFEED`, `AUTOSELECT` |
-| Media type | `MEDIATYPE` | `PLAIN`, `THIN`, `THICK`, `THICKER`, `BOND`, `ENVELOPE`, `ENVTHICK`, `ENVTHIN` |
-| Resolution | `RESOLUTION` | `300`, `600`, `1200` |
-| Duplex | `DUPLEX` | `ON`, `OFF` |
-| Binding | `BINDING` | `LONGEDGE`, `SHORTEDGE` |
-| Toner save | `ECONOMODE` | `ON`, `OFF` |
-| Copies | `COPIES` | integer |
+- `application/vnd.hp-PCL 0` — cost-0 passthrough for configured clients.
+- `application/vnd.cups-postscript 150` — PostScript via filter.
+- `application/pdf 200` — PDF via filter.
+- `image/pwg-raster 150` — AirPrint via filter.
 
 ## Verification Steps
 
-1. **Read Tech Manual** — confirm PCL XL support and PJL SET string values:
-   - `Tech_Manual_Ch5_PJL.md` §6 (Environment Commands) for SET variable names/values
-   - `Tech_Manual_Ch5_PJL.md` §4.6 for `ENTER LANGUAGE=` accepted values
-
-2. **GS smoke test** on Pi:
+1. **GS smoke test on Pi.** Confirm `ljet4` produces PCL 5e:
    ```bash
-   gs -dBATCH -dNOPAUSE -sDEVICE=pxlmono -sOutputFile=/dev/stdout image-test.pdf \
+   gs -dBATCH -dNOPAUSE -sDEVICE=ljet4 -sOutputFile=/dev/stdout image-test.pdf \
      | xxd | head
-   # Expect: 1b 25 2d 31 32 33 34 35 58 40 50 4a 4c (UEL + @PJL)
+   # Expect: 1b 45 ... (ESC E reset) followed by PCL 5e escape sequences
    ```
 
-3. **Test print** — check `/var/log/cups/error_log` for filter DEBUG lines confirming
-   resolved option values.
+2. **Test print from configured client.** Print PDF from Mac → Pi → printer.
+   Check `/var/log/cups/error_log` for `Detected input type: pcl` (passthrough)
+   and the resolved option values.
 
-4. **Test PCL passthrough** — print from configured Mac; Pi log should show
-   `Detected input type: pcl`.
+3. **Test AirPrint.** Print from iPhone. Pi log should show
+   `Detected input type: raster` (PWG) or `pdf`.
 
-5. **Test AirPrint** — print from iPhone; Pi log should show `pdf` or `raster`.
+4. **Verify each PJL setting takes effect.** If tray/paper/media options don't
+   work, the next thing to try is moving them from in-band PCL escapes to PJL
+   `SET` with the `LPARM : PCL` modifier (manual Ch5 §6, line 1010 — PCL-specific
+   variables "must be set using the LPARM : PCL option").
+
+## Open Items
+
+- `cupstestppd` reports two pre-existing PPD-spec gaps: missing `*Manufacturer`
+  and `*PSVersion`. Cosmetic; CUPS accepts the PPD without them. Worth fixing
+  if pursuing strict spec compliance.
+- `*PCFileName` warning (8.3 limit violation) — same status.
 
 ## Reference
 
