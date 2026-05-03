@@ -1,0 +1,247 @@
+#!/bin/bash
+#
+# brother-hl5070n-pjl - CUPS filter for Brother HL-5070N
+#
+# Prepends a PJL header to control toner save, resolution, duplex,
+# media type, and paper source. Converts input (PDF, PostScript, PWG
+# Raster) to PCL XL (pxlmono) via Ghostscript if needed.
+#
+# CUPS calls filters as:
+#   filter job-id user title copies options [filename]
+#
+# Install to: /usr/lib/cups/filter/brother-hl5070n-pjl
+# Permissions: chmod 755
+#
+# Dependencies: ghostscript, bc (usually pre-installed)
+
+set -euo pipefail
+
+#---- CUPS arguments ---------------------------------------------------
+JOB_ID="${1:-0}"
+USER="${2:-unknown}"
+TITLE="${3:-Untitled}"
+COPIES="${4:-1}"
+OPTIONS="${5:-}"
+INPUT="${6:-}"   # empty = read stdin
+
+#---- Logging ----------------------------------------------------------
+log() { echo "DEBUG: brother-hl5070n-pjl: $*" >&2; }
+err() { echo "ERROR: brother-hl5070n-pjl: $*" >&2; exit 1; }
+
+log "Job $JOB_ID from $USER: '$TITLE' copies=$COPIES"
+log "Options: $OPTIONS"
+
+#---- Parse CUPS options -----------------------------------------------
+# Helper: extract value for a named option from $OPTIONS
+get_opt() {
+    local key="$1" default="$2"
+    # Match key=value (case-insensitive key)
+    local val
+    val=$(echo "$OPTIONS" | grep -ioP "(?<=(^| )${key}=)\S+" | head -1 || true)
+    echo "${val:-$default}"
+}
+
+RESOLUTION=$(get_opt "Resolution" "600dpi")
+TONER_SAVE=$(get_opt "TonerSave" "OFF")
+DUPLEX=$(get_opt "Duplex" "None")
+MEDIA_TYPE=$(get_opt "MediaType" "PLAIN")
+INPUT_SLOT=$(get_opt "InputSlot" "AUTO")
+PAGE_SIZE=$(get_opt "PageSize" "Letter")
+
+# Also check IPP standard attributes and map them
+SIDES=$(get_opt "sides" "")
+PRINT_QUALITY=$(get_opt "print-quality" "")
+
+# Map IPP sides → Duplex
+if [ -n "$SIDES" ]; then
+    case "$SIDES" in
+        two-sided-long-edge)  DUPLEX="DuplexNoTumble" ;;
+        two-sided-short-edge) DUPLEX="DuplexTumble"   ;;
+        one-sided)            DUPLEX="None"            ;;
+    esac
+fi
+
+# Map IPP print-quality → TonerSave (draft = save on)
+if [ -n "$PRINT_QUALITY" ]; then
+    case "$PRINT_QUALITY" in
+        3) TONER_SAVE="ON"  ;;   # Draft
+        4) TONER_SAVE="OFF" ;;   # Normal
+        5) TONER_SAVE="OFF" ;;   # High
+    esac
+fi
+
+log "Resolved: res=$RESOLUTION toner=$TONER_SAVE duplex=$DUPLEX media=$MEDIA_TYPE slot=$INPUT_SLOT"
+
+#---- Map options to PJL values ----------------------------------------
+
+# Resolution
+case "$RESOLUTION" in
+    300dpi)  PJL_RES=300  ; GS_RES=300  ;;
+    1200dpi) PJL_RES=1200 ; GS_RES=1200 ;;
+    *)       PJL_RES=600  ; GS_RES=600  ;;
+esac
+
+# Toner save
+case "${TONER_SAVE^^}" in
+    ON|TRUE|YES) PJL_ECONOOFF="ON"  ;;
+    *)           PJL_ECONOOFF="OFF" ;;
+esac
+
+# Duplex
+case "$DUPLEX" in
+    DuplexNoTumble) PJL_DUPLEX="ON"; PJL_BINDING="LONGEDGE"  ;;
+    DuplexTumble)   PJL_DUPLEX="ON"; PJL_BINDING="SHORTEDGE" ;;
+    *)              PJL_DUPLEX="OFF"; PJL_BINDING="LONGEDGE"  ;;
+esac
+
+# Paper size → PCL page size number
+case "$PAGE_SIZE" in
+    Letter)     PCL_PAPER=2  ;;
+    Legal)      PCL_PAPER=3  ;;
+    Executive)  PCL_PAPER=1  ;;
+    A4)         PCL_PAPER=26 ;;
+    A5)         PCL_PAPER=25 ;;
+    A6)         PCL_PAPER=24 ;;
+    Env10)      PCL_PAPER=81 ;;
+    EnvMonarch) PCL_PAPER=80 ;;
+    EnvDL)      PCL_PAPER=90 ;;
+    EnvC5)      PCL_PAPER=91 ;;
+    EnvISOB5)   PCL_PAPER=100 ;;
+    *)          PCL_PAPER=2  ;;
+esac
+
+# Input slot → PCL tray number
+case "$INPUT_SLOT" in
+    MPTRAY) PCL_TRAY=2 ;;
+    TRAY1)  PCL_TRAY=4 ;;
+    TRAY2)  PCL_TRAY=5 ;;
+    MANUAL) PCL_TRAY=3 ;;
+    *)      PCL_TRAY=1 ;; # Auto
+esac
+
+# Media type → PCL media type number
+case "$MEDIA_TYPE" in
+    THIN)       PCL_MEDIA=2 ;;
+    THICK)      PCL_MEDIA=3 ;;
+    THICKER)    PCL_MEDIA=4 ;;
+    BOND)       PCL_MEDIA=5 ;;
+    ENV|ENVTHICK|ENVTHIN) PCL_MEDIA=6 ;;
+    *)          PCL_MEDIA=0 ;; # Plain
+esac
+
+#---- Build PJL header -------------------------------------------------
+ESC=$'\x1b'
+UEL="${ESC}%-12345X"
+CRLF=$'\r\n'
+
+build_pjl_header() {
+    printf '%s' "${UEL}"
+    printf '@PJL\r\n'
+    printf '@PJL SET RESOLUTION=%s\r\n'  "$PJL_RES"
+    printf '@PJL SET ECONOMODE=%s\r\n'   "$PJL_ECONOOFF"
+    printf '@PJL SET DUPLEX=%s\r\n'      "$PJL_DUPLEX"
+    if [ "$PJL_DUPLEX" = "ON" ]; then
+        printf '@PJL SET BINDING=%s\r\n' "$PJL_BINDING"
+    fi
+    printf '@PJL ENTER LANGUAGE=PCL\r\n'
+    # PCL job setup: reset, copies, paper size, tray, media type
+    printf '%s' "${ESC}E"                          # PCL reset
+    printf '%s&l%dH' "${ESC}" "$PCL_TRAY"         # paper source
+    printf '%s&l%dA' "${ESC}" "$PCL_PAPER"         # page size
+    printf '%s&l%dM' "${ESC}" "$PCL_MEDIA"         # media type
+    printf '%s&l%dX' "${ESC}" "$COPIES"            # copy count
+}
+
+build_pjl_trailer() {
+    printf '%s' "${ESC}E"       # PCL reset / eject
+    printf '%s' "${UEL}"        # return to PJL
+    printf '@PJL\r\n'
+    printf '%s' "${UEL}"        # final UEL
+}
+
+#---- Determine input type and convert ---------------------------------
+
+# Work in a temp directory
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+INPUT_PCL="$TMPDIR/job.pcl"
+
+# Read input to a temp file so we can detect type
+if [ -n "$INPUT" ]; then
+    INPUT_RAW="$INPUT"
+else
+    INPUT_RAW="$TMPDIR/input.raw"
+    cat > "$INPUT_RAW"
+fi
+
+# Detect MIME type by magic bytes
+MAGIC=$(head -c 4 "$INPUT_RAW" | cat -v 2>/dev/null || true)
+FIRST_LINE=$(head -1 "$INPUT_RAW" 2>/dev/null || true)
+
+if echo "$FIRST_LINE" | grep -q "^%!"; then
+    INPUT_TYPE="postscript"
+elif echo "$FIRST_LINE" | grep -q "^%PDF"; then
+    INPUT_TYPE="pdf"
+elif echo "$MAGIC" | grep -q "RaS2"; then
+    INPUT_TYPE="raster"
+elif echo "$FIRST_LINE" | grep -q "^ESC\|^\x1b"; then
+    INPUT_TYPE="pcl"
+else
+    # Default assumption for unknown: try as PostScript
+    INPUT_TYPE="postscript"
+fi
+
+log "Detected input type: $INPUT_TYPE"
+
+# Convert to raw PCL XL raster using Ghostscript if needed
+case "$INPUT_TYPE" in
+    postscript|pdf)
+        log "Converting $INPUT_TYPE → PCL via Ghostscript (pxlmono) at ${GS_RES}dpi"
+        gs \
+            -dBATCH -dNOPAUSE -dSAFER \
+            -sDEVICE=pxlmono \
+            -r"${GS_RES}" \
+            -dNumCopies=1 \
+            -sOutputFile="$INPUT_PCL" \
+            "$INPUT_RAW" \
+            2>&1 | while IFS= read -r line; do log "gs: $line"; done
+        # Ghostscript generates its own PJL/PCL headers in pxlmono output,
+        # so we inject our PJL *before* the GS output (UEL resets state first)
+        OUTPUT_FILE="$TMPDIR/final.pcl"
+        build_pjl_header > "$OUTPUT_FILE"
+        cat "$INPUT_PCL" >> "$OUTPUT_FILE"
+        build_pjl_trailer >> "$OUTPUT_FILE"
+        cat "$OUTPUT_FILE"
+        ;;
+    raster)
+        # PWG Raster - convert via Ghostscript pwgraster input device
+        log "Converting PWG Raster → PCL via Ghostscript at ${GS_RES}dpi"
+        gs \
+            -dBATCH -dNOPAUSE -dSAFER \
+            -sDEVICE=pxlmono \
+            -r"${GS_RES}" \
+            -dNumCopies=1 \
+            -sOutputFile="$INPUT_PCL" \
+            -sDEFAULTPAPERSIZE="$PAGE_SIZE" \
+            "$INPUT_RAW" \
+            2>&1 | while IFS= read -r line; do log "gs: $line"; done
+        OUTPUT_FILE="$TMPDIR/final.pcl"
+        build_pjl_header > "$OUTPUT_FILE"
+        cat "$INPUT_PCL" >> "$OUTPUT_FILE"
+        build_pjl_trailer >> "$OUTPUT_FILE"
+        cat "$OUTPUT_FILE"
+        ;;
+    pcl)
+        # Already PCL - just wrap with PJL header
+        log "Input is PCL - wrapping with PJL header only"
+        build_pjl_header
+        cat "$INPUT_RAW"
+        build_pjl_trailer
+        ;;
+    *)
+        err "Unknown input type, cannot process job"
+        ;;
+esac
+
+log "Job $JOB_ID complete"

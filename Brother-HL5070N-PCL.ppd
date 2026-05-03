@@ -1,0 +1,168 @@
+*PPD-Adobe: "4.3"
+*%================================================
+*%  Brother HL-5070N - Custom PCL/PJL Driver
+*%  Designed for Raspberry Pi CUPS print server
+*%  Rendering: host-side (Ghostscript pxlmono)
+*%  Printer control: PJL commands in job header
+*%================================================
+
+*FormatVersion: "4.3"
+*FileVersion: "1.00"
+*LanguageEncoding: ISOLatin1
+*LanguageVersion: English
+*PCFileName: "BRHL5070N_PCL.PPD"
+*Product: "(Brother HL-5070N series)"
+*ModelName: "Brother HL-5070N PCL"
+*NickName: "Brother HL-5070N PCL (PJL)"
+*ShortNickName: "Brother HL-5070N PCL"
+
+*%==== CUPS Filter ============================
+*% This filter handles: PWG Raster, PDF, PostScript → PCL via Ghostscript
+*cupsVersion: 1.1
+*cupsManualCopies: True
+*cupsModelNumber: 71
+*cupsFilter: "application/vnd.cups-raster 100 brother-hl5070n-pjl"
+*cupsFilter: "application/vnd.cups-postscript 150 brother-hl5070n-pjl"
+*cupsFilter: "application/pdf 200 brother-hl5070n-pjl"
+
+*%==== Basic Device Capabilities ==============
+*LanguageLevel: "3"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*FileSystem: False
+*Throughput: "16"
+*FreeVM: "1700000"
+
+*%==== Installable Options ====================
+*OpenGroup: InstallableOptions/Options Installed
+*OpenUI *OptionTrays/Number of Input Trays: PickOne
+*DefaultOptionTrays: 2Trays
+*OptionTrays 1Trays/1 Tray: ""
+*OptionTrays 2Trays/2 Trays: ""
+*CloseUI: *OptionTrays
+*CloseGroup: InstallableOptions
+
+*UIConstraints: *OptionTrays 1Trays *InputSlot TRAY2
+
+*%==== Paper Sizes ============================
+*OpenUI *PageSize: PickOne
+*OrderDependency: 30 AnySetup *PageSize
+*DefaultPageSize: Letter
+*PageSize Letter/Letter: ""
+*PageSize Legal/Legal: ""
+*PageSize Executive/Executive: ""
+*PageSize A4/A4: ""
+*PageSize A5/A5: ""
+*PageSize A6/A6: ""
+*PageSize Env10/Com-10 Envelope: ""
+*PageSize EnvMonarch/Monarch Envelope: ""
+*PageSize EnvDL/DL Envelope: ""
+*PageSize EnvC5/C5 Envelope: ""
+*PageSize EnvISOB5/B5 Envelope: ""
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion: PickOne
+*OrderDependency: 40 AnySetup *PageRegion
+*DefaultPageRegion: Letter
+*PageRegion Letter/Letter: ""
+*PageRegion Legal/Legal: ""
+*PageRegion Executive/Executive: ""
+*PageRegion A4/A4: ""
+*PageRegion A5/A5: ""
+*PageRegion A6/A6: ""
+*PageRegion Env10/Com-10 Envelope: ""
+*PageRegion EnvMonarch/Monarch Envelope: ""
+*PageRegion EnvDL/DL Envelope: ""
+*PageRegion EnvC5/C5 Envelope: ""
+*PageRegion EnvISOB5/B5 Envelope: ""
+*CloseUI: *PageRegion
+
+*DefaultImageableArea: Letter
+*ImageableArea Letter/Letter:       "18 12 594 780"
+*ImageableArea Legal/Legal:         "18 12 594 996"
+*ImageableArea Executive/Executive: "18 12 504 744"
+*ImageableArea A4/A4:               "18 12 577 830"
+*ImageableArea A5/A5:               "18 12 403 583"
+*ImageableArea A6/A6:               "18 12 279 408"
+*ImageableArea Env10/Com-10:        "18 12 279 672"
+*ImageableArea EnvMonarch/Monarch:  "18 12 261 528"
+*ImageableArea EnvDL/DL:            "18 12 294 612"
+*ImageableArea EnvC5/C5:            "18 12 441 637"
+*ImageableArea EnvISOB5/B5:         "18 12 463 697"
+
+*DefaultPaperDimension: Letter
+*PaperDimension Letter/Letter:       "612 792"
+*PaperDimension Legal/Legal:         "612 1008"
+*PaperDimension Executive/Executive: "522 756"
+*PaperDimension A4/A4:               "595 842"
+*PaperDimension A5/A5:               "420 595"
+*PaperDimension A6/A6:               "297 420"
+*PaperDimension Env10/Com-10:        "297 684"
+*PaperDimension EnvMonarch/Monarch:  "279 540"
+*PaperDimension EnvDL/DL:            "312 624"
+*PaperDimension EnvC5/C5:            "459 649"
+*PaperDimension EnvISOB5/B5:         "499 709"
+
+*%==== Input Tray / Media Type ================
+*OpenUI *InputSlot/Paper Source: PickOne
+*OrderDependency: 29 AnySetup *InputSlot
+*DefaultInputSlot: AUTO
+*InputSlot AUTO/Auto Select: ""
+*InputSlot MPTRAY/MP Tray: ""
+*InputSlot TRAY1/Tray 1: ""
+*InputSlot TRAY2/Tray 2: ""
+*InputSlot MANUAL/Manual Feed: ""
+*CloseUI: *InputSlot
+
+*OpenUI *MediaType/Media Type: PickOne
+*OrderDependency: 28 AnySetup *MediaType
+*DefaultMediaType: PLAIN
+*MediaType PLAIN/Plain Paper: ""
+*MediaType THIN/Thin Paper: ""
+*MediaType THICK/Thick Paper: ""
+*MediaType THICKER/Thicker Paper: ""
+*MediaType BOND/Bond Paper: ""
+*MediaType ENV/Envelopes: ""
+*MediaType ENVTHICK/Thick Envelopes: ""
+*MediaType ENVTHIN/Thin Envelopes: ""
+*CloseUI: *MediaType
+
+*%==== Resolution =============================
+*OpenUI *Resolution/Resolution: PickOne
+*OrderDependency: 11 AnySetup *Resolution
+*DefaultResolution: 600dpi
+*Resolution 300dpi/300 dpi: ""
+*Resolution 600dpi/600 dpi: ""
+*Resolution 1200dpi/HQ1200 (2400x600): ""
+*CloseUI: *Resolution
+
+*%==== Toner Save =============================
+*OpenUI *TonerSave/Toner Save: PickOne
+*OrderDependency: 10 AnySetup *TonerSave
+*DefaultTonerSave: OFF
+*TonerSave OFF/Off: ""
+*TonerSave ON/On: ""
+*CloseUI: *TonerSave
+
+*%==== Duplex =================================
+*OpenUI *Duplex/Two-Sided Printing: PickOne
+*OrderDependency: 20 AnySetup *Duplex
+*DefaultDuplex: None
+*Duplex None/Off (Single-Sided): ""
+*Duplex DuplexNoTumble/Long Edge (Portrait): ""
+*Duplex DuplexTumble/Short Edge (Landscape): ""
+*CloseUI: *Duplex
+
+*%==== IPP/AirPrint attribute hints ==========
+*% These allow AirPrint clients to see capabilities
+*cupsIPPSupplied: True
+*cupsSides: two-sided-long-edge two-sided-short-edge one-sided
+
+*%==== Default Font ===========================
+*DefaultFont: Courier
+*Font Courier: Standard "(002.004S)" Standard ROM
+*Font Helvetica: Standard "(001.006S)" Standard ROM
+*Font Times-Roman: Standard "(001.007S)" Standard ROM
+*Font Symbol: Special "(001.007S)" Special ROM
+
+*% End of PPD
