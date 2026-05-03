@@ -4,7 +4,7 @@
 #
 # Prepends a PJL header to control toner save, resolution, duplex,
 # media type, and paper source. Converts input (PDF, PostScript, PWG
-# Raster) to PCL XL (pxlmono) via Ghostscript if needed.
+# Raster) to PCL 5e (ljet4) via Ghostscript if needed.
 #
 # CUPS calls filters as:
 #   filter job-id user title copies options [filename]
@@ -77,7 +77,7 @@ log "Resolved: res=$RESOLUTION toner=$TONER_SAVE duplex=$DUPLEX media=$MEDIA_TYP
 # Resolution
 case "$RESOLUTION" in
     300dpi)  PJL_RES=300  ; GS_RES=300        ;;
-    1200dpi) PJL_RES=1200 ; GS_RES="1200x600" ;;
+    1200dpi) PJL_RES=1200 ; GS_RES=1200       ;;
     *)       PJL_RES=600  ; GS_RES=600        ;;
 esac
 
@@ -94,41 +94,39 @@ case "$DUPLEX" in
     *)              PJL_DUPLEX="OFF"; PJL_BINDING="LONGEDGE"   ;;
 esac
 
-# Paper size → PJL paper name
+# Paper size → PCL page size number
 case "$PAGE_SIZE" in
-    Letter)     PJL_PAPER="LETTER"     ;;
-    Legal)      PJL_PAPER="LEGAL"      ;;
-    Executive)  PJL_PAPER="EXECUTIVE"  ;;
-    A4)         PJL_PAPER="A4"         ;;
-    A5)         PJL_PAPER="A5"         ;;
-    A6)         PJL_PAPER="A6"         ;;
-    Env10)      PJL_PAPER="COM10"      ;;
-    EnvMonarch) PJL_PAPER="MONARCH"    ;;
-    EnvDL)      PJL_PAPER="DL"         ;;
-    EnvC5)      PJL_PAPER="C5"         ;;
-    EnvISOB5)   PJL_PAPER="B5ENVELOPE" ;;
-    *)          PJL_PAPER="LETTER"     ;;
+    Letter)     PCL_PAPER=2  ;;
+    Legal)      PCL_PAPER=3  ;;
+    Executive)  PCL_PAPER=1  ;;
+    A4)         PCL_PAPER=26 ;;
+    A5)         PCL_PAPER=25 ;;
+    A6)         PCL_PAPER=24 ;;
+    Env10)      PCL_PAPER=81 ;;
+    EnvMonarch) PCL_PAPER=80 ;;
+    EnvDL)      PCL_PAPER=90 ;;
+    EnvC5)      PCL_PAPER=91 ;;
+    EnvISOB5)   PCL_PAPER=100 ;;
+    *)          PCL_PAPER=2  ;;
 esac
 
-# Input slot → PJL tray name
+# Input slot → PCL tray number
 case "$INPUT_SLOT" in
-    MPTRAY) PJL_TRAY="MPTRAY"     ;;
-    TRAY1)  PJL_TRAY="TRAY1"      ;;
-    TRAY2)  PJL_TRAY="TRAY2"      ;;
-    MANUAL) PJL_TRAY="MANUALFEED" ;;
-    *)      PJL_TRAY="AUTOSELECT" ;;
+    MPTRAY) PCL_TRAY=2 ;;
+    TRAY1)  PCL_TRAY=4 ;;
+    TRAY2)  PCL_TRAY=5 ;;
+    MANUAL) PCL_TRAY=3 ;;
+    *)      PCL_TRAY=1 ;; # Auto
 esac
 
-# Media type → PJL media type name
+# Media type → PCL media type number
 case "$MEDIA_TYPE" in
-    THIN)     PJL_MEDIA="THIN"     ;;
-    THICK)    PJL_MEDIA="THICK"    ;;
-    THICKER)  PJL_MEDIA="THICKER"  ;;
-    BOND)     PJL_MEDIA="BOND"     ;;
-    ENV)      PJL_MEDIA="ENVELOPE" ;;
-    ENVTHICK) PJL_MEDIA="ENVTHICK" ;;
-    ENVTHIN)  PJL_MEDIA="ENVTHIN"  ;;
-    *)        PJL_MEDIA="PLAIN"    ;;
+    THIN)                 PCL_MEDIA=2 ;;
+    THICK)                PCL_MEDIA=3 ;;
+    THICKER)              PCL_MEDIA=4 ;;
+    BOND)                 PCL_MEDIA=5 ;;
+    ENV|ENVTHICK|ENVTHIN) PCL_MEDIA=6 ;;
+    *)                    PCL_MEDIA=0 ;; # Plain
 esac
 
 #---- Build PJL header -------------------------------------------------
@@ -144,17 +142,20 @@ build_pjl_header() {
     if [ "$PJL_DUPLEX" = "ON" ]; then
         printf '@PJL SET BINDING=%s\r\n' "$PJL_BINDING"
     fi
-    printf '@PJL SET PAPER=%s\r\n'      "$PJL_PAPER"
-    printf '@PJL SET SOURCETRAY=%s\r\n' "$PJL_TRAY"
-    printf '@PJL SET MEDIATYPE=%s\r\n'  "$PJL_MEDIA"
-    printf '@PJL SET COPIES=%s\r\n'     "$COPIES"
-    # PCL XL data that follows provides its own @PJL ENTER LANGUAGE=PCLXL
+    printf '@PJL ENTER LANGUAGE=PCL\r\n'
+    # PCL job setup: reset, copies, paper size, tray, media type
+    printf '%s' "${ESC}E"                   # PCL reset
+    printf '%s&l%dH' "${ESC}" "$PCL_TRAY"   # paper source
+    printf '%s&l%dA' "${ESC}" "$PCL_PAPER"  # page size
+    printf '%s&l%dM' "${ESC}" "$PCL_MEDIA"  # media type
+    printf '%s&l%dX' "${ESC}" "$COPIES"     # copy count
 }
 
 build_pjl_trailer() {
-    printf '%s' "${UEL}"   # return to PJL
+    printf '%s' "${ESC}E"   # PCL reset / eject
+    printf '%s' "${UEL}"    # return to PJL
     printf '@PJL\r\n'
-    printf '%s' "${UEL}"   # final UEL
+    printf '%s' "${UEL}"    # final UEL
 }
 
 #---- Determine input type and convert ---------------------------------
@@ -194,20 +195,20 @@ fi
 
 log "Detected input type: $INPUT_TYPE"
 
-# Convert to raw PCL XL raster using Ghostscript if needed
+# Convert to raw PCL 5e using Ghostscript if needed
 case "$INPUT_TYPE" in
     postscript|pdf)
-        log "Converting $INPUT_TYPE → PCL via Ghostscript (pxlmono) at ${GS_RES}dpi"
+        log "Converting $INPUT_TYPE → PCL 5e via Ghostscript (ljet4) at ${GS_RES}dpi"
         gs \
             -dBATCH -dNOPAUSE -dSAFER \
-            -sDEVICE=pxlmono \
+            -sDEVICE=ljet4 \
             -r"${GS_RES}" \
             -dNumCopies=1 \
             -sOutputFile="$INPUT_PCL" \
             "$INPUT_RAW" \
             2>&1 | while IFS= read -r line; do log "gs: $line"; done
-        # Ghostscript pxlmono output starts with its own UEL + @PJL ENTER LANGUAGE=PCLXL,
-        # so our SET commands precede it correctly after the opening UEL.
+        # Ghostscript ljet4 output begins with its own ESC E reset and PCL 5e
+        # data; our PJL header + ENTER LANGUAGE=PCL precedes it.
         OUTPUT_FILE="$WORK_DIR/final.pcl"
         build_pjl_header > "$OUTPUT_FILE"
         cat "$INPUT_PCL" >> "$OUTPUT_FILE"
@@ -215,8 +216,8 @@ case "$INPUT_TYPE" in
         cat "$OUTPUT_FILE"
         ;;
     raster)
-        # PWG Raster → CUPS Raster → PDF → PCL XL via cups-filters + Ghostscript
-        log "Converting PWG Raster → PCL via cups-filters + Ghostscript at ${GS_RES}dpi"
+        # PWG Raster → CUPS Raster → PDF → PCL 5e via cups-filters + Ghostscript
+        log "Converting PWG Raster → PCL 5e via cups-filters + Ghostscript (ljet4) at ${GS_RES}dpi"
         TMPRAS="$WORK_DIR/input.ras"
         TMPPDF="$WORK_DIR/input.pdf"
         pwgtoraster "$JOB_ID" "$USER" "$TITLE" "$COPIES" "$OPTIONS" "$INPUT_RAW" \
@@ -225,7 +226,7 @@ case "$INPUT_TYPE" in
             > "$TMPPDF" || err "rastertopdf failed; ensure cups-filters is installed"
         gs \
             -dBATCH -dNOPAUSE -dSAFER \
-            -sDEVICE=pxlmono \
+            -sDEVICE=ljet4 \
             -r"${GS_RES}" \
             -dNumCopies=1 \
             -sOutputFile="$INPUT_PCL" \
@@ -238,7 +239,7 @@ case "$INPUT_TYPE" in
         cat "$OUTPUT_FILE"
         ;;
     pcl)
-        # Already PCL XL - just wrap with PJL header
+        # Already PCL 5e - just wrap with PJL header
         log "Input is PCL - wrapping with PJL header only"
         build_pjl_header
         cat "$INPUT_RAW"
