@@ -17,13 +17,14 @@
 *ShortNickName: "Brother HL-5070N PCL"
 
 *%==== CUPS Filter ============================
-*% This filter handles: PWG Raster, PDF, PostScript → PCL via Ghostscript
+*% This filter handles: PCL XL passthrough (cost 0), PDF, PostScript, PWG Raster → PCL via Ghostscript
 *cupsVersion: 1.1
 *cupsManualCopies: True
 *cupsModelNumber: 71
-*cupsFilter: "application/vnd.cups-raster 100 brother-hl5070n-pjl"
+*cupsFilter: "application/vnd.hp-PCLXL 0 brother-hl5070n-pjl"
 *cupsFilter: "application/vnd.cups-postscript 150 brother-hl5070n-pjl"
 *cupsFilter: "application/pdf 200 brother-hl5070n-pjl"
+*cupsFilter: "image/pwg-raster 150 brother-hl5070n-pjl"
 
 *%==== Basic Device Capabilities ==============
 *LanguageLevel: "3"

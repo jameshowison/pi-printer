@@ -92,10 +92,23 @@ The filter maps standard IPP attributes automatically:
 - `avahi-daemon` — Bonjour/mDNS advertisement for AirPrint
 - `ghostscript` — PDF/PostScript/PWG Raster → PCL conversion
 
+## Reference Sources
+
+| Document | URL | Notes |
+|----------|-----|-------|
+| Brother PCL/PJL Technical Reference Manual | https://download.brother.com/welcome/doc002907/Tech_Manual_AD.pdf | PJL environment variables including `ECONOMODE`, `ECONOLEVEL`, `RESOLUTION`, `DUPLEX`, `BINDING`. Primary source for all PJL commands used in the filter. Also on ManualsLib: search "Brother PCL Technical Reference" |
+| Brother HL-5070N driver downloads | https://support.brother.com (search HL-5070N, select Linux, deb) | LPR deb, CUPSwrapper deb, CUPSwrapper source tarball, BR-Script PPD |
+| CUPSwrapper source | `brother-laser1-src-1_0_2-1_tar.gz` from above | Contains original PostScript-based PPD at `SRC/PARTS/cupswrapperHL5070N-1.0.2` — used as basis for paper sizes, imageable areas, and option names in this PPD |
+| OpenPrinting database | https://openprinting.org (search HL-5070N) | Confirms PCL6 and BR-Script3 language support; notes all special features require PJL not PCL escape sequences |
+| CUPS PPD spec | https://www.cups.org/doc/spec-ppd.html | PPD 4.3 format reference |
+| Ghostscript pxlmono device | https://ghostscript.com/docs/9.54.0/Devices.htm | PCL XL output device used for raster conversion |
+
 ## Caveats
 
 - HQ1200 mode (2400×600) will be slow to render on the Pi for complex pages;
   for best performance configure clients to send PCL directly.
-- PJL header interaction with Ghostscript's own pxlmono output may need
-  tuning — test with a simple document first and check for double-reset issues.
+- Ghostscript pxlmono output starts with its own `@PJL ENTER LANGUAGE=PCLXL`
+  line; the filter's `@PJL SET` commands precede it and should be honoured by
+  the printer, but verify with a first test print (check `/var/log/cups/error_log`
+  for the resolved option values logged by the filter).
 - Brother's LPR binary driver is not used or required.
