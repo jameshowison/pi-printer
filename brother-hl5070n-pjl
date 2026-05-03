@@ -94,39 +94,47 @@ case "$DUPLEX" in
     *)              PJL_DUPLEX="OFF"; PJL_BINDING="LONGEDGE"   ;;
 esac
 
-# Paper size → PCL page size number
+# Paper size → PJL paper name (LPARM:PCL PAPER) and Ghostscript -sPAPERSIZE
+# PJL values per Tech Manual Ch5 §2 (PCL-specific PJL variables, line 1014)
+# GS values are the standard Ghostscript paper name lowercase
 case "$PAGE_SIZE" in
-    Letter)     PCL_PAPER=2  ;;
-    Legal)      PCL_PAPER=3  ;;
-    Executive)  PCL_PAPER=1  ;;
-    A4)         PCL_PAPER=26 ;;
-    A5)         PCL_PAPER=25 ;;
-    A6)         PCL_PAPER=24 ;;
-    Env10)      PCL_PAPER=81 ;;
-    EnvMonarch) PCL_PAPER=80 ;;
-    EnvDL)      PCL_PAPER=90 ;;
-    EnvC5)      PCL_PAPER=91 ;;
-    EnvISOB5)   PCL_PAPER=100 ;;
-    *)          PCL_PAPER=2  ;;
+    Letter)     PJL_PAPER="LETTER"    ; GS_PAPER="letter"    ;;
+    Legal)      PJL_PAPER="LEGAL"     ; GS_PAPER="legal"     ;;
+    Executive)  PJL_PAPER="EXECUTIVE" ; GS_PAPER="executive" ;;
+    A4)         PJL_PAPER="A4"        ; GS_PAPER="a4"        ;;
+    A5)         PJL_PAPER="A5"        ; GS_PAPER="a5"        ;;
+    A6)         PJL_PAPER="A6"        ; GS_PAPER="a6"        ;;
+    Env10)      PJL_PAPER="COM10"     ; GS_PAPER="com10"     ;;
+    EnvMonarch) PJL_PAPER="MONARCH"   ; GS_PAPER="monarch"   ;;
+    EnvDL)      PJL_PAPER="DL"        ; GS_PAPER="dl"        ;;
+    EnvC5)      PJL_PAPER="C5"        ; GS_PAPER="c5"        ;;
+    EnvISOB5)   PJL_PAPER="B5"        ; GS_PAPER="isob5"     ;;
+    *)          PJL_PAPER="LETTER"    ; GS_PAPER="letter"    ;;
 esac
 
-# Input slot → PCL tray number
+# Input slot → PJL SOURCETRAY (Tech Manual Ch5 §1, line 803)
+# HL-5070N supports: AUTO, MPTRAY, TRAY1, TRAY2 (manual feed not documented;
+# MANUALFEED is sent on a best-effort basis)
 case "$INPUT_SLOT" in
-    MPTRAY) PCL_TRAY=2 ;;
-    TRAY1)  PCL_TRAY=4 ;;
-    TRAY2)  PCL_TRAY=5 ;;
-    MANUAL) PCL_TRAY=3 ;;
-    *)      PCL_TRAY=1 ;; # Auto
+    MPTRAY) PJL_TRAY="MPTRAY"     ;;
+    TRAY1)  PJL_TRAY="TRAY1"      ;;
+    TRAY2)  PJL_TRAY="TRAY2"      ;;
+    MANUAL) PJL_TRAY="MANUALFEED" ;;
+    *)      PJL_TRAY="AUTO"       ;;
 esac
 
-# Media type → PCL media type number
+# Media type → PJL MEDIATYPE (Tech Manual Ch5 §1, line 727)
+# HL-5070N supports: REGULAR, THICK, THICK2, TRANSPARENCY, THIN, BOND,
+# ENVELOPES, ENVTHICK, ENVTHIN
 case "$MEDIA_TYPE" in
-    THIN)                 PCL_MEDIA=2 ;;
-    THICK)                PCL_MEDIA=3 ;;
-    THICKER)              PCL_MEDIA=4 ;;
-    BOND)                 PCL_MEDIA=5 ;;
-    ENV|ENVTHICK|ENVTHIN) PCL_MEDIA=6 ;;
-    *)                    PCL_MEDIA=0 ;; # Plain
+    THIN)     PJL_MEDIA="THIN"      ;;
+    THICK)    PJL_MEDIA="THICK"     ;;
+    THICKER)  PJL_MEDIA="THICK2"    ;;
+    BOND)     PJL_MEDIA="BOND"      ;;
+    ENV)      PJL_MEDIA="ENVELOPES" ;;
+    ENVTHICK) PJL_MEDIA="ENVTHICK"  ;;
+    ENVTHIN)  PJL_MEDIA="ENVTHIN"   ;;
+    *)        PJL_MEDIA="REGULAR"   ;;
 esac
 
 #---- Build PJL header -------------------------------------------------
@@ -134,21 +142,22 @@ ESC=$'\x1b'
 UEL="${ESC}%-12345X"
 
 build_pjl_header() {
+    # PJL SET commands persist across the PCL ESC E reset that begins
+    # Ghostscript's ljet4 output, so paper/tray/media/copies set here
+    # remain in effect for the actual print data.
     printf '%s' "${UEL}"
     printf '@PJL\r\n'
-    printf '@PJL SET RESOLUTION=%s\r\n'  "$PJL_RES"
-    printf '@PJL SET ECONOMODE=%s\r\n'   "$PJL_ECONOOFF"
-    printf '@PJL SET DUPLEX=%s\r\n'      "$PJL_DUPLEX"
+    printf '@PJL SET RESOLUTION=%s\r\n'         "$PJL_RES"
+    printf '@PJL SET ECONOMODE=%s\r\n'          "$PJL_ECONOOFF"
+    printf '@PJL SET DUPLEX=%s\r\n'             "$PJL_DUPLEX"
     if [ "$PJL_DUPLEX" = "ON" ]; then
-        printf '@PJL SET BINDING=%s\r\n' "$PJL_BINDING"
+        printf '@PJL SET BINDING=%s\r\n'        "$PJL_BINDING"
     fi
+    printf '@PJL SET SOURCETRAY=%s\r\n'         "$PJL_TRAY"
+    printf '@PJL SET MEDIATYPE=%s\r\n'          "$PJL_MEDIA"
+    printf '@PJL SET COPIES=%s\r\n'             "$COPIES"
+    printf '@PJL SET LPARM : PCL PAPER=%s\r\n'  "$PJL_PAPER"
     printf '@PJL ENTER LANGUAGE=PCL\r\n'
-    # PCL job setup: reset, copies, paper size, tray, media type
-    printf '%s' "${ESC}E"                   # PCL reset
-    printf '%s&l%dH' "${ESC}" "$PCL_TRAY"   # paper source
-    printf '%s&l%dA' "${ESC}" "$PCL_PAPER"  # page size
-    printf '%s&l%dM' "${ESC}" "$PCL_MEDIA"  # media type
-    printf '%s&l%dX' "${ESC}" "$COPIES"     # copy count
 }
 
 build_pjl_trailer() {
@@ -198,17 +207,18 @@ log "Detected input type: $INPUT_TYPE"
 # Convert to raw PCL 5e using Ghostscript if needed
 case "$INPUT_TYPE" in
     postscript|pdf)
-        log "Converting $INPUT_TYPE → PCL 5e via Ghostscript (ljet4) at ${GS_RES}dpi"
+        log "Converting $INPUT_TYPE → PCL 5e via Ghostscript (ljet4) at ${GS_RES}dpi paper=$GS_PAPER"
         gs \
             -dBATCH -dNOPAUSE -dSAFER \
             -sDEVICE=ljet4 \
             -r"${GS_RES}" \
+            -sPAPERSIZE="$GS_PAPER" \
             -dNumCopies=1 \
             -sOutputFile="$INPUT_PCL" \
             "$INPUT_RAW" \
             2>&1 | while IFS= read -r line; do log "gs: $line"; done
         # Ghostscript ljet4 output begins with its own ESC E reset and PCL 5e
-        # data; our PJL header + ENTER LANGUAGE=PCL precedes it.
+        # data; our PJL SETs persist across that reset.
         OUTPUT_FILE="$WORK_DIR/final.pcl"
         build_pjl_header > "$OUTPUT_FILE"
         cat "$INPUT_PCL" >> "$OUTPUT_FILE"
@@ -217,7 +227,7 @@ case "$INPUT_TYPE" in
         ;;
     raster)
         # PWG Raster → CUPS Raster → PDF → PCL 5e via cups-filters + Ghostscript
-        log "Converting PWG Raster → PCL 5e via cups-filters + Ghostscript (ljet4) at ${GS_RES}dpi"
+        log "Converting PWG Raster → PCL 5e via cups-filters + Ghostscript (ljet4) at ${GS_RES}dpi paper=$GS_PAPER"
         TMPRAS="$WORK_DIR/input.ras"
         TMPPDF="$WORK_DIR/input.pdf"
         pwgtoraster "$JOB_ID" "$USER" "$TITLE" "$COPIES" "$OPTIONS" "$INPUT_RAW" \
@@ -228,6 +238,7 @@ case "$INPUT_TYPE" in
             -dBATCH -dNOPAUSE -dSAFER \
             -sDEVICE=ljet4 \
             -r"${GS_RES}" \
+            -sPAPERSIZE="$GS_PAPER" \
             -dNumCopies=1 \
             -sOutputFile="$INPUT_PCL" \
             "$TMPPDF" \
