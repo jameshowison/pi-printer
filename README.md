@@ -1,14 +1,13 @@
-# Brother HL-5070N PCL/PJL CUPS Driver
+# Brother HL-5170DN PCL/PJL CUPS Driver
 
-A host-side rendering CUPS driver for the Brother HL-5070N laser printer,
+A host-side rendering CUPS driver for the Brother HL-5170DN laser printer,
 designed to run on a Raspberry Pi 3B+ as a WiFi print server.
 
 ## The Problem
 
-The HL-5070N's built-in BR-Script (PostScript clone) interpreter runs on a
-slow 133MHz onboard CPU with 16MB RAM. The standard Brother CUPS driver sends
-PostScript and lets the printer RIP it, causing a long pause before the first
-page prints.
+The HL-5170DN's built-in BR-Script (PostScript clone) interpreter runs on a
+slow onboard CPU. The standard Brother CUPS driver sends PostScript and lets
+the printer RIP it, causing a long pause before the first page prints.
 
 ## The Solution
 
@@ -18,7 +17,7 @@ configured hosts), and PJL commands in the job header control printer
 features without going through BR-Script at all.
 
 ```
-Mac/Linux (configured)          Raspberry Pi 3B+           HL-5070N
+Mac/Linux (configured)          Raspberry Pi 3B+           HL-5170DN
 ┌─────────────────────┐        ┌──────────────────┐        ┌──────────┐
 │ PPD installed       │        │ CUPS + this       │        │          │
 │ Renders to PCL      │─PCL──▶│ driver            │─PCL──▶│ Prints   │
@@ -36,8 +35,8 @@ AirPrint / visitors             │ PDF/PS/PWG Raster │
 
 | File | Purpose |
 |------|---------|
-| `Brother-HL5070N-PCL.ppd` | PPD with toner save, resolution, duplex, media type, tray options |
-| `brother-hl5070n-pjl` | CUPS filter: detects input type, converts via Ghostscript, prepends PJL header |
+| `Brother-HL5170DN-PCL.ppd` | PPD with toner save, resolution, duplex, media type, tray options |
+| `brother-hl5170dn-pjl` | CUPS filter: detects input type, converts via Ghostscript, prepends PJL header |
 | `install.sh` | Sets up dependencies, installs driver, configures CUPS sharing on the Pi |
 
 ## Pi Setup
@@ -47,12 +46,12 @@ AirPrint / visitors             │ PDF/PS/PWG Raster │
 sudo bash install.sh
 
 # Add printer via http://localhost:631 → Administration → Add Printer
-# Select: Brother-HL5070N-PCL.ppd
+# Select: Brother-HL5170DN-PCL.ppd
 
-# Set queue-wide defaults (substitute your queue name for HL5070N)
-sudo lpadmin -p HL5070N -o TonerSave-default=OFF
-sudo lpadmin -p HL5070N -o Resolution-default=600dpi
-sudo lpadmin -p HL5070N -o Duplex-default=DuplexNoTumble
+# Set queue-wide defaults (substitute your queue name for HL5170DN)
+sudo lpadmin -p HL5170DN -o TonerSave-default=OFF
+sudo lpadmin -p HL5170DN -o Resolution-default=600dpi
+sudo lpadmin -p HL5170DN -o Duplex-default=DuplexNoTumble
 ```
 
 **Use `lpadmin -o KEY-default=VALUE`, not `lpoptions -o KEY=VALUE`.** They look
@@ -67,7 +66,7 @@ below.
 cupsctl WebInterface=yes
 
 # Copy PPD from Pi
-scp pi@<pi-ip>:/usr/share/cups/model/Brother-HL5070N-PCL.ppd ~/Downloads/
+scp pi@<pi-ip>:/usr/share/cups/model/Brother-HL5170DN-PCL.ppd ~/Downloads/
 ```
 
 Then visit `http://localhost:631`, add the Pi printer, and select the PPD
@@ -104,9 +103,9 @@ The filter maps standard IPP attributes automatically:
 | Document | URL | Notes |
 |----------|-----|-------|
 | Brother PCL/PJL Technical Reference Manual | https://download.brother.com/welcome/doc002907/Tech_Manual_AD.pdf | PJL environment variables including `ECONOMODE`, `ECONOLEVEL`, `RESOLUTION`, `DUPLEX`, `BINDING`. Primary source for all PJL commands used in the filter. Also on ManualsLib: search "Brother PCL Technical Reference" |
-| Brother HL-5070N driver downloads | https://support.brother.com (search HL-5070N, select Linux, deb) | LPR deb, CUPSwrapper deb, CUPSwrapper source tarball, BR-Script PPD |
-| CUPSwrapper source | `brother-laser1-src-1_0_2-1_tar.gz` from above | Contains original PostScript-based PPD at `SRC/PARTS/cupswrapperHL5070N-1.0.2` — used as basis for paper sizes, imageable areas, and option names in this PPD |
-| OpenPrinting database | https://openprinting.org (search HL-5070N) | Lists "PCL6" and BR-Script3. The Brother tech manual confirms "PCL6" here means PCL 6 Standard (= PCL 5e), not PCL XL — no `ENTER LANGUAGE=PCLXL` examples appear anywhere in the manual. |
+| Brother HL-5170DN driver downloads | https://support.brother.com (search HL-5170DN, select Linux, deb) | LPR deb, CUPSwrapper deb, CUPSwrapper source tarball, BR-Script PPD |
+| CUPSwrapper source | `brother-laser1-src-1_0_2-1_tar.gz` from above | The PPD's paper sizes, imageable areas, and option names were initially derived from the HL-5070N CUPSwrapper at `SRC/PARTS/cupswrapperHL5070N-1.0.2` (kept as the historical source — the HL-5070N and HL-5170DN share these values per Brother's PJL manual) |
+| OpenPrinting database | https://openprinting.org (search HL-5170DN) | Lists "PCL6" and BR-Script3. The Brother tech manual confirms "PCL6" here means PCL 6 Standard (= PCL 5e), not PCL XL — no `ENTER LANGUAGE=PCLXL` examples appear anywhere in the manual. |
 | CUPS PPD spec | https://www.cups.org/doc/spec-ppd.html | PPD 4.3 format reference |
 | Ghostscript ljet4 device | https://ghostscript.com/docs/9.54.0/Devices.htm | PCL 5e output device used for raster conversion |
 
@@ -147,7 +146,7 @@ sudo awk '/^<Printer NAME>/,/^<\/Printer>/' /etc/cups/printers.conf
   ```bash
   sudo cupsctl --debug-logging
   # ... print a job ...
-  grep brother-hl5070n /var/log/cups/error_log | tail -30
+  grep brother-hl5170dn /var/log/cups/error_log | tail -30
   sudo cupsctl --no-debug-logging
   ```
 
@@ -163,8 +162,8 @@ sudo awk '/^<Printer NAME>/,/^<\/Printer>/' /etc/cups/printers.conf
   grep cupsFilter /etc/cups/ppd/<queue>.ppd
   ```
 
-  Should list four lines pointing at `brother-hl5070n-pjl`. If not,
-  `sudo lpadmin -p <queue> -P /usr/share/cups/model/Brother-HL5070N-PCL.ppd`
+  Should list four lines pointing at `brother-hl5170dn-pjl`. If not,
+  `sudo lpadmin -p <queue> -P /usr/share/cups/model/Brother-HL5170DN-PCL.ppd`
   followed by `sudo systemctl restart cups`.
 
 ## Caveats

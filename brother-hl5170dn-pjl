@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# brother-hl5070n-pjl - CUPS filter for Brother HL-5070N
+# brother-hl5170dn-pjl - CUPS filter for Brother HL-5170DN
 #
 # Prepends a PJL header to control toner save, resolution, duplex,
 # media type, and paper source. Converts input (PDF, PostScript, PWG
@@ -9,7 +9,7 @@
 # CUPS calls filters as:
 #   filter job-id user title copies options [filename]
 #
-# Install to: /usr/lib/cups/filter/brother-hl5070n-pjl
+# Install to: /usr/lib/cups/filter/brother-hl5170dn-pjl
 # Permissions: chmod 755
 #
 # Dependencies: ghostscript, cups-filters
@@ -25,8 +25,8 @@ OPTIONS="${5:-}"
 INPUT="${6:-}"   # empty = read stdin
 
 #---- Logging ----------------------------------------------------------
-log() { echo "DEBUG: brother-hl5070n-pjl: $*" >&2; }
-err() { echo "ERROR: brother-hl5070n-pjl: $*" >&2; exit 1; }
+log() { echo "DEBUG: brother-hl5170dn-pjl: $*" >&2; }
+err() { echo "ERROR: brother-hl5170dn-pjl: $*" >&2; exit 1; }
 
 log "Job $JOB_ID from $USER: '$TITLE' copies=$COPIES"
 log "Options: $OPTIONS"
@@ -113,7 +113,7 @@ case "$PAGE_SIZE" in
 esac
 
 # Input slot → PJL SOURCETRAY (Tech Manual Ch5 §1, line 803)
-# HL-5070N supports: AUTO, MPTRAY, TRAY1, TRAY2 (manual feed not documented;
+# HL-5170DN supports: AUTO, MPTRAY, TRAY1, TRAY2 (manual feed not documented;
 # MANUALFEED is sent on a best-effort basis)
 case "$INPUT_SLOT" in
     MPTRAY) PJL_TRAY="MPTRAY"     ;;
@@ -124,7 +124,7 @@ case "$INPUT_SLOT" in
 esac
 
 # Media type → PJL MEDIATYPE (Tech Manual Ch5 §1, line 727)
-# HL-5070N supports: REGULAR, THICK, THICK2, TRANSPARENCY, THIN, BOND,
+# HL-5170DN supports: REGULAR, THICK, THICK2, TRANSPARENCY, THIN, BOND,
 # ENVELOPES, ENVTHICK, ENVTHIN
 case "$MEDIA_TYPE" in
     THIN)     PJL_MEDIA="THIN"      ;;

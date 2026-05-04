@@ -1,4 +1,4 @@
-# Brother HL-5070N CUPS Driver — Plan
+# Brother HL-5170DN CUPS Driver — Plan
 
 ## Architecture
 
@@ -21,7 +21,7 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
 
 ## Implementation State
 
-### Filter (`brother-hl5070n-pjl`)
+### Filter (`brother-hl5170dn-pjl`)
 
 - GS device: `ljet4` (PCL 5e), resolution as plain integer (300 / 600 / 1200).
 - PJL header: `@PJL SET RESOLUTION/ECONOMODE/DUPLEX/BINDING`, then
@@ -33,7 +33,7 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
 - AirPrint/PWG raster pipeline: `pwgtoraster` → `rastertopdf` → `gs -sDEVICE=ljet4`.
 - Working directory variable `WORK_DIR` (does not shadow `$TMPDIR`).
 
-### PPD (`Brother-HL5070N-PCL.ppd`)
+### PPD (`Brother-HL5170DN-PCL.ppd`)
 
 - `application/vnd.hp-PCL 0` — cost-0 passthrough for configured clients.
 - `application/vnd.cups-postscript 150` — PostScript via filter.
@@ -68,7 +68,7 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
 ## Operational Notes (learned from Pi-side test)
 
 - **Filter debug output requires `cupsctl --debug-logging`.** CUPS's default
-  `LogLevel warn` discards `DEBUG:`-prefixed lines, so `grep brother-hl5070n
+  `LogLevel warn` discards `DEBUG:`-prefixed lines, so `grep brother-hl5170dn
   /var/log/cups/error_log` returns nothing on a stock install. Toggle debug
   logging on while reproducing, off after.
 
@@ -85,12 +85,11 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
   in the trace, not `lpoptions -l`. README "CUPS option precedence" section
   has the full lookup order.
 
-- **Hardware identifies as HL-5170DN.** The USB device URI on the test
-  printer reports `Brother/HL-5170DN%20series`. The 5170DN is in the same
-  PJL/PCL family as the 5070N for every variable we use (Brother manual
-  groups them together at lines 727 / 803 / 1014), so the driver works
-  unchanged. Project nominally targets HL-5070N but the 5170DN is a
-  drop-in.
+- **Driver also works on HL-5070N.** The two models share the same
+  PJL/PCL vocabulary for every variable we use (Brother manual groups
+  them together at lines 727 / 803 / 1014). Project name and PPD nickname
+  target the HL-5170DN since that's the test hardware, but the 5070N is
+  a drop-in if anyone has one.
 
 ## Open Items
 
@@ -98,11 +97,6 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
   and `*PSVersion`. Cosmetic; CUPS accepts the PPD without them. Worth fixing
   if pursuing strict spec compliance.
 - `*PCFileName` warning (8.3 limit violation) — same status.
-- `install.sh` doesn't `apt install cups-filters`, but the AirPrint path
-  needs it. Add to the dependency line.
-- Project naming: PPD `*ModelName`, `*NickName`, and project README still say
-  "HL-5070N". Either rename to "HL-5070N/HL-5170DN" (covers both) or just
-  HL-5170DN if the test hardware is the canonical target.
 
 ## Reference
 
