@@ -49,11 +49,16 @@ sudo bash install.sh
 # Add printer via http://localhost:631 → Administration → Add Printer
 # Select: Brother-HL5070N-PCL.ppd
 
-# Set defaults
-lpoptions -p HL5070N -o TonerSave=OFF
-lpoptions -p HL5070N -o Resolution=600dpi
-lpoptions -p HL5070N -o Duplex=None
+# Set queue-wide defaults (substitute your queue name for HL5070N)
+sudo lpadmin -p HL5070N -o TonerSave-default=OFF
+sudo lpadmin -p HL5070N -o Resolution-default=600dpi
+sudo lpadmin -p HL5070N -o Duplex-default=DuplexNoTumble
 ```
+
+**Use `lpadmin -o KEY-default=VALUE`, not `lpoptions -o KEY=VALUE`.** They look
+similar but `lpoptions` writes to `/etc/cups/lpoptions` (or `~/.cups/lpoptions`)
+which takes precedence over the queue default. See "CUPS option precedence"
+below.
 
 ## Mac Setup (for full option control)
 
@@ -89,6 +94,8 @@ The filter maps standard IPP attributes automatically:
 ## Dependencies
 
 - `cups` — print server and filter infrastructure
+- `cups-filters` — provides `pwgtoraster` and `rastertopdf` used by the AirPrint
+  PWG-raster path
 - `avahi-daemon` — Bonjour/mDNS advertisement for AirPrint
 - `ghostscript` — PDF/PostScript/PWG Raster → PCL conversion
 
@@ -103,13 +110,71 @@ The filter maps standard IPP attributes automatically:
 | CUPS PPD spec | https://www.cups.org/doc/spec-ppd.html | PPD 4.3 format reference |
 | Ghostscript ljet4 device | https://ghostscript.com/docs/9.54.0/Devices.htm | PCL 5e output device used for raster conversion |
 
+## CUPS option precedence
+
+When CUPS resolves an option value for a job, it walks this list and uses
+the first hit:
+
+1. Per-job options on the command line (`lp -o Duplex=None …`)
+2. The submitting user's `~/.cups/lpoptions`
+3. The system-wide `/etc/cups/lpoptions` (written by `sudo lpoptions -o …`)
+4. The `Option KEY VALUE` lines for the queue in `/etc/cups/printers.conf`
+   (written by `sudo lpadmin -p NAME -o KEY-default=VALUE`)
+5. The PPD's `*Default<Key>: …` line
+
+The trap: `sudo lpoptions -p NAME -o Duplex=None` and
+`sudo lpadmin -p NAME -o Duplex-default=None` both look like they set
+"the queue default", but `lpoptions` writes a system-wide override at
+level 3 that beats anything `lpadmin` puts at level 4. Always use
+`lpadmin -o KEY-default=VALUE` for queue defaults.
+
+Diagnosing a stuck default: the truth lives in the filter trace under
+`Resolved: …` (see Troubleshooting below), not in `lpoptions -l` output.
+If the filter sees the wrong value, inspect the lookup chain in order:
+
+```bash
+cat ~/.cups/lpoptions 2>/dev/null
+sudo cat /etc/cups/lpoptions 2>/dev/null
+sudo awk '/^<Printer NAME>/,/^<\/Printer>/' /etc/cups/printers.conf
+```
+
+## Troubleshooting
+
+- **See what the filter is doing.** The filter logs DEBUG-prefixed lines, but
+  CUPS's default `LogLevel warn` doesn't capture them. Turn on debug logging
+  before reproducing the issue:
+
+  ```bash
+  sudo cupsctl --debug-logging
+  # ... print a job ...
+  grep brother-hl5070n /var/log/cups/error_log | tail -30
+  sudo cupsctl --no-debug-logging
+  ```
+
+  Toggling `cupsctl` triggers a CUPS reconfigure that briefly takes the queue
+  offline. If `lp` returns "The printer or class does not exist" right after
+  `cupsctl --debug-logging`, wait a couple of seconds and retry — your `lp`
+  command landed in the reload window.
+
+- **Confirm the active filter chain.** If the trace shows nothing at all, the
+  queue may still be using the previous PPD/driver:
+
+  ```bash
+  grep cupsFilter /etc/cups/ppd/<queue>.ppd
+  ```
+
+  Should list four lines pointing at `brother-hl5070n-pjl`. If not,
+  `sudo lpadmin -p <queue> -P /usr/share/cups/model/Brother-HL5070N-PCL.ppd`
+  followed by `sudo systemctl restart cups`.
+
 ## Caveats
 
 - HQ1200 mode (2400×600) will be slow to render on the Pi for complex pages;
   for best performance configure clients to send PCL directly.
-- The filter emits `@PJL SET` commands (RESOLUTION, ECONOMODE, DUPLEX,
-  BINDING) before `@PJL ENTER LANGUAGE=PCL`; tray, paper size, media type,
-  and copies are sent in-band as PCL 5e escape sequences after the language
-  switch. If a setting doesn't take effect, check `/var/log/cups/error_log`
-  for the resolved option values logged by the filter.
+- The filter sets paper, tray, media type, and copies via `@PJL SET`
+  (with `LPARM : PCL` for `PAPER` per Brother manual Ch5 §2). PJL settings
+  persist across the PCL `<ESC>E` reset that begins Ghostscript's `ljet4`
+  output, so they remain in effect for the actual print data. If a setting
+  doesn't take effect, check `/var/log/cups/error_log` for the resolved
+  option values (see Troubleshooting).
 - Brother's LPR binary driver is not used or required.

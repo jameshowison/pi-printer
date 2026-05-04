@@ -42,24 +42,55 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
 
 ## Verification Steps
 
-1. **GS smoke test on Pi.** Confirm `ljet4` produces PCL 5e:
+1. **GS smoke test on Pi** — done. `ljet4` produces canonical PCL 5e (`1b 45`
+   ESC E reset, `1b 26 6c …` `<ESC>&l…` page setup, delta-row compressed
+   raster). Use `-q` to suppress the GS banner, which otherwise lands in
+   stdout and contaminates the dump:
    ```bash
-   gs -dBATCH -dNOPAUSE -sDEVICE=ljet4 -sOutputFile=/dev/stdout image-test.pdf \
+   gs -q -dBATCH -dNOPAUSE -sDEVICE=ljet4 -sOutputFile=/dev/stdout test.pdf \
      | xxd | head
-   # Expect: 1b 45 ... (ESC E reset) followed by PCL 5e escape sequences
    ```
 
-2. **Test print from configured client.** Print PDF from Mac → Pi → printer.
-   Check `/var/log/cups/error_log` for `Detected input type: pcl` (passthrough)
-   and the resolved option values.
+2. **Pi-side print test** — done. Job submitted via `lp -d <queue> file.pdf`,
+   filter trace shows `Detected input type: pdf` → `Converting pdf → PCL 5e
+   via Ghostscript (ljet4) at 600dpi paper=letter` → `Job N complete`. Pages
+   print on the physical printer.
 
-3. **Test AirPrint.** Print from iPhone. Pi log should show
-   `Detected input type: raster` (PWG) or `pdf`.
+3. **Test print from configured Mac client.** Print PDF from Mac → Pi → printer.
+   With Path A setup (Pi does the rendering), Pi log should show
+   `Detected input type: pdf`. With Path B (Mac pre-renders), Pi log should
+   show `Detected input type: pcl` (cost-0 passthrough).
 
-4. **Verify each PJL setting takes effect.** If tray/paper/media options don't
-   work, the next thing to try is moving them from in-band PCL escapes to PJL
-   `SET` with the `LPARM : PCL` modifier (manual Ch5 §6, line 1010 — PCL-specific
-   variables "must be set using the LPARM : PCL option").
+4. **Test AirPrint.** Print from iPhone. Pi log should show
+   `Detected input type: raster` (PWG) or `pdf`. Requires `cups-filters`
+   installed on the Pi for `pwgtoraster` / `rastertopdf`.
+
+## Operational Notes (learned from Pi-side test)
+
+- **Filter debug output requires `cupsctl --debug-logging`.** CUPS's default
+  `LogLevel warn` discards `DEBUG:`-prefixed lines, so `grep brother-hl5070n
+  /var/log/cups/error_log` returns nothing on a stock install. Toggle debug
+  logging on while reproducing, off after.
+
+- **`cupsctl` toggling restarts CUPS.** `lp` commands issued in the ~1–2s
+  reload window get rejected with "The printer or class does not exist."
+  Either `sleep 2` after `cupsctl`, or leave debug logging on for the test
+  session.
+
+- **Use `lpadmin -o KEY-default=VALUE` for queue defaults, never
+  `lpoptions -o KEY=VALUE`.** `sudo lpoptions` writes to
+  `/etc/cups/lpoptions` (a system-wide override) which silently beats the
+  queue default in `/etc/cups/printers.conf`. The filter sees whichever
+  the resolution chain ends up at; check it with the `Resolved: …` line
+  in the trace, not `lpoptions -l`. README "CUPS option precedence" section
+  has the full lookup order.
+
+- **Hardware identifies as HL-5170DN.** The USB device URI on the test
+  printer reports `Brother/HL-5170DN%20series`. The 5170DN is in the same
+  PJL/PCL family as the 5070N for every variable we use (Brother manual
+  groups them together at lines 727 / 803 / 1014), so the driver works
+  unchanged. Project nominally targets HL-5070N but the 5170DN is a
+  drop-in.
 
 ## Open Items
 
@@ -67,6 +98,11 @@ Implemented in commit `7be63fc` (Switch from PCL XL to PCL 5e).
   and `*PSVersion`. Cosmetic; CUPS accepts the PPD without them. Worth fixing
   if pursuing strict spec compliance.
 - `*PCFileName` warning (8.3 limit violation) — same status.
+- `install.sh` doesn't `apt install cups-filters`, but the AirPrint path
+  needs it. Add to the dependency line.
+- Project naming: PPD `*ModelName`, `*NickName`, and project README still say
+  "HL-5070N". Either rename to "HL-5070N/HL-5170DN" (covers both) or just
+  HL-5170DN if the test hardware is the canonical target.
 
 ## Reference
 
