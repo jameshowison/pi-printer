@@ -147,6 +147,21 @@
 *TonerSave ON/On: ""
 *CloseUI: *TonerSave
 
+*%==== Print Quality ==========================
+*% Single picker that AirPrint clients (iOS, IPP Everywhere) surface
+*% as Draft/Normal/High. The filter maps each level to a TonerSave +
+*% Resolution preset (Draft=ON+300, Normal=OFF+600, High=OFF+1200).
+*% PostScript bodies are intentionally empty — the actual mapping is
+*% applied in brother-hl5170dn-pjl, not via setpagedevice, because we
+*% emit PCL via ljet4, not CUPS Raster.
+*OpenUI *cupsPrintQuality/Print Quality: PickOne
+*OrderDependency: 30 AnySetup *cupsPrintQuality
+*DefaultcupsPrintQuality: Normal
+*cupsPrintQuality Draft/Draft: ""
+*cupsPrintQuality Normal/Normal: ""
+*cupsPrintQuality High/High: ""
+*CloseUI: *cupsPrintQuality
+
 *%==== Duplex =================================
 *OpenUI *Duplex/Two-Sided Printing: PickOne
 *OrderDependency: 20 AnySetup *Duplex

@@ -374,19 +374,42 @@ that `cups-filters` is installed and the queue is shared.
 
 | Option | Values | Default |
 |--------|--------|---------|
+| Print Quality | Draft, Normal, High | Normal |
 | Resolution | 300dpi, 600dpi, HQ1200 | 600dpi |
 | Toner Save | OFF, ON | OFF |
 | Duplex | None, Long Edge, Short Edge | None |
 | Media Type | Plain, Thin, Thick, Thicker, Bond, Envelope variants | Plain |
 | Input Slot | Auto, MP Tray, Tray 1, Tray 2, Manual | Auto |
 
+**Print Quality** is a single-picker preset that overrides both Toner Save
+and Resolution in one step:
+
+| Quality | Toner Save | Resolution |
+|---------|-----------|------------|
+| Draft   | ON        | 300dpi     |
+| Normal  | OFF       | 600dpi     |
+| High    | OFF       | HQ1200     |
+
+This is what AirPrint clients (iOS/iPadOS) surface as "Quality" in the
+print dialog. The same option is also available in the Mac print dialog
+under "Print Quality". For independent control of Toner Save and
+Resolution from the command line, use `lp -o TonerSave=… -o Resolution=…`
+without setting `cupsPrintQuality`.
+
 ## AirPrint Visitors
 
 No setup needed on visitor devices. Avahi advertises the printer via Bonjour.
 The filter maps standard IPP attributes automatically:
 
-- `print-quality=3` (Draft) → Toner Save ON
+- `print-quality=3` (Draft) → Toner Save ON, 300dpi
+- `print-quality=4` (Normal) → Toner Save OFF, 600dpi
+- `print-quality=5` (High) → Toner Save OFF, HQ1200
 - `sides=two-sided-long-edge` → Duplex long edge
+
+The PPD also declares `cupsPrintQuality` so iOS shows a Draft/Normal/High
+picker in its print dialog (Bonjour TXT record `pq=3,4,5`). The
+PPD-driven option and the raw IPP attribute are equivalent;
+`cupsPrintQuality` wins if both appear in a single job.
 
 ## Dependencies
 

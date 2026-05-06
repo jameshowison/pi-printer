@@ -71,6 +71,7 @@ PAGE_SIZE=$(get_opt "PageSize" "Letter")
 # Also check IPP standard attributes and map them
 SIDES=$(get_opt "sides" "")
 PRINT_QUALITY=$(get_opt "print-quality" "")
+CUPS_PRINT_QUALITY=$(get_opt "cupsPrintQuality" "")
 
 # Map IPP sides → Duplex
 if [ -n "$SIDES" ]; then
@@ -81,13 +82,44 @@ if [ -n "$SIDES" ]; then
     esac
 fi
 
-# Map IPP print-quality → TonerSave (draft = save on)
-if [ -n "$PRINT_QUALITY" ]; then
+# Normalize print quality from either source into a single symbolic value.
+#   cupsPrintQuality (PPD-driven, PickOne string) — set by the print dialog
+#     when the user picks Draft/Normal/High in the Mac options panel
+#   print-quality (IPP enum) — set by AirPrint clients (iOS, IPP Everywhere)
+# cupsPrintQuality wins if both are present (PPD option > raw IPP attribute).
+QUALITY=""
+if [ -n "$CUPS_PRINT_QUALITY" ]; then
+    QUALITY="$CUPS_PRINT_QUALITY"
+elif [ -n "$PRINT_QUALITY" ]; then
     case "$PRINT_QUALITY" in
-        3) TONER_SAVE="ON"  ;;   # Draft
-        4) TONER_SAVE="OFF" ;;   # Normal
-        5) TONER_SAVE="OFF" ;;   # High
+        3) QUALITY="Draft"  ;;
+        4) QUALITY="Normal" ;;
+        5) QUALITY="High"   ;;
     esac
+fi
+
+# Quality preset: each level overrides BOTH TonerSave and Resolution. This
+# is intentional — single-picker semantics (the user said "I want Draft",
+# not "I want Draft toner but 600dpi resolution"). Per-job overrides on
+# TonerSave or Resolution that conflict with the picked quality are
+# discarded; if you want independent control, drop the Quality option from
+# the job (lp -o cupsPrintQuality= or just don't set it).
+if [ -n "$QUALITY" ]; then
+    case "$QUALITY" in
+        Draft)
+            TONER_SAVE="ON"
+            RESOLUTION="300dpi"
+            ;;
+        Normal)
+            TONER_SAVE="OFF"
+            RESOLUTION="600dpi"
+            ;;
+        High)
+            TONER_SAVE="OFF"
+            RESOLUTION="1200dpi"   # PPD value for HQ1200 (2400×600)
+            ;;
+    esac
+    log "Quality preset '$QUALITY' applied: toner=$TONER_SAVE resolution=$RESOLUTION"
 fi
 
 # Coerce paper size to what's loaded (see LOADED_PAPER above). Avoids the
