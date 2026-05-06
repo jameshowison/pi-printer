@@ -30,8 +30,23 @@ echo "==> Installing Brother HL-5170DN PCL/PJL CUPS driver"
 
 # Dependencies
 # - cups-filters provides pwgtoraster and rastertopdf used by the AirPrint path
+# - libpaper-utils provides paperconfig (sets the system paper size that
+#   CUPS reads for IPP/AirPrint media-default advertisement)
 echo "--> Checking dependencies..."
-apt-get install -y cups cups-filters avahi-daemon ghostscript
+apt-get install -y cups cups-filters avahi-daemon ghostscript libpaper-utils
+
+# Raspberry Pi OS ships with /etc/papersize=a4 (UK locale defaults).
+# Set it to letter so CUPS advertises Letter as the queue's media-default
+# over IPP/AirPrint. The filter also coerces A4→Letter at render time as
+# a defense in depth, but advertising the right default avoids the
+# coercion path for AirPrint clients in the first place.
+if command -v paperconfig >/dev/null 2>&1; then
+    echo "--> Setting system papersize to letter (paperconfig)..."
+    paperconfig -p letter || true
+elif [ -w /etc/papersize ]; then
+    echo "--> Setting /etc/papersize to letter..."
+    echo letter > /etc/papersize
+fi
 
 # Clean up any orphaned files from the previous HL-5070N name
 for f in "$OLD_FILTER_DST" "$OLD_PPD_DST"; do
@@ -126,6 +141,11 @@ else
     lpadmin -p "$QUEUE_NAME" -o TonerSave-default=OFF
     lpadmin -p "$QUEUE_NAME" -o Resolution-default=600dpi
     lpadmin -p "$QUEUE_NAME" -o Duplex-default=DuplexNoTumble
+    # Pin the IPP-advertised media-default to Letter so AirPrint clients
+    # see Letter (not A4) as the queue's default size. The filter further
+    # coerces non-envelope sizes at render time via LOADED_PAPER.
+    lpadmin -p "$QUEUE_NAME" -o PageSize-default=Letter
+    lpadmin -p "$QUEUE_NAME" -o media-default=letter
 fi
 
 echo ""

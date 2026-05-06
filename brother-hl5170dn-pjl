@@ -16,6 +16,15 @@
 
 set -euo pipefail
 
+#---- Configuration ----------------------------------------------------
+# Coerce common paper sizes to LOADED_PAPER so a job requesting (e.g.) A4
+# prints on the actually-loaded Letter without the printer pausing for a
+# tray mismatch. Content is rescaled to fit via Ghostscript's PDFFitPage.
+# Envelopes pass through unchanged (they require manual loading anyway).
+# Set LOADED_PAPER='' to disable coercion entirely. Override at the
+# cupsd-environment level or by editing this default.
+LOADED_PAPER="${LOADED_PAPER:-Letter}"
+
 #---- CUPS arguments ---------------------------------------------------
 JOB_ID="${1:-0}"
 USER="${2:-unknown}"
@@ -25,8 +34,9 @@ OPTIONS="${5:-}"
 INPUT="${6:-}"   # empty = read stdin
 
 #---- Logging ----------------------------------------------------------
-log() { echo "DEBUG: brother-hl5170dn-pjl: $*" >&2; }
-err() { echo "ERROR: brother-hl5170dn-pjl: $*" >&2; exit 1; }
+log()  { echo "DEBUG: brother-hl5170dn-pjl: $*"   >&2; }
+warn() { echo "WARNING: brother-hl5170dn-pjl: $*" >&2; }
+err()  { echo "ERROR: brother-hl5170dn-pjl: $*"   >&2; exit 1; }
 
 log "Job $JOB_ID from $USER: '$TITLE' copies=$COPIES"
 log "Options: $OPTIONS"
@@ -80,7 +90,23 @@ if [ -n "$PRINT_QUALITY" ]; then
     esac
 fi
 
-log "Resolved: res=$RESOLUTION toner=$TONER_SAVE duplex=$DUPLEX media=$MEDIA_TYPE slot=$INPUT_SLOT"
+# Coerce paper size to what's loaded (see LOADED_PAPER above). Avoids the
+# printer pausing on a media mismatch when a client (e.g. an iPhone with
+# A4 as its AirPrint default) requests something we don't have loaded.
+# Envelopes are not coerced — they're a different physical media that
+# the user has to load manually anyway.
+if [ -n "$LOADED_PAPER" ]; then
+    case "$PAGE_SIZE" in
+        Letter|Legal|Executive|A4|A5|A6)
+            if [ "$PAGE_SIZE" != "$LOADED_PAPER" ]; then
+                warn "PageSize=$PAGE_SIZE coerced to $LOADED_PAPER (loaded paper); content rescaled to fit"
+                PAGE_SIZE="$LOADED_PAPER"
+            fi
+            ;;
+    esac
+fi
+
+log "Resolved: res=$RESOLUTION toner=$TONER_SAVE duplex=$DUPLEX media=$MEDIA_TYPE slot=$INPUT_SLOT paper=$PAGE_SIZE"
 
 #---- Map options to PJL values ----------------------------------------
 
@@ -218,11 +244,18 @@ log "Detected input type: $INPUT_TYPE"
 case "$INPUT_TYPE" in
     postscript|pdf)
         log "Converting $INPUT_TYPE → PCL 5e via Ghostscript (ljet4) at ${GS_RES}dpi paper=$GS_PAPER"
+        # -dFIXEDMEDIA: force the device's media size; ignore any
+        #   setpagedevice in the input that would override it.
+        # -dPDFFitPage: scale PDF content to fit the device's media size.
+        # Together these make A4 PDFs print on Letter paper (etc.)
+        # without clipping or paper-mismatch pauses.
         gs \
             -dBATCH -dNOPAUSE -dSAFER \
             -sDEVICE=ljet4 \
             -r"${GS_RES}" \
             -sPAPERSIZE="$GS_PAPER" \
+            -dFIXEDMEDIA \
+            -dPDFFitPage \
             -dNumCopies=1 \
             -sOutputFile="$INPUT_PCL" \
             "$INPUT_RAW" \
@@ -249,6 +282,8 @@ case "$INPUT_TYPE" in
             -sDEVICE=ljet4 \
             -r"${GS_RES}" \
             -sPAPERSIZE="$GS_PAPER" \
+            -dFIXEDMEDIA \
+            -dPDFFitPage \
             -dNumCopies=1 \
             -sOutputFile="$INPUT_PCL" \
             "$TMPPDF" \
