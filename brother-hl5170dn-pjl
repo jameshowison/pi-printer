@@ -35,10 +35,20 @@ log "Options: $OPTIONS"
 # Helper: extract value for a named option from $OPTIONS
 get_opt() {
     local key="$1" default="$2"
-    # Match key=value (case-insensitive key)
-    local val
-    val=$(echo "$OPTIONS" | grep -ioP "(?<=(^| )${key}=)\S+" | head -1 || true)
-    echo "${val:-$default}"
+    # Match key=value (case-insensitive key). Pure-shell to stay portable
+    # across GNU grep (Linux) and BSD grep (macOS, no -P) and across
+    # bash 3.2 (default macOS) and bash 4+.
+    local key_lc pair k v
+    key_lc=$(echo "$key" | tr '[:upper:]' '[:lower:]')
+    for pair in $OPTIONS; do
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        if [ "$(echo "$k" | tr '[:upper:]' '[:lower:]')" = "$key_lc" ]; then
+            echo "$v"
+            return
+        fi
+    done
+    echo "$default"
 }
 
 RESOLUTION=$(get_opt "Resolution" "600dpi")
@@ -81,8 +91,8 @@ case "$RESOLUTION" in
     *)       PJL_RES=600  ; GS_RES=600        ;;
 esac
 
-# Toner save
-case "${TONER_SAVE^^}" in
+# Toner save (uppercase via tr to stay bash-3.2 compatible — macOS)
+case "$(echo "$TONER_SAVE" | tr '[:lower:]' '[:upper:]')" in
     ON|TRUE|YES) PJL_ECONOOFF="ON"  ;;
     *)           PJL_ECONOOFF="OFF" ;;
 esac
