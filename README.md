@@ -37,63 +37,149 @@ AirPrint / visitors             │ PDF/PS/PWG Raster │
 |------|---------|
 | `Brother-HL5170DN-PCL.ppd` | PPD with toner save, resolution, duplex, media type, tray options |
 | `brother-hl5170dn-pjl` | CUPS filter: detects input type, converts via Ghostscript, prepends PJL header |
-| `install.sh` | Sets up dependencies, installs driver, configures CUPS sharing on the Pi |
+| `install.sh` | OS-aware installer. Linux: deps + filter + PPD + sharing + auto-discovered queue. macOS: Mac-variant PPD (cupsFilter lines stripped) + optional auto-add queue pointing at the Pi. |
 
 ## Pi Setup
 
+Plug the printer in via USB, power it on, then on the Pi:
+
 ```bash
-# On the Pi
 sudo bash install.sh
-
-# Add printer via http://localhost:631 → Administration → Add Printer
-# Select: Brother-HL5170DN-PCL.ppd
-
-# Set queue-wide defaults (substitute your queue name for HL5170DN)
-sudo lpadmin -p HL5170DN -o TonerSave-default=OFF
-sudo lpadmin -p HL5170DN -o Resolution-default=600dpi
-sudo lpadmin -p HL5170DN -o Duplex-default=DuplexNoTumble
 ```
 
-**Use `lpadmin -o KEY-default=VALUE`, not `lpoptions -o KEY=VALUE`.** They look
-similar but `lpoptions` writes to `/etc/cups/lpoptions` (or `~/.cups/lpoptions`)
-which takes precedence over the queue default. See "CUPS option precedence"
-below.
+That installs cups + cups-filters + ghostscript + avahi + libpaper-utils,
+drops the filter and PPD into the standard CUPS paths, runs
+`paperconfig -p letter`, auto-discovers the Brother USB device URI via
+`lpinfo`, adds (or updates) a shared queue named `HL5170DN`, and pins
+defaults: Letter paper, 600dpi, duplex long-edge, toner save off.
+Idempotent — safe to re-run after re-imaging.
+
+To override the queue name or USB URI:
+
+```bash
+sudo QUEUE_NAME=myprinter PRINTER_URI='usb://Brother/...' bash install.sh
+```
+
+**On queue defaults: use `lpadmin -o KEY-default=VALUE`, not
+`lpoptions -o KEY=VALUE`.** They look similar but `lpoptions` writes to
+`/etc/cups/lpoptions` (or `~/.cups/lpoptions`) which takes precedence
+over the queue default. See "CUPS option precedence" below.
 
 ## Mac Setup
 
-Two paths. Both work; the IP-tab path avoids a known macOS bug, but the Bonjour
-path is faster if you fix the URI afterwards.
+`install.sh` handles the Mac side too. From a clone of this repo on the
+Mac:
 
-### Recommended: IP tab
+```bash
+sudo PI_HOSTNAME=<pi-hostname>.local bash install.sh
+```
 
-System Settings → Printers & Scanners → Add Printer (`+`) → **IP** tab.
+That installs a Mac-variant of the PPD into `/Library/Printers/PPDs/Contents/Resources/`
+and adds a local queue pointing at the Pi via IPP. Without `PI_HOSTNAME`,
+it just installs the PPD and prints instructions for adding the queue
+manually via the GUI or `lpadmin`.
+
+**Why a Mac variant.** The PPD installed on the Mac has its
+`*cupsFilter:` lines stripped. The CUPS filter sandbox on macOS blocks
+Homebrew's `gs` from loading dylibs outside `/usr/lib` (Apple's
+`cups#4508`), so trying to run `brother-hl5170dn-pjl` on the Mac
+ends in "Filter failed". With no cupsFilter line, CUPS uses Apple's
+built-in `pstops` chain to ship PostScript to the Pi via IPP, and
+the Pi's full PPD + filter handles PCL conversion — sandbox-free,
+because Linux doesn't sandbox CUPS that way. The Mac print dialog
+still shows Toner Save / Resolution / Duplex / Media Type / Input
+Slot because their `*OpenUI` declarations stay in the PPD; CUPS
+forwards their values to the Pi as IPP attributes per job.
+
+### GUI alternatives
+
+If you'd rather avoid the script:
+
+**Recommended: IP tab.** System Settings → Printers & Scanners → Add
+Printer (`+`) → **IP** tab.
 
 - **Address:** Pi's hostname (`pi.local` style) or its IP
 - **Protocol:** Internet Printing Protocol — IPP
 - **Queue:** `printers/<your-queue-name>`
-- **Use:** "Generic PostScript Printer" works (Pi handles all rendering),
-  or "Other…" → select the PPD copied from
-  `/usr/share/cups/model/Brother-HL5170DN-PCL.ppd` for the full options
-  dialog (Toner Save, Resolution, etc.)
+- **Use:** "Other…" → select the Mac PPD at
+  `/Library/Printers/PPDs/Contents/Resources/Brother-HL5170DN-PCL.ppd`
+  (drop in via `install.sh` first). "Generic PostScript Printer" also
+  works but loses the printer-specific options dropdown.
 
-Click **Add**. Done.
-
-### Alternative: Bonjour Shared discovery
-
-Quicker but has a known macOS bug — the local queue inherits the Pi's
-underlying USB device URI instead of constructing a new IPP URI, so the
-printer appears immediately offline.
-
-System Settings → Printers & Scanners → Add Printer → first tab → pick
-the printer (shown as "Bonjour Shared"). After adding, fix the URI:
+**Alternative: Bonjour Shared.** Pick the Bonjour-shared entry on the
+first tab. Earlier macOS versions had a bug where the local queue
+inherited the Pi's `usb://` URI; if `lpstat -v <queue>` shows a `usb://`
+URI on a Mac without that printer connected, fix it with:
 
 ```bash
 sudo lpadmin -p <local-queue-name> -v \
     ipp://<pi-hostname>.local:631/printers/<pi-queue-name>
 ```
 
-Find `<local-queue-name>` with `lpstat -p`. After the URI fix, jobs will
-forward correctly.
+## Big jobs: render on Mac, send raw to Pi
+
+The Pi 3B+ is the rendering bottleneck for image-heavy or HQ1200 pages
+(see `plan.md` for the bitmap-throughput math). For those jobs you can
+render PDF → PCL on the Mac CPU and ship the already-rendered bytes
+straight through the Pi via `lp -o raw`. The Pi's filter detects PCL
+input, skips Ghostscript entirely, just wraps with the PJL header, and
+streams to USB. Mac CPU does the heavy lifting; Pi is a passthrough
+PJL wrapper.
+
+Why not let the Mac's CUPS run the filter locally? Because of the
+sandbox issue described in "Mac Setup". Rendering from a Terminal-spawned
+`gs` sidesteps the sandbox entirely — the Terminal isn't sandboxed —
+and `lp -o raw` skips the local filter chain.
+
+Drop this into your `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+# Render PDF → PCL on the Mac CPU, send raw to the Pi (no Mac-side filter)
+fastprint() {
+    if [ -z "${1:-}" ]; then
+        echo "usage: fastprint <pdf> [more pdfs...]" >&2
+        return 1
+    fi
+    local queue="${FASTPRINT_QUEUE:-HL5170DN}"
+    local resolution="${FASTPRINT_RES:-600}"
+    local paper="${FASTPRINT_PAPER:-letter}"
+    local gs="${FASTPRINT_GS:-$(command -v gs)}"
+    local pcl
+    for pdf in "$@"; do
+        pcl=$(mktemp -t fastprint).pcl
+        "$gs" -q -dBATCH -dNOPAUSE -dSAFER \
+            -sDEVICE=ljet4 -r"$resolution" -sPAPERSIZE="$paper" \
+            -dFIXEDMEDIA -dPDFFitPage \
+            -sOutputFile="$pcl" "$pdf" \
+            && lp -d "$queue" -o raw "$pcl" \
+            || echo "fastprint: failed on $pdf" >&2
+        rm -f "$pcl"
+    done
+}
+```
+
+Usage:
+
+```bash
+fastprint big-photo-document.pdf
+FASTPRINT_QUEUE=HL5170DN___tuttle_pi fastprint slides.pdf
+FASTPRINT_RES=300 fastprint draft.pdf      # half resolution, ~4× smaller PCL
+FASTPRINT_PAPER=a4 fastprint euro-form.pdf
+```
+
+For a one-off without the function, the same logic inline:
+
+```bash
+gs -q -dBATCH -dNOPAUSE -sDEVICE=ljet4 -r600 -sPAPERSIZE=letter \
+   -dFIXEDMEDIA -dPDFFitPage -sOutputFile=/tmp/job.pcl input.pdf \
+&& lp -d HL5170DN -o raw /tmp/job.pcl
+```
+
+What you give up: the macOS print dialog. fastprint is command-line
+only — no per-document margins, page-range selection, multi-up, etc.
+Use the regular print dialog (which routes through the Pi) for everyday
+text printing. Reach for fastprint only when you've watched the Pi
+struggle with a particular job and want the Mac's CPU to take over.
 
 ## Direct USB Setup (no Pi)
 
@@ -140,64 +226,90 @@ distros), add them: `sudo usermod -aG lp $USER` then re-login.
 
 ### On a Mac laptop
 
-The Mac path is mostly the same, with two macOS-specific wrinkles: filter
-location, and Ghostscript installation.
+**Constrained by the macOS CUPS filter sandbox.** Unlike Linux, macOS
+runs every CUPS filter inside a sandbox profile that blocks `dlopen()`
+of dylibs outside `/usr/lib`. Homebrew's `gs` lives at
+`/opt/homebrew/bin/gs` (or `/usr/local/bin/gs` on Intel) and depends on
+`/opt/homebrew/lib/libgs.dylib`, which the sandbox denies. Result:
+"Filter failed" on every job. See Apple's `cups#4508`. Two ways
+forward:
+
+**Option A: Sandboxing Relaxed.** Apple-supported config knob in
+`cups-files.conf` that loosens (not disables) the filter sandbox so
+filters can spawn binaries and load dylibs from non-system paths.
+After enabling, the install steps mirror the Linux laptop path above
+with macOS-specific paths.
 
 ```bash
-# Ghostscript via Homebrew (CUPS itself ships with macOS)
+sudo sh -c 'echo "Sandboxing Relaxed" >> /etc/cups/cups-files.conf'
+sudo launchctl kickstart -k system/org.cups.cupsd  # or reboot
+
+# Then install the filter, PPD, gs symlink, and queue:
+brew install ghostscript
+sudo ln -sf /opt/homebrew/bin/gs /usr/local/bin/gs   # CUPS PATH includes /usr/local/bin
+sudo install -m 755 brother-hl5170dn-pjl /usr/libexec/cups/filter/
+sudo install -m 644 Brother-HL5170DN-PCL.ppd /Library/Printers/PPDs/Contents/Resources/
+
+sudo lpinfo -v | grep -i brother    # find usb://Brother/... URI
+sudo lpadmin -p HL5170DN -E \
+    -v 'usb://Brother/HL-5170DN%20series?serial=...' \
+    -P /Library/Printers/PPDs/Contents/Resources/Brother-HL5170DN-PCL.ppd
+```
+
+Trade-off: this is a security relaxation across the entire CUPS stack
+on the Mac, not just for our printer. Reasonable for a personal
+machine, often disallowed by corporate MDM policy, and recent macOS
+versions have shown signs of breaking this workaround entirely (per
+Apple Developer Forums on Tahoe 26.2). Verify with `sw_vers` and check
+your IT policy before committing.
+
+**Option B: Skip the filter on the Mac.** Install the Mac-variant PPD
+(no `*cupsFilter:` lines) so the Mac's CUPS doesn't try to invoke the
+filter at all, then submit pre-rendered PCL via `lp -o raw` for any job
+you actually want to print. This is the same shape as the
+"Big jobs: render on Mac" section above but with the printer attached
+locally instead of via the Pi.
+
+```bash
 brew install ghostscript
 
-# Install the filter and PPD
-sudo install -m 755 brother-hl5170dn-pjl /usr/libexec/cups/filter/
-sudo install -m 644 Brother-HL5170DN-PCL.ppd /usr/share/cups/model/
+# Strip cupsFilter lines (same trick install.sh does for Pi-via-Mac)
+sed '/^\*cupsFilter:/d' Brother-HL5170DN-PCL.ppd \
+    | sudo tee /Library/Printers/PPDs/Contents/Resources/Brother-HL5170DN-PCL.ppd >/dev/null
 
-# Find the USB device URI
+# Add a USB-backed queue using the stripped PPD
 sudo lpinfo -v | grep -i brother
-#   direct usb://Brother/HL-5170DN%20series?serial=E5XXXXX
-
-# Add the queue
 sudo lpadmin -p HL5170DN -E \
-    -v 'usb://Brother/HL-5170DN%20series?serial=E5XXXXX' \
-    -P /usr/share/cups/model/Brother-HL5170DN-PCL.ppd
-
-# Queue defaults
-sudo lpadmin -p HL5170DN -o TonerSave-default=OFF
-sudo lpadmin -p HL5170DN -o Resolution-default=600dpi
-sudo lpadmin -p HL5170DN -o Duplex-default=DuplexNoTumble
+    -v 'usb://Brother/HL-5170DN%20series?serial=...' \
+    -P /Library/Printers/PPDs/Contents/Resources/Brother-HL5170DN-PCL.ppd
 ```
 
-The printer now appears in System Settings → Printers & Scanners and is
-usable from any app's print dialog.
-
-**Ghostscript path inside the filter.** CUPS runs filters as the `_cups`
-user with a minimal `PATH` that does not include Homebrew's bin directory.
-If you see "gs: command not found" in the filter trace, symlink it or
-hardcode it:
+Then a `fastprint-usb` variant of the function above that drops the
+`-d <queue>` step in favor of the same local queue:
 
 ```bash
-# Apple Silicon: gs lives in /opt/homebrew/bin/gs
-# Intel:        gs lives in /usr/local/bin/gs
-sudo ln -sf "$(which gs)" /usr/local/bin/gs
+fastprint-usb() {
+    local queue="${FASTPRINT_QUEUE:-HL5170DN}"
+    local resolution="${FASTPRINT_RES:-600}"
+    local pcl
+    pcl=$(mktemp -t fastprint-usb).pcl
+    /opt/homebrew/bin/gs -q -dBATCH -dNOPAUSE -sDEVICE=ljet4 \
+        -r"$resolution" -sPAPERSIZE=letter -dFIXEDMEDIA -dPDFFitPage \
+        -sOutputFile="$pcl" "$1" \
+    && lp -d "$queue" -o raw "$pcl"
+    rm -f "$pcl"
+}
 ```
 
-Alternatively, edit the top of `brother-hl5170dn-pjl` to set
-`PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"`.
+GUI app print dialogs won't work because there's no working filter
+chain, but command-line workflow is sound and you keep the sandbox
+strict. Best fit for "I print rarely and don't mind a one-line shell
+command for it."
 
-**SIP and the filter directory.** On some macOS configurations
-`/usr/libexec/cups/filter/` is on the read-only system volume and the
-`install` command above will fail with "Operation not permitted." The
-robust workaround is to put the filter under `/Library/Printers/` (which
-is always writable) and point the PPD at it with absolute paths:
-
-```bash
-sudo mkdir -p /Library/Printers/Brother/Filters
-sudo install -m 755 brother-hl5170dn-pjl \
-    /Library/Printers/Brother/Filters/brother-hl5170dn-pjl
-
-# Edit each *cupsFilter line in the PPD to use the absolute path, e.g.
-#   *cupsFilter: "application/pdf 200 /Library/Printers/Brother/Filters/brother-hl5170dn-pjl"
-# Do this for all four cupsFilter entries, then install the edited PPD.
-```
+**Recommendation:** if direct USB on a Mac is the actual constraint,
+strongly consider just running a small Linux box (the Pi, a NUC, or
+similar) as the print server — Linux's CUPS doesn't sandbox filters
+the same way, and the architecture in this repo is built for that.
 
 ### Sharing the laptop's printer for AirPrint
 
