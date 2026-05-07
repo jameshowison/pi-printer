@@ -155,6 +155,23 @@ outcome in this section before Phase 2 begins.
 
 ### Phase 1 — Skeleton driver: one page of text at 600 dpi
 
+**Status: complete (2026-05-07).** `text-test.pdf` prints cleanly on
+the physical HL-5170DN at 300 dpi (commit `2594fe8`). PAPPL's web admin
+UI is reachable at `http://tuttle-pi.local:8000/` after enabling the
+`_WEB_INTERFACE | _WEB_LOG | _WEB_REMOTE` SOPTIONS flags and supplying
+a non-NULL `footer_html` to `papplMainloop`. Final default resolution
+is 300 dpi (Investigation 2 finding); 600 dpi and HQ1200 deferred to
+Phases 2 and 6 respectively.
+
+Phase 1 surfaced more PAPPL bring-up gotchas than expected — the
+1.3.1 → 1.4.10 source-build upgrade, the `papplLocGetString` /
+`cupsArrayFind` / `strcmp` NULL-deref in PAPPL's default footer,
+the `_WEB_LOG` flag not registering a `/logs` route in 1.4.10, and a
+last-decimal-digit truncation bug in PAPPL's logger present in both
+1.3.1 and 1.4.10. All recorded in
+[`bring-up-notes.md`](bring-up-notes.md) so the next person hitting
+them has a head start.
+
 Smallest thing that prints. Resolves the PAPPL API shape before we
 commit to feature work. All files live in a new top-level `src/`
 directory; the repo root stays clean.
@@ -378,15 +395,52 @@ against the Investigation 1 stream byte-by-byte before changing logic.
 
 ### Phase 2 — Feature parity with the baseline filter
 
+#### 2.0 — Start here: unblock iPhone AirPrint, then add features
+
+Three small changes go first because they unblock everything else and
+two of them are one-liners:
+
+1. **Wire PDF via `papplSystemAddMIMEFilter()`** — the headline fix.
+   PAPPL 1.3.1's bring-up log said `JPEG is supported, PDF is not
+   supported`; iPhone AirPrint sends `application/pdf` for photos, so
+   this is why the iPhone test prints a blank page. PAPPL 1.4 added
+   `papplSystemAddMIMEFilter()` for exactly this case. The Ghostscript
+   Printer Application
+   ([`OpenPrinting/ghostscript-printer-app`](https://github.com/OpenPrinting/ghostscript-printer-app))
+   is the cleanest reference for the call signature and the GS
+   invocation pattern — read its filter registration first, graft into
+   our `system_cb`. Verification: reprint the iPhone photo that
+   produced a blank page in Phase 1; expect a recognisable photo on
+   paper. This also satisfies Phase 2 exit-criterion 2 (iPhone AirPrint
+   of a photo).
+2. **Drop `data->force_raster_type`** in `driver.c`. Comment out or
+   remove the `force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1`
+   line — `raster_types` alone declares what we accept, and the
+   `force_raster_type` hint's behaviour in 1.4 is unclear. If the
+   iPhone print still misbehaves after wiring PDF, this is the next
+   variable to remove.
+3. **Add a per-line trace** in `rwriteline_cb`: `if ((y % 256) == 0)
+   papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "rwriteline y=%u bytes=%u",
+   y, encoded_len);`. Two lines of code; gives us "are rasterlines
+   actually being called, and at what dimensions" visibility from
+   `runtime.log` without flooding it. Useful for the rest of Phase 2
+   and beyond.
+
+Once iPhone AirPrint of a photo prints something recognisable,
+Phase 2 feature work proper:
+
+#### 2.1 — Feature expansion
+
 Adds every IPP attribute the baseline filter respects. The PJL
 mapping table in the PRD (§"PJL command mapping") is copied verbatim
-from `brother-hl5170dn-pjl`; it's known-good against this printer.
+from `legacy/brother-hl5170dn-pjl`; it's known-good against this
+printer.
 
 - Resolutions: 300 + 600. (HQ1200 deferred to Phase 6.)
 - Media sizes: A4, A5, A6, Legal, Executive, plus envelope variants
   (DL, C5, Com10, Monarch, ISOB5).
 - Sources: `tray-1`, `by-pass-tray`, `auto`.
-- Media types: per `brother-hl5170dn-pjl`'s mapping
+- Media types: per `legacy/brother-hl5170dn-pjl`'s mapping
   (`REGULAR`, `THICK`, `THICK2`, etc.).
 - Duplex: `one-sided`, `two-sided-long-edge`, `two-sided-short-edge`.
   `BINDING` only emitted when `DUPLEX=ON`.
@@ -394,17 +448,31 @@ from `brother-hl5170dn-pjl`; it's known-good against this printer.
   (1200 nominal-only until Phase 6 confirms).
 - Copies.
 
-Exit criteria — manual test pass against:
+#### 2.2 — Phase 2 exit criteria
+
+Manual test pass against:
 
 1. `text-test.pdf` and `image-test.pdf` at 300 and 600 dpi, compared
    side-by-side with baseline output.
 2. iPhone AirPrint of a photo: confirm a single rasterisation
-   (PWG → PCL, no PDF detour) by debug-logging in `rwriteline_cb`.
-   This is the test that reproduces the iOS stall scenario from the
-   baseline; the new architecture should not exhibit it.
+   (PWG → PCL, no PDF detour) by reading the per-line trace added in
+   §2.0 step 3. This is the test that reproduces the iOS stall
+   scenario from the baseline; the new architecture (Option B
+   keepalive in PJL header + 300 dpi default) should not exhibit it.
 3. Multi-page PDF, duplex long-edge and short-edge.
 4. Mid-print job cancel: PAPPL aborts cleanly, printer is not stuck
    in a bad PJL state on the next job.
+
+#### 2.3 — Phase 3 prerequisite check
+
+Before starting Phase 3 (media substitution), confirm the job-creation
+hooks needed are present in PAPPL 1.4.10. Investigation 4's outcome
+flagged this as a re-check item: `papplJobSetState()` and the early
+job-attribute inspection point both need to exist for the
+media-coercion logic to work. Quick verification — grep
+`/usr/local/include/pappl/job.h` for `papplJobSetState` and any
+`papplPrinterSetCreateCB` / job-creation callback registrations
+before writing Phase 3 code.
 
 ### Phase 3 — Media substitution
 
@@ -568,6 +636,7 @@ From PRD §"Open questions for the implementation phase":
 |------|---------|
 | `PRD-printer-applicance-rewrite-hl5170dn-pappl-driver.md` | The spec this plan operationalises |
 | `phase-0-investigations.md` | Pi-side runbook for the four day-zero investigations. Findings get recorded inline. |
+| `bring-up-notes.md` | PAPPL 1.3/1.4 quirks and other things learned during Phase 1 implementation that aren't in the PRD or vendor manuals. |
 | `legacy/brother-hl5170dn-pjl` | Baseline CUPS filter — source of truth for the PJL mapping table |
 | `legacy/Brother-HL5170DN-PCL.ppd` | Baseline PPD — historical reference for media/source/type names |
 | `legacy/install.sh` | Installs the legacy filter; usable from any CWD via `$(dirname "$0")` resolution |
