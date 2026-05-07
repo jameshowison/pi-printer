@@ -51,8 +51,12 @@ set -euo pipefail
 
 #---- Common -----------------------------------------------------------
 
-FILTER_SRC="brother-hl5170dn-pjl"
-PPD_SRC="Brother-HL5170DN-PCL.ppd"
+# Resolve sibling files relative to this script so the installer works
+# whether invoked from the repo root (`bash legacy/install.sh`), from
+# inside legacy/ (`bash install.sh`), or with an absolute path.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FILTER_SRC="$SCRIPT_DIR/brother-hl5170dn-pjl"
+PPD_SRC="$SCRIPT_DIR/Brother-HL5170DN-PCL.ppd"
 QUEUE_NAME="${QUEUE_NAME:-HL5170DN}"
 
 #---- Linux (Pi or Linux laptop) ---------------------------------------
