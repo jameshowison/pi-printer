@@ -11,6 +11,7 @@
 extern bool driver_cb(pappl_system_t *system, const char *driver_name,
     const char *device_uri, const char *device_id,
     pappl_pr_driver_data_t *data, ipp_t **attrs, void *cbdata);
+extern void register_pdf_filter(pappl_system_t *system);
 
 /* File-scope so system_cb can reference it when registering drivers. */
 static pappl_pr_driver_t drivers[] = {
@@ -59,6 +60,13 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
     if (!printer)
         papplLog(system, PAPPL_LOGLEVEL_WARN,
             "papplPrinterCreate failed — printer may already exist");
+
+    /* Phase 2: wire PDF -> PWG raster via Ghostscript so that iPhone
+     * AirPrint jobs (format: application/pdf) print instead of producing
+     * a blank page.  Requires PAPPL 1.4+ (papplSystemAddMIMEFilter was
+     * added in 1.4).  See bring-up-notes.md §1 for the PAPPL source-build
+     * instructions, and driver.c::pdf_filter_cb for implementation notes. */
+    register_pdf_filter(system);
 
     return system;
 }

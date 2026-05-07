@@ -203,3 +203,79 @@ Two specific bugs that bit on first try:
   reserve `snprintf` for the variable PJL content lines that follow.
 
 Both fixed in commit `2594fe8`.
+
+## 8. papplJobCreatePrintOptions — argument count varies; third arg is speculative
+
+From PAPPL issue #60 (the num_pages/duplex bug) we can confirm the function
+takes at least `(job, num_pages)`.  Our call site uses
+`papplJobCreatePrintOptions(job, (unsigned)INT_MAX, false)` with a third `bool`
+argument; if the actual installed header only takes two arguments the compiler
+will fail with "too many arguments to function".  In that case drop `false`:
+
+```c
+options = papplJobCreatePrintOptions(job, (unsigned)INT_MAX);
+```
+
+Always pass `INT_MAX` (not 0 or 1) for num_pages when you don't know the
+page count — passing 0 or 1 causes PAPPL to override duplex-default to
+single-sided (the root cause of issue #60).
+
+## 9. papplSystemAddMIMEFilter — call site rules
+
+`papplSystemAddMIMEFilter` must be called AFTER `papplSystemCreate()` and
+BEFORE `papplSystemRun()` (i.e., while the system is not yet running). In
+our architecture that means inside `system_cb`, after `papplPrinterCreate`.
+
+Signature confirmed from PAPPL 1.4 docs:
+```c
+void papplSystemAddMIMEFilter(
+    pappl_system_t        *system,
+    const char            *srctype,   /* "application/pdf" */
+    const char            *dsttype,   /* "image/pwg-raster" */
+    pappl_mime_filter_cb_t cb,
+    void                  *cbdata);
+```
+
+The `pappl_mime_filter_cb_t` is: `bool (*)(pappl_job_t *, pappl_device_t *, void *)`.
+
+## 10. PDF filter design: drive raster callbacks directly, not PWG byte output
+
+The PAPPL 1.4 docs say: "A raster filter that needs to print more than one
+image must use the raster callback functions in the pappl_pr_driver_data_t
+structure directly."
+
+Interpretation: even with `dsttype = "image/pwg-raster"`, our filter does NOT
+produce PWG raster bytes — it calls `rstartjob_cb` / `rstartpage_cb` /
+`rwriteline_cb` / `rendpage_cb` / `rendjob_cb` from `pappl_pr_driver_data_t`,
+obtained via `papplPrinterGetDriverData(papplJobGetPrinter(job), &drv)`.
+
+The `device` parameter passed to the filter IS the physical device.  The
+filter calls the raster callbacks with it directly; those write PCL to USB.
+PAPPL does NOT call the raster callbacks again after the filter returns.
+
+If this interpretation is wrong (i.e., if we see double-initialisation or the
+printer gets two PJL headers) the fix is:
+  a) Change dsttype to something non-raster like "application/vnd.hp-PCL".
+  b) In the filter, write PCL bytes directly with papplDeviceWrite() instead
+     of calling the raster callbacks.  This bypasses PJL wrapping but should
+     still print if the printer accepts bare PCL.
+
+## 11. PDF→PBM via gs pbmraw — verified format matches rwriteline_cb
+
+`gs -sDEVICE=pbmraw` produces P4 (raw PBM): 1-bit, MSB-first, pixels packed
+8 per byte, rows padded to byte boundaries.  Width in bytes = ceil(width/8).
+
+This is exactly the format `hl5170dn_rwriteline` expects:
+- `options->header.cupsBytesPerLine` = `(width + 7) / 8`
+- `line` bytes: MSB = leftmost pixel
+
+The packbits encoder then compresses these bytes for PCL `ESC *b <n> W` transfer.
+
+Multi-page: gs outputs one P4 block per page, concatenated.  Each block has
+its own "P4\n<w> <h>\n<data>" header.  The filter loops on fgets looking for
+"P4" magic, reads dimensions, then fread()s the raw pixels directly.
+
+Key: switch from fgets (text mode) to fread (binary mode) immediately after
+parsing the PBM header.  fgets must NOT be used to read pixel data — it will
+corrupt binary content that contains 0x0a (newline) bytes.
+

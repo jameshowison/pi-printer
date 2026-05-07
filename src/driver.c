@@ -14,6 +14,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>   /* unlink */
+#include <limits.h>   /* INT_MAX */
 #include "pjl.h"
 #include "packbits.h"
 
@@ -271,4 +274,209 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     data->bin_default = 0;
 
     return true;
+}
+
+/* ---- PDF → PCL filter (via Ghostscript) --------------------------------- *
+ *
+ * PAPPL 1.3.1 has no papplSystemAddMIMEFilter(); this function exists only
+ * when built against PAPPL 1.4+.  The Makefile currently links whatever
+ * version pkg-config finds; see bring-up-notes.md §1 for the source-build
+ * steps that install 1.4.x to /usr/local.
+ *
+ * Design: iPhone AirPrint sends application/pdf.  PAPPL's built-in raster
+ * filters handle PWG/Apple raster and JPEG/PNG natively.  For PDF we
+ * register a MIME filter here that:
+ *   1. Shells out to ghostscript to render the PDF as 1-bit PBM ("pbmraw")
+ *      — one P4 block per page.
+ *   2. Calls our own raster callbacks directly, page by page, to emit the
+ *      packbits-encoded PCL wrapped in PJL.
+ *
+ * The PAPPL docs (§ "Processing Jobs") say: "A raster filter that needs to
+ * print more than one image must use the raster callback functions in the
+ * pappl_pr_driver_data_t structure directly."  We do exactly that.
+ *
+ * Why PBM (pbmraw) and not pwgraster?
+ *   - PBM is trivial to parse (P4 magic + "w h" header + raw bits, MSB=left).
+ *   - Our rwriteline_cb already expects 1-bit, MSB-first packed bytes —
+ *     exactly what gs pbmraw produces.  No intermediate colour conversion
+ *     or raster library needed.
+ *
+ * Build note: papplJobCreatePrintOptions is confirmed to take (job, num_pages)
+ * in PAPPL ≤1.4.  The third arg (false) is speculative — remove it if the
+ * compiler complains "too many arguments".  If you get "too few", check the
+ * local pappl/job.h for the actual third parameter type.
+ */
+
+static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata)
+{
+    const char          *filename = papplJobGetFilename(job);
+    pappl_printer_t     *printer  = papplJobGetPrinter(job);
+    pappl_pr_driver_data_t drv;
+    pappl_pr_options_t  *options;
+    char                 gs_cmd[4096];
+    char                 pbm_path[256];
+    char                 line[256];
+    FILE                *pbm = NULL;
+    unsigned             pagenum = 0;
+    bool                 ok = false;
+
+    (void)cbdata;
+
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "pdf_filter: converting '%s' via gs pbmraw", filename);
+
+    /* Build print options from the job's IPP attributes.
+     * INT_MAX for num_pages = "unknown", which preserves the driver's duplex
+     * default rather than forcing single-sided (see PAPPL issue #60). */
+    options = papplJobCreatePrintOptions(job, (unsigned)INT_MAX, false);
+    if (!options) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "pdf_filter: papplJobCreatePrintOptions failed");
+        return false;
+    }
+
+    /* Force 300 dpi.  Phase 0 investigation showed 600 dpi photo render
+     * takes ~45s on Pi 3B+ — beyond the USB keepalive window.  300 dpi is
+     * safe for both text and photos. */
+    options->header.HWResolution[0] = 300;
+    options->header.HWResolution[1] = 300;
+
+    /* Get driver callbacks so we can drive the raster pipeline ourselves. */
+    papplPrinterGetDriverData(printer, &drv);
+
+    /* Temp output file — named by job ID to avoid collisions if two jobs
+     * run concurrently (unlikely on a single-USB printer, but be safe). */
+    snprintf(pbm_path, sizeof(pbm_path),
+             "/tmp/hl5170dn-pdf-%d.pbm", (int)papplJobGetID(job));
+
+    /* gs renders the PDF as 1-bit monochrome PBM.
+     *   -dSAFE   : prevents PostScript programs in the PDF from calling
+     *              system(), accessing the network, or writing arbitrary files.
+     *   -dFitPage: scales each page to fill the paper without clipping.
+     *   -r300    : 300 dpi output — matches the driver's Phase 1 resolution.
+     * Stderr is redirected so gs diagnostic output doesn't corrupt the PBM
+     * stream; inspect /tmp/hl5170dn-gs.log when debugging. */
+    snprintf(gs_cmd, sizeof(gs_cmd),
+        "gs -dBATCH -dNOPAUSE -dSAFE "
+        "-sDEVICE=pbmraw -r300 -dFitPage -sPAPERSIZE=letter "
+        "-sOutputFile='%s' '%s' 2>/tmp/hl5170dn-gs.log",
+        pbm_path, filename);
+
+    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "pdf_filter: gs cmd: %s", gs_cmd);
+
+    if (system(gs_cmd) != 0) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "pdf_filter: gs failed (exit non-zero) — "
+            "inspect /tmp/hl5170dn-gs.log");
+        goto done;
+    }
+
+    pbm = fopen(pbm_path, "rb");
+    if (!pbm) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "pdf_filter: cannot open gs output '%s': %s",
+            pbm_path, strerror(errno));
+        goto done;
+    }
+
+    /* Send the PJL job header once, before any page data. */
+    if (!drv.rstartjob_cb(job, options, device)) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "pdf_filter: rstartjob_cb failed");
+        goto done;
+    }
+
+    /* Each P4 block in the PBM file is one page of the PDF.
+     * fgets reads lines; the PBM binary pixel data follows immediately
+     * after the header, so we must switch to fread for pixel rows. */
+    while (fgets(line, sizeof(line), pbm)) {
+        int           w, h;
+        size_t        rowbytes;
+        unsigned char *rowbuf;
+        bool          page_ok = true;
+
+        /* Skip until we see the P4 magic (raw PBM). */
+        if (strncmp(line, "P4", 2) != 0)
+            continue;
+
+        /* Skip optional comment lines after the magic. */
+        do {
+            if (!fgets(line, sizeof(line), pbm))
+                goto jobs_done;   /* EOF between magic and dimensions */
+        } while (line[0] == '#');
+
+        /* "line" now holds "<width> <height>\n". */
+        if (sscanf(line, "%d %d", &w, &h) != 2 || w <= 0 || h <= 0) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "pdf_filter: bad PBM dimensions on page %u", pagenum);
+            break;
+        }
+
+        rowbytes = (size_t)((w + 7) / 8);   /* bits packed, MSB first */
+
+        /* Patch options so the raster callbacks know the page geometry. */
+        options->header.cupsWidth        = (unsigned)w;
+        options->header.cupsHeight       = (unsigned)h;
+        options->header.cupsBytesPerLine = (unsigned)rowbytes;
+
+        papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+            "pdf_filter: page %u: %dx%d px, %zu bytes/line",
+            pagenum, w, h, rowbytes);
+
+        rowbuf = malloc(rowbytes);
+        if (!rowbuf) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "pdf_filter: out of memory for row buffer (page %u)", pagenum);
+            page_ok = false;
+        } else {
+            drv.rstartpage_cb(job, options, device, pagenum);
+
+            for (int y = 0; y < h && page_ok; y++) {
+                if (fread(rowbuf, 1, rowbytes, pbm) != rowbytes) {
+                    papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                        "pdf_filter: short read at y=%d page %u: %s",
+                        y, pagenum, strerror(errno));
+                    page_ok = false;
+                } else {
+                    drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf);
+                }
+            }
+
+            drv.rendpage_cb(job, options, device, pagenum);
+            free(rowbuf);
+        }
+
+        pagenum++;
+        if (!page_ok)
+            break;
+    }
+
+jobs_done:
+    drv.rendjob_cb(job, options, device);
+    ok = (pagenum > 0);
+
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "pdf_filter: %s — %u page(s)", ok ? "ok" : "FAILED", pagenum);
+
+done:
+    if (pbm) { fclose(pbm); pbm = NULL; }
+    unlink(pbm_path);   /* harmless if gs failed and file was never created */
+    papplJobDeletePrintOptions(options);
+    return ok;
+}
+
+/* Called from system_cb (main.c) after papplSystemCreate().
+ * Must be called before papplSystemRun() / papplMainloop(). */
+void register_pdf_filter(pappl_system_t *system)
+{
+    papplSystemAddMIMEFilter(
+        system,
+        "application/pdf",   /* srctype: iPhone AirPrint sends this */
+        "image/pwg-raster",  /* dsttype: signals raster-capable filter;
+                              * our filter drives the raster callbacks
+                              * directly rather than emitting PWG bytes */
+        pdf_filter_cb,
+        NULL);
+    papplLog(system, PAPPL_LOGLEVEL_INFO,
+        "pdf_filter: registered application/pdf -> image/pwg-raster");
 }
