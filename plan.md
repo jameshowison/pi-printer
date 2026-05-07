@@ -96,6 +96,29 @@ commands, expected output, and decision rules. In short:
 Deliverable: findings recorded in `phase-0-investigations.md`,
 summary lifted into this file under Phase 1 once they're in.
 
+**Phase 0 complete (2026-05-07). Summary of findings:**
+
+1. **HQ1200 byte stream** — baseline uses genuine 1200 dpi raster with
+   standard PCL5e mode-2 (packbits) and mode-3 (delta row) compression;
+   no Brother proprietary mode 1027/1024/1152. Phase 6 = PRD option 2:
+   declare HQ1200, set `@PJL SET RESOLUTION=1200`, run GS at 1200 dpi,
+   emit mode-2 packbits. No proprietary encoding work required.
+
+2. **GS render timing** — text PDF @ 600 dpi: ~0.8 s (fine). Image PDF
+   @ 600 dpi: ~45 s; @ 300 dpi: ~21 s. Both exceed the safe USB-keepalive
+   window for photo input. **Phase 1 defaults to 300 dpi.** Pi 5 is the
+   upgrade path for 600 dpi photo performance.
+
+3. **papplDeviceRead() back-channel** — works. Response in ~400 ms from
+   sleep. STATUS codes: `CODE=10001` = READY, `CODE=40000` = SLEEP.
+   `INFO SUPPLIES` returns `"?"` — toner level unavailable. Phase 5 can
+   poll ready/sleep state; `marker-levels` will be `-2` (unknown).
+   USB URI: `usb://Brother/HL-5170DN%20series?serial=L4J624176`.
+
+4. **libpappl-dev version** — apt 1.3.1 is sufficient for Phases 1–5.
+   All required callbacks and device APIs present and compiling.
+   Re-check for Phase 3 (vendor options / job-creation hooks).
+
 ### Phase 1 — Skeleton driver: one page of text at 600 dpi
 
 Smallest thing that prints. Resolves the PAPPL API shape before we

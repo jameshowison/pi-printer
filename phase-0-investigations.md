@@ -112,8 +112,33 @@ ship at 600 dpi only.
 **Findings.**
 
 ```
-(record here — counts from the grep commands above, plus the
-xxd-decoded `<ESC>*t<n>R` value, plus the `RESOLUTION=` PJL value)
+Captured by running the CUPS filter directly at 1200dpi:
+  /usr/lib/cups/filter/brother-hl5170dn-pjl 1 user title 1 "Resolution=1200dpi" text-test.pdf > stream.bin
+
+Stream size at 1200dpi: 2,501,203 bytes (vs 1,062,293 bytes at 600dpi — 2.36× larger)
+
+<ESC>*r1027 (Brother mode 1027):            0 occurrences
+<ESC>*b1024M (Brother compression 1024):    0 occurrences
+<ESC>*b1152M (Brother compression 1152):    0 occurrences
+<ESC>*b2M (TIFF packbits, standard):      184 occurrences
+<ESC>*b3M (delta row, standard):          189 occurrences
+RESOLUTION= in PJL: 1200
+<ESC>*t<n>R (raster resolution):    1200   ← genuine 1200 dpi raster
+<ESC>*r<n>A (start raster):         1
+
+Comparison at 600dpi:
+  Mode 2: 159, Mode 3: 163, <ESC>*t600R, RESOLUTION=600
+
+PJL header (first 256 bytes):
+  <ESC>%-12345X@PJL
+  @PJL SET RESOLUTION=1200
+  @PJL SET ECONOMODE=OFF
+  @PJL SET DUPLEX=OFF
+  @PJL SET SOURCETRAY=AUTO
+  @PJL SET MEDIATYPE=REGULAR
+  @PJL SET COPIES=1
+  @PJL SET LPARM : PCL PAPER=LETTER
+  @PJL ENTER LANGUAGE=PCL
 ```
 
 **Decision rule for Phase 6.**
@@ -128,6 +153,16 @@ xxd-decoded `<ESC>*t<n>R` value, plus the `RESOLUTION=` PJL value)
 - Anything weirder (e.g. `<ESC>*t1200R` with mode-2 compression):
   inspect the post-raster bytes manually and update this section
   before deciding.
+
+**Outcome: third case — `<ESC>*t1200R` with standard mode-2 and mode-3
+compression, no Brother-proprietary modes.** GS ljet4 runs at 1200 dpi
+and emits a genuine 1200-dpi raster using standard PCL5e compression;
+Brother's mode 1024/1152 extensions are not used. Phase 6 = **PRD option
+2**: declare HQ1200, set `@PJL SET RESOLUTION=1200`, instruct PAPPL to
+run GS at 1200 dpi (not 600), emit standard mode-2 packbits. No
+proprietary encoding work needed. Caveat: on Pi 3B+, GS at 1200 dpi
+will be even slower than at 600 dpi (which is already 45 s for photo
+input — see Investigation 2); HQ1200 photo prints will be very slow.
 
 ---
 
@@ -175,9 +210,16 @@ on photo input, that's another reason to default to 300 dpi.
 **Findings.**
 
 ```
-text-test.pdf @ 600 dpi:   Elapsed=??  Peak RSS=??
-image-test.pdf @ 600 dpi:  Elapsed=??  Peak RSS=??
-image-test.pdf @ 300 dpi:  Elapsed=??  Peak RSS=??
+GS version: 10.05.1 (Ghostscript)
+Ghostscript device: ljet4
+
+text-test.pdf  @ 600 dpi:  Elapsed=0.77s  (runs 1.04s, 0.77s, 0.75s — median 0.77s)
+image-test.pdf @ 600 dpi:  Elapsed=45.1s  (single run; consistently ~45s)
+image-test.pdf @ 300 dpi:  Elapsed=20.7s  (runs 21.0s, 20.7s, 20.8s — median 20.8s)
+
+Peak RSS not measured (no /usr/bin/time available; 'time' builtin only).
+Pi 3B+ has 1 GB RAM; GS at 600 dpi on a photo PDF stays well below OOM
+based on system stability during the run.
 ```
 
 **Decision rule for Phase 1.**
@@ -188,6 +230,13 @@ image-test.pdf @ 300 dpi:  Elapsed=??  Peak RSS=??
   in the README.
 - Photo render at 600 dpi >15 s: default to 300 dpi, document Pi 5
   as upgrade path.
+
+**Outcome: 45 s at 600 dpi → default to 300 dpi.** Even 300 dpi takes
+~21 s for image-heavy input, which exceeds the Pi 3B+'s safe window for
+keeping the printer awake over USB. Phase 1 driver defaults to 300 dpi;
+Phase 7 README documents Pi 5 as the upgrade path and recommends
+disabling printer sleep mode (front-panel menu or web interface) for
+anyone who wants 600 dpi on Pi 3B+.
 
 ---
 
@@ -261,8 +310,54 @@ or the probe will fight it for the USB device. Re-enable after
 **Findings.**
 
 ```
-wrote N bytes
-read N bytes: [paste response, hexdump if non-printable]
+Probe: ~/pappl-probe/probe.c + probe3.c compiled against libpappl 1.3.1
+URI:   usb://Brother/HL-5170DN%20series?serial=L4J624176
+       (discovered via: sudo lpinfo -v | grep -i brother)
+
+Initial probe (probe2.c, 200ms polling intervals):
+  wrote 57 bytes, flushed
+  read attempt 0: 0 bytes  (200ms)
+  read attempt 1: 0 bytes  (400ms)
+  read attempt 2: 72 bytes  ← first response at ~400ms
+
+Initial response (printer was in sleep mode):
+  @PJL INFO STATUS
+  CODE=40000
+  DISPLAY="SLEEP           "
+  ONLINE=TRUE
+
+Deep probe (probe3.c, after printer woke from first query):
+  INFO STATUS (222 bytes):
+    @PJL INFO PAGECOUNT
+    PAGECOUNT=18421
+    @PJL INFO STATUS
+    CODE=10001
+    DISPLAY="READY           "
+    ONLINE=TRUE
+    [echoed twice — note: printer echoes the query back before its response]
+
+  INFO PAGECOUNT (39 bytes):
+    @PJL INFO PAGECOUNT
+    PAGECOUNT=18421
+
+  INFO ID (68 bytes):
+    @PJL INFO ID
+    "Brother HL-5170DN series:84UZ74:Ver1.11:EVer1.00M"
+
+  INFO SUPPLIES (26 bytes):
+    @PJL INFO SUPPLIES
+    "?"       ← printer does not report supply levels
+
+  INFO MEMORY (53 bytes):
+    @PJL INFO MEMORY
+    TOTAL=24389808     (≈24 MB firmware memory)
+    LARGEST=24389808
+
+Status code meanings (confirmed vs Tech_Manual_Ch5_PJL):
+  CODE=10001 = READY
+  CODE=40000 = SLEEP
+
+Printer serial: L4J624176, page count: 18421
 ```
 
 Particularly note: does the response include `STATUS=`,
@@ -280,6 +375,17 @@ needs an aggressive timeout.
   boxed day trying to coax it.
 - Garbage: capture an example, file as a Phase 5 open question, but
   default to "unknown" for shipping.
+
+**Outcome: back-channel works; toner level is not available.** Response
+arrives in ~400 ms from sleep, faster when awake (within one 100 ms
+polling interval). `CODE=10001` (READY) and `CODE=40000` (SLEEP) are
+confirmed. `INFO SUPPLIES` returns `"?"` — the HL-5170DN does not expose
+toner level over PJL. Phase 5 will poll `INFO STATUS` to detect
+READY/SLEEP/error states and report them in `pappl_preason_t`, but
+`marker-levels` will always be `-2` (unknown) and `marker-supply-low-
+report` cannot be populated. Document this limitation in the README.
+The 500 ms timeout budget for `papplDeviceRead()` is sufficient — actual
+response comes faster once the printer is awake.
 
 ---
 
@@ -341,9 +447,25 @@ PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH \
 **Findings.**
 
 ```
-apt version:                ??
-PAPPL_VERSION (from header): ??
-Decision:                   apt / source-built v?.?.?
+apt version:  1.3.1-2.1+b2  (libpappl-dev and libpappl1t64)
+pkg-config:   1.3.1
+
+PAPPL_VERSION macro not present in 1.3.1 headers (available in later versions).
+Version confirmed from pkg-config --modversion.
+
+Key APIs verified present in headers:
+  papplDeviceOpen / papplDeviceRead / papplDeviceWrite / papplDeviceClose / papplDeviceFlush
+  pappl_pr_rstartjob_cb_t / rstartpage_cb_t / rwriteline_cb_t
+  pappl_pr_rendpage_cb_t / rendjob_cb_t / status_cb_t / identify_cb_t
+  pappl_pr_driver_data_t (struct with all above callback fields)
+  papplPrinterSetDriverData / papplPrinterSetDriverDefaults
+
+Compilation test: probe.c (calls papplDeviceOpen, papplDeviceWrite,
+  papplDeviceRead, papplDeviceClose) compiled and ran successfully.
+
+Note: papplDeviceRead() has no timeout parameter in 1.3.1. The driver
+  must manage its own read timeout using select()/alarm() or by
+  limiting poll frequency in status_cb.
 ```
 
 **Decision rule for Phase 1.**
@@ -353,6 +475,14 @@ Decision:                   apt / source-built v?.?.?
   README.
 - apt version is too old: Phase 7 of the README documents the source
   build steps above. Pin the source-built version.
+
+**Outcome: apt 1.3.1 is sufficient for Phase 1 through Phase 5.**
+All Phase 1 callbacks and device APIs are present and working. Phase 1
+Makefile uses `pkg-config pappl` against the system install. README pins
+to 1.3.1. Re-evaluate if Phase 3 (vendor options / media substitution
+hooks) needs PAPPL features absent in 1.3.1 — check before starting
+Phase 3 whether `papplJobSetState()` and job-creation hooks are
+present at this version.
 
 ---
 
