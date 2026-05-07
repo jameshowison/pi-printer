@@ -1,7 +1,13 @@
-CC     = cc
-CFLAGS = -Wall -Wextra -g $(shell pkg-config --cflags pappl)
-LIBS   = $(shell pkg-config --libs pappl)
-TARGET = hl5170dn-printer-app
+CC      = cc
+# Prefer the source-built PAPPL 1.4 in /usr/local over the apt 1.3.1 in
+# /lib/aarch64-linux-gnu.  PKG_CONFIG_PATH ensures we get 1.4 headers/flags;
+# -Wl,-rpath bakes /usr/local/lib into the binary so the runtime linker finds
+# libpappl.so.1 there first, regardless of ldconfig search order.
+PKG_CONFIG_PATH := /usr/local/lib/pkgconfig:$(PKG_CONFIG_PATH)
+export PKG_CONFIG_PATH
+CFLAGS  = -Wall -Wextra -g $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags pappl)
+LIBS    = -Wl,-rpath,/usr/local/lib $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs pappl)
+TARGET  = hl5170dn-printer-app
 
 SRCS = src/main.c src/driver.c src/pjl.c src/packbits.c
 OBJS = $(SRCS:.c=.o)
