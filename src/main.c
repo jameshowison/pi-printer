@@ -29,12 +29,12 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
 
     /* PAPPL_SOPTIONS_WEB_INTERFACE  — admin UI at /
      * PAPPL_SOPTIONS_WEB_LOG        — live log viewer at /logs
-     * PAPPL_SOPTIONS_REMOTE_ADMIN   — accept admin requests from non-localhost
+     * PAPPL_SOPTIONS_WEB_REMOTE     — accept admin requests from non-localhost
      *                                 (otherwise the Mac can read pages but
      *                                 not change settings).
      * Without these, papplSystemCreate registers no HTTP routes and `/` 404s. */
     system = papplSystemCreate(
-        PAPPL_SOPTIONS_WEB_INTERFACE | PAPPL_SOPTIONS_WEB_LOG | PAPPL_SOPTIONS_REMOTE_ADMIN,
+        PAPPL_SOPTIONS_WEB_INTERFACE | PAPPL_SOPTIONS_WEB_LOG | PAPPL_SOPTIONS_WEB_REMOTE,
         "hl5170dn-printer-app",
         8000,
         "_print,_universal",
