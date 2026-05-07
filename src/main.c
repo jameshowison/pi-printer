@@ -63,11 +63,20 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
     return system;
 }
 
+/* PAPPL 1.4 calls papplLocGetString from its default HTML footer; without
+ * registered localisation data that NULL-derefs in cupsArrayFind. Bypass
+ * the localised path by supplying our own footer HTML literal. */
+#define APP_FOOTER_HTML \
+    "<a class=\"btn\" href=\"https://github.com/jameshowison/pi-printer\">" \
+    "hl5170dn-printer-app v" APP_VERSION "</a>"
+
 int main(int argc, char *argv[])
 {
     return papplMainloop(argc, argv,
         APP_VERSION,
-        NULL,           /* footer_html */
+        APP_FOOTER_HTML,/* footer_html — non-NULL to bypass PAPPL's
+                           localised default footer (crashes in 1.4 when
+                           no localisation strings are registered). */
         1, drivers,     /* num_drivers, drivers[] */
         NULL,           /* autoadd_cb */
         driver_cb,
