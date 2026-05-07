@@ -12,6 +12,11 @@ extern bool driver_cb(pappl_system_t *system, const char *driver_name,
     const char *device_uri, const char *device_id,
     pappl_pr_driver_data_t *data, ipp_t **attrs, void *cbdata);
 
+/* File-scope so system_cb can reference it when registering drivers. */
+static pappl_pr_driver_t drivers[] = {
+    { DRIVER_NAME, "Brother HL-5170DN", NULL, NULL }
+};
+
 static pappl_system_t *system_cb(int num_options, cups_option_t *options,
                                   void *data)
 {
@@ -30,12 +35,18 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
         NULL,                    /* spooldir: use PAPPL default */
         "-",                     /* logfile: stderr (captured by journald) */
         PAPPL_LOGLEVEL_DEBUG,
-        NULL);                   /* no authentication */
+        NULL,                    /* no authentication */
+        false);                  /* tls_only */
 
     if (!system)
         return NULL;
 
     papplSystemAddListeners(system, NULL);
+
+    /* papplMainloop registers driver_cb AFTER system_cb returns, so
+     * papplPrinterCreate would fail with "no driver callback set".
+     * Register it here first; papplMainloop's redundant registration is harmless. */
+    papplSystemSetPrinterDrivers(system, 1, drivers, NULL, NULL, driver_cb, NULL);
 
     printer = papplPrinterCreate(system, 0, PRINTER_NAME, DRIVER_NAME,
                                  NULL, DEVICE_URI);
@@ -48,10 +59,6 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
 
 int main(int argc, char *argv[])
 {
-    static pappl_pr_driver_t drivers[] = {
-        { DRIVER_NAME, "Brother HL-5170DN", NULL, NULL }
-    };
-
     return papplMainloop(argc, argv,
         APP_VERSION,
         NULL,           /* footer_html */
@@ -61,5 +68,6 @@ int main(int argc, char *argv[])
         NULL,           /* subcmd_name */
         NULL,           /* subcmd_cb */
         system_cb,
+        NULL,           /* usage_cb */
         NULL);          /* cbdata */
 }

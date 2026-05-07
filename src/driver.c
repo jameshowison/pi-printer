@@ -79,7 +79,7 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
      * Paper size, source, and duplex are already set by PJL; no PCL
      * paper commands here. */
     n = snprintf(buf, sizeof(buf),
-        "\x1bE"         /* PCL reset */
+        "\033E"         /* PCL reset */
         "\x1b*t%dR"     /* raster resolution */
         "\x1b*r0F"      /* presentation */
         "\x1b*b2M"      /* compression = packbits */
@@ -120,7 +120,7 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
     static const char end_page[] =
         "\x1b*rC"   /* ESC *r C — end raster transfer */
         "\x0c"      /* form feed — eject page */
-        "\x1bE";    /* PCL reset */
+        "\033E";    /* PCL reset */
 
     (void)options;
 
@@ -187,6 +187,10 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
 
     memset(data, 0, sizeof(*data));
 
+    strncpy(data->make_and_model, "Brother HL-5170DN",
+            sizeof(data->make_and_model) - 1);
+    data->ppm = 21; /* HL-5170DN rated 21 ppm */
+
     /* Callbacks */
     data->identify_cb   = hl5170dn_identify;
     data->status_cb     = hl5170dn_status;
@@ -208,35 +212,47 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     data->raster_types      = PAPPL_PWG_RASTER_TYPE_BLACK_1;
     data->force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1;
 
-    /* No duplex, no copies in Phase 1. */
-    data->duplex     = PAPPL_DUPLEX_NONE;
-    data->has_copies = false;
+    /* Monochrome only. */
+    data->color_supported = PAPPL_COLOR_MODE_MONOCHROME;
+    data->color_default   = PAPPL_COLOR_MODE_MONOCHROME;
+
+    /* PAPPL 1.3.1 calls _papplContentString / _papplScalingString with these
+     * values and passes the result directly to strlcpy — a NULL return (from
+     * value 0) causes a SIGSEGV.  Set valid defaults for all three. */
+    data->content_default = PAPPL_CONTENT_AUTO;
+    data->scaling_default = PAPPL_SCALING_AUTO;
+    data->quality_default = IPP_QUALITY_NORMAL;
+
+    /* No duplex in Phase 1. */
+    data->duplex        = PAPPL_DUPLEX_NONE;
     data->input_face_up = false;
 
     /* Identify: declare SOUND but the callback is a no-op. */
-    data->identify_actions = PAPPL_IDENTIFY_ACTIONS_SOUND;
+    data->identify_default   = PAPPL_IDENTIFY_ACTIONS_SOUND;
+    data->identify_supported = PAPPL_IDENTIFY_ACTIONS_SOUND;
 
     /* Media: Letter only, from tray-1 and by-pass-tray. */
     data->num_media = 1;
-    strncpy(data->media[0].size_name, "na_letter_8.5x11in",
-            sizeof(data->media[0].size_name) - 1);
-    data->media[0].size_width   = 21590; /* 8.5" in hundredths of mm */
-    data->media[0].size_length  = 27940; /* 11" in hundredths of mm */
-    data->media[0].left_margin  = 500;
-    data->media[0].right_margin = 500;
-    data->media[0].top_margin   = 500;
-    data->media[0].bottom_margin = 500;
-    strncpy(data->media[0].source, "tray-1",
-            sizeof(data->media[0].source) - 1);
-    strncpy(data->media[0].type, "stationery",
-            sizeof(data->media[0].type) - 1);
+    data->media[0]  = "na_letter_8.5x11in";
 
-    data->media_default = data->media[0];
+    memset(&data->media_default, 0, sizeof(data->media_default));
+    strncpy(data->media_default.size_name, "na_letter_8.5x11in",
+            sizeof(data->media_default.size_name) - 1);
+    data->media_default.size_width    = 21590; /* 8.5" in hundredths of mm */
+    data->media_default.size_length   = 27940; /* 11" in hundredths of mm */
+    data->media_default.left_margin   = 500;
+    data->media_default.right_margin  = 500;
+    data->media_default.top_margin    = 500;
+    data->media_default.bottom_margin = 500;
+    strncpy(data->media_default.source, "tray-1",
+            sizeof(data->media_default.source) - 1);
+    strncpy(data->media_default.type, "stationery",
+            sizeof(data->media_default.type) - 1);
 
     /* Sources */
     data->num_source = 2;
-    strncpy(data->source[0], "tray-1",      sizeof(data->source[0]) - 1);
-    strncpy(data->source[1], "by-pass-tray", sizeof(data->source[1]) - 1);
+    data->source[0]  = "tray-1";
+    data->source[1]  = "by-pass-tray";
 
     /* media_ready: tray-1 has Letter loaded; by-pass-tray inherits same */
     data->media_ready[0] = data->media_default;
@@ -246,7 +262,13 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
 
     /* Media types */
     data->num_type = 1;
-    strncpy(data->type[0], "stationery", sizeof(data->type[0]) - 1);
+    data->type[0]  = "stationery";
+
+    /* Output bin — PAPPL 1.3.1 calls strlcpy(options->output_bin,
+     * data->bin[data->bin_default]) without a num_bin > 0 guard. */
+    data->num_bin    = 1;
+    data->bin[0]     = "face-down";
+    data->bin_default = 0;
 
     return true;
 }

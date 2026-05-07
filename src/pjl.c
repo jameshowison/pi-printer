@@ -2,8 +2,10 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Universal Exit Language sequence — transitions printer to PJL mode. */
-#define UEL "\x1b%-12345X"
+/* Universal Exit Language sequence — transitions printer to PJL mode.
+ * The literal '%' must NOT pass through snprintf; write it directly. */
+static const char UEL[] = "\x1b%-12345X";
+#define UEL_LEN (sizeof(UEL) - 1)
 
 void pjl_write_job_header(pappl_device_t *dev, int resolution,
                           bool powersave_off)
@@ -11,11 +13,10 @@ void pjl_write_job_header(pappl_device_t *dev, int resolution,
     char buf[512];
     int  n;
 
-    /* All PJL SETs in a single UEL block.  POWERSAVE=OFF comes first so
-     * the printer stays awake during the raster render that follows.
-     * Field order matches Investigation 1 capture for easy diff. */
+    /* UEL written directly — snprintf would misinterpret the '%' in %-12345X. */
+    papplDeviceWrite(dev, UEL, UEL_LEN);
+
     n = snprintf(buf, sizeof(buf),
-        UEL
         "@PJL\r\n"
         "%s"   /* POWERSAVE=OFF if requested */
         "@PJL SET RESOLUTION=%d\r\n"
@@ -38,15 +39,17 @@ void pjl_write_job_trailer(pappl_device_t *dev, bool restore_powersave)
     char buf[128];
     int  n;
 
-    /* UEL exits PCL, EOJ closes the job, optional POWERSAVE=ON restores
-     * sleep mode, final UEL closes the PJL session. */
+    /* UEL exits PCL back to PJL. */
+    papplDeviceWrite(dev, UEL, UEL_LEN);
+
     n = snprintf(buf, sizeof(buf),
-        UEL
         "@PJL EOJ\r\n"
-        "%s"    /* POWERSAVE=ON if restoring */
-        UEL,
+        "%s",    /* POWERSAVE=ON if restoring */
         restore_powersave ? "@PJL SET POWERSAVE=ON\r\n" : "");
 
     papplDeviceWrite(dev, buf, (size_t)n);
+
+    /* Final UEL closes the PJL session. */
+    papplDeviceWrite(dev, UEL, UEL_LEN);
     papplDeviceFlush(dev);
 }
