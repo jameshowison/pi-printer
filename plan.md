@@ -119,38 +119,262 @@ summary lifted into this file under Phase 1 once they're in.
    All required callbacks and device APIs present and compiling.
    Re-check for Phase 3 (vendor options / job-creation hooks).
 
+**Open question from Phase 0 — USB keepalive during rendering.**
+GS render takes 21–45 s for image input, which exceeds the printer's
+USB idle-sleep threshold. PAPPL owns the USB device, but the render
+runs before `rstartjob_cb` is called (or inside it via GS pipe); the
+printer sees silence and may enter sleep, requiring a ~400 ms re-wake
+that can stall or wedge the job. Investigate before or during Phase 1:
+
+- **Option A — PJL ping thread**: spawn a background thread in
+  `rstartjob_cb` that sends `@PJL INFO STATUS\r\n` every ~8 s over
+  the USB back-channel and reads (drains) the reply, keeping the link
+  active. Thread is cancelled and joined before the first PCL byte
+  goes out. Risk: overlapping PJL/PCL traffic if thread and main
+  disagree on timing.
+- **Option B — disable printer sleep via PJL**: send
+  `@PJL SET POWERSAVE=OFF\r\n` in `rstartjob_cb`'s PJL header (before
+  `ENTER LANGUAGE=PCL`), re-enable with `@PJL SET POWERSAVE=ON` at
+  `rendjob_cb`. Check `Tech_Manual_Ch5_PJL` §POWERSAVE for whether the
+  HL-5170DN honours this command. Cleanest solution if it works;
+  downside is the printer stays on when idle between jobs.
+- **Option C — stream GS output**: instead of buffering full raster
+  before sending, pipe GS stdout directly into the PCL send path so
+  bytes start flowing to the printer immediately after the PJL header.
+  Eliminates the silent gap entirely at the cost of a more complex
+  `rstartjob_cb` / `rwriteline_cb` wiring (GS must be launched as a
+  child process with a pipe, and `rwriteline_cb` reads from that pipe).
+  This is architecturally cleanest and also removes the intermediate
+  buffer allocation for large photo pages.
+
+Recommendation: try Option B first (single PJL line, no threading);
+if the HL-5170DN doesn't honour `POWERSAVE=OFF`, fall back to Option A.
+Reserve Option C for Phase 2 if A/B still produce stalls on real photo
+input, because it requires restructuring the job-start path. Record the
+outcome in this section before Phase 2 begins.
+
 ### Phase 1 — Skeleton driver: one page of text at 600 dpi
 
 Smallest thing that prints. Resolves the PAPPL API shape before we
-commit to feature work.
+commit to feature work. All files live in a new top-level `src/`
+directory; the repo root stays clean.
 
-- `Makefile` (no autotools), pkg-config-driven against `libpappl`,
-  `libcupsfilters`, `libusb-1.0`, `ghostscript`.
-- Driver registration: PCL5e + PJL declared as printer language;
-  `image/pwg-raster` as the consuming format.
-- `printer_cb` populating `pappl_pr_driver_data_t` with: 600 dpi only,
-  Letter only, MP/Tray1 sources, Regular media type, simplex, no
-  output bins. (Everything else lights up in Phase 2.)
-- `rstartjob_cb` emits PJL header with the minimum non-default sets
-  (`RESOLUTION=600`, `LPARM : PCL PAPER=LETTER`) and `@PJL ENTER LANGUAGE=PCL`.
-- `rstartpage_cb` emits `<ESC>E`, raster-resolution `<ESC>*t600R`,
-  presentation `<ESC>*r0F`, compression `<ESC>*b2M` (TIFF packbits),
-  start raster `<ESC>*r1A`. **No** paper-size / source / duplex PCL
-  here — those are PJL's job, per PRD.
-- `rwriteline_cb` consuming pre-halftoned 1-bit input (PRD halftoning
-  decision = option 1, ordered dither via libcupsfilters' `cfOneBitLine()`).
-  Compress with packbits, emit `<ESC>*b<n>W<data>`.
-- `rendpage_cb` `<ESC>*rC`, `0x0C`, `<ESC>E`.
-- `rendjob_cb` `<ESC>%-12345X@PJL EOJ\r\n<ESC>%-12345X`.
-- `identify_cb` no-op.
-- `status_cb` stub (Phase 5 fills it in).
-- Systemd unit `/etc/systemd/system/hl5170dn-printer-app.service`,
-  runs as a `printapp` user with USB device-group membership.
-  Default port 8000.
+#### 1.1 — Source layout
 
-Exit criterion: `lp -d hl5170dn text-test.pdf` from the Pi prints a
-recognisable page. Bytes-on-paper verification against the
-`cups-filter-baseline` output of the same PDF.
+```
+src/
+  main.c          # papplMainloop() entry point, system/printer setup
+  driver.c        # driver_cb, all raster callbacks, identify_cb, status_cb
+  pjl.c           # PJL header construction helpers (extracted so Phase 2 can extend)
+  pjl.h
+  packbits.c      # packbits encoder (used in rwriteline_cb)
+  packbits.h
+Makefile
+hl5170dn-printer-app.service   # systemd unit template
+```
+
+No single-file approach — keeping `pjl.c` and `packbits.c` separate
+means Phase 2 can extend PJL without touching raster code.
+
+#### 1.2 — Makefile
+
+`pkg-config`-driven; no autotools. Targets:
+
+- `all` → `hl5170dn-printer-app`
+- `install` → binary to `/usr/local/bin`, unit to
+  `/etc/systemd/system/`, then `systemctl daemon-reload`
+- `clean`
+
+Flags: `-Wall -Wextra -g` for Phase 1 (strip `-g` in Phase 7).
+Dependencies: `pappl`, `cupsfilters` (for `cfOneBitLine()`). No direct
+`libusb` link — PAPPL's USB backend owns the device; the driver never
+calls libusb directly.
+
+#### 1.3 — `main.c`
+
+```c
+papplMainloop(argc, argv,
+    "1.0",                      // version string
+    NULL,                       // footer HTML
+    1, drivers, driver_cb,      // one driver entry
+    NULL,                       // setup_cb (unused)
+    NULL);                      // subcmd_name / subcmd_cb (unused)
+```
+
+`drivers[]` is a single `pappl_pr_driver_t` entry:
+`{ "hl5170dn", "Brother HL-5170DN", NULL, NULL }`.
+
+`driver_cb` signature: `pappl_pr_driver_data_t *data, ipp_t **attrs,
+const char *driver_name, void *cbdata` — fill `data` in place.
+
+System creation via `papplSystemCreate()` with:
+- `PAPPL_SOPTIONS_MULTI_QUEUE` off (single printer),
+- hostname `NULL` (use system default / Bonjour),
+- port 8000,
+- `NULL` TLS options (plain HTTP for Phase 1).
+
+Printer added via `papplSystemAddPrinter()` after system create, with
+device URI from `argv` or hardcoded
+`usb://Brother/HL-5170DN%20series?serial=L4J624176` for Phase 1 (make
+it a `#define` so Phase 7 can replace it with a CLI flag).
+
+#### 1.4 — `driver_cb` (in `driver.c`)
+
+Fills `pappl_pr_driver_data_t`:
+
+| Field | Phase 1 value |
+|---|---|
+| `input_face_up` | `false` |
+| `has_copies` | `false` (Phase 2) |
+| `identify_supported` | `PAPPL_IDENTIFY_ACTIONS_SOUND` (no-op stub) |
+| `num_resolution` | 1 |
+| `x_resolution[0]`, `y_resolution[0]` | 300 (Phase 0 finding 2: default 300 dpi) |
+| `x_default`, `y_default` | 300 |
+| `raster_types` | `PAPPL_PWG_RASTER_TYPE_BLACK_1` |
+| `force_raster_type` | same |
+| `num_media` | 1 — `"na_letter_8.5x11in"` |
+| `media_default` | Letter, 300 dpi, `"tray-1"`, `"stationery"` |
+| `num_source` | 2 — `"tray-1"`, `"by-pass-tray"` |
+| `num_type` | 1 — `"stationery"` |
+| `duplex` | `PAPPL_DUPLEX_NONE` |
+| Callbacks | set all five: `rstartjob`, `rstartpage`, `rwriteline`, `rendpage`, `rendjob` |
+| `status_cb` | stub returning immediately |
+| `identify_cb` | stub returning immediately |
+
+Note: `x_resolution` / `y_resolution` are in dots-per-inch as `int`.
+`raster_types` must include `PAPPL_PWG_RASTER_TYPE_BLACK_1` so PAPPL
+knows to give us 1-bit-per-pixel lines.
+
+#### 1.5 — `rstartjob_cb`
+
+Emits the PJL job header via `papplDeviceWrite()`. Exact byte sequence
+(from Investigation 1 capture, verbatim field order):
+
+```
+<ESC>%-12345X
+@PJL SET RESOLUTION=300\r\n
+@PJL SET ECONOMODE=OFF\r\n
+@PJL SET DUPLEX=OFF\r\n
+@PJL SET SOURCETRAY=AUTO\r\n
+@PJL SET MEDIATYPE=REGULAR\r\n
+@PJL SET COPIES=1\r\n
+@PJL SET LPARM : PCL PAPER=LETTER\r\n
+@PJL ENTER LANGUAGE=PCL\r\n
+```
+
+Follow immediately with `papplDeviceFlush()`. Store the job-start
+timestamp in the `job_data` pointer (allocated with `calloc`, freed in
+`rendjob_cb`) — Phase 4 uses this for the log prefix. For Phase 1 the
+struct can be a single `time_t`.
+
+USB keepalive experiment lives here: before the PJL header, try
+`@PJL SET POWERSAVE=OFF\r\n` and note whether it generates an error
+response on the back-channel at `rendpage_cb` teardown time.
+
+#### 1.6 — `rstartpage_cb`
+
+Called once per page. Emits PCL raster setup:
+
+```
+<ESC>E                 (printer reset — clears any leftover state)
+<ESC>*t300R            (raster resolution = 300 dpi)
+<ESC>*r0F              (presentation mode: portrait, don't rotate)
+<ESC>*b2M              (compression method: TIFF packbits)
+<ESC>*r1A              (start raster at current cursor, 1 = top-left origin)
+```
+
+No paper size / source PCL commands — PJL owns those. `<ESC>E` resets
+any previous raster state cleanly; safe to emit every page.
+
+#### 1.7 — `rwriteline_cb`
+
+Receives a `pappl_pr_line_t` with pre-halftoned 1-bit data from PAPPL
+(forced by `force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1`).
+PAPPL handles the halftoning; `cfOneBitLine()` is **not** needed in
+Phase 1 — simplifies the dependency chain.
+
+Per line:
+
+1. Skip trailing blank lines at the bottom of the page by tracking
+   the last non-blank line (defer the emit until we know it's not the
+   final skip; or emit all lines — blank lines compress to near zero,
+   so skip the optimisation for Phase 1).
+2. Packbits-encode the line bytes using `packbits_encode()` from
+   `packbits.c`.
+3. Emit `<ESC>*b<n>W<encoded-bytes>` where `<n>` is the encoded length
+   as a decimal ASCII integer.
+
+`packbits.c` implements standard TIFF packbits (identical to what GS
+ljet4 emits, confirmed by Investigation 1). The encoder fits in ~40
+lines:
+
+- Scan forward for runs of identical bytes → emit run-length token
+  `(1 - runlen)` followed by the repeated byte.
+- Scan forward for literal sequences → emit count-1 followed by the
+  bytes verbatim.
+- Output buffer is at most `ceil(n * 1.5) + 1` bytes; allocate once
+  per job (store in `job_data`), reuse per line.
+
+#### 1.8 — `rendpage_cb`
+
+End of page:
+
+```
+<ESC>*rC               (end raster)
+0x0C                   (form feed — eject the page)
+<ESC>E                 (printer reset — clears raster mode cleanly)
+```
+
+#### 1.9 — `rendjob_cb`
+
+End of job (UEL bookend):
+
+```
+<ESC>%-12345X
+@PJL EOJ\r\n
+<ESC>%-12345X
+```
+
+If Option B keepalive was used, re-enable sleep here:
+`@PJL SET POWERSAVE=ON\r\n` before `EOJ`. Free `job_data`.
+
+#### 1.10 — Systemd unit (`hl5170dn-printer-app.service`)
+
+```ini
+[Unit]
+Description=Brother HL-5170DN Printer App
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/hl5170dn-printer-app
+User=printapp
+Group=lp
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`printapp` user needs to be in the `lp` group (USB device access on
+Pi OS) — `make install` documents this but does not create the user
+(prohibited action; Phase 7 README covers it).
+
+#### 1.11 — Exit criterion and verification
+
+1. Build without warnings on the Pi: `make 2>&1 | grep -c warning`
+   should be 0.
+2. Run under `sudo` (or after adding `printapp` to `lp` group):
+   `sudo ./hl5170dn-printer-app`.
+3. `lp -d hl5170dn text-test.pdf` from the Pi.
+4. Physical page comes out. No garbled header, no blank page.
+5. Byte-diff: capture `papplDeviceWrite()` output by temporarily
+   wrapping it (or use `usbmon`) and diff the PCL section against the
+   baseline `cups-filter-baseline` stream for `text-test.pdf` at 300
+   dpi. The PJL header should match field-for-field; the raster section
+   should have the same compression mode and similar line counts.
+
+If the page is blank or garbled, attach `usbmon` output and compare
+against the Investigation 1 stream byte-by-byte before changing logic.
 
 ### Phase 2 — Feature parity with the baseline filter
 

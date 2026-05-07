@@ -1,0 +1,13 @@
+[Unit]
+Description=Brother HL-5170DN Printer App
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/hl5170dn-printer-app server
+User=printapp
+Group=plugdev
+Restart=on-failure
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
