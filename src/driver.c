@@ -105,7 +105,15 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
     int    hdr_len;
     size_t encoded_len;
 
-    (void)y; /* used only for tracing; omit for Phase 1 */
+    /* Diagnostic: log the very first line of each job so we can verify that
+     * (a) rwriteline_cb is being called at all, (b) bytes_per_line is non-zero,
+     * and (c) the pixel data contains non-zero bytes (actual image content).
+     * Remove once printing is confirmed working. */
+    if (y == 0) {
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "rwriteline y=0: bytes_per_line=%zu line[0]=0x%02x line[1]=0x%02x",
+            bytes_per_line, line[0], bytes_per_line > 1 ? line[1] : 0u);
+    }
 
     encoded_len = packbits_encode(line, bytes_per_line, jd->line_buf);
 
