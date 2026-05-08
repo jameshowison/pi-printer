@@ -5,7 +5,7 @@ After=network.target
 [Service]
 ExecStart=/usr/local/bin/hl5170dn-printer-app server
 User=printapp
-Group=plugdev
+Group=lp
 Restart=on-failure
 StandardError=journal
 

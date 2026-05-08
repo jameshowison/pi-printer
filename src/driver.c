@@ -196,7 +196,14 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     if (strcmp(driver_name, "hl5170dn") != 0)
         return false;
 
-    memset(data, 0, sizeof(*data));
+    /* Do NOT memset(data, 0) here.  PAPPL calls _papplPrinterInitDriverData()
+     * before invoking driver_cb, which zeroes the struct and installs proper
+     * 16×16 dither matrices in data->gdither (clustered-dot) and data->pdither
+     * (blue-noise).  Wiping them to zero causes all pixels with value > 0
+     * (any non-black pixel) to be dropped by the dither check in
+     * papplJobFilterImage, producing a blank page for anything except pure
+     * black text.  We only set the fields we actually care about; PAPPL's
+     * defaults for everything else are correct. */
 
     strncpy(data->make_and_model, "Brother HL-5170DN",
             sizeof(data->make_and_model) - 1);

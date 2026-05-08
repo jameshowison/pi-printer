@@ -1,0 +1,10 @@
+# Grant the lp group read/write access to the Brother HL-5170DN USB device.
+# The printer app (running as the 'printapp' system user, which is in the lp
+# group) uses libusb directly via PAPPL's USB backend — it does not claim the
+# usblp kernel module.  Without this rule the device node is owned by root:root
+# with mode 0600, and the app must run as root to open it.
+#
+# Vendor 04f9 = Brother Industries, product 0023 = HL-5170DN series.
+# Install to /etc/udev/rules.d/ (done by 'make install').
+# Reload with: sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04f9", ATTRS{idProduct}=="0023", MODE="0660", GROUP="lp"

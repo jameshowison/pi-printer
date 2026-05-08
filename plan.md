@@ -363,18 +363,37 @@ Description=Brother HL-5170DN Printer App
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/hl5170dn-printer-app
+ExecStart=/usr/local/bin/hl5170dn-printer-app server
 User=printapp
 Group=lp
 Restart=on-failure
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-`printapp` user needs to be in the `lp` group (USB device access on
-Pi OS) — `make install` documents this but does not create the user
-(prohibited action; Phase 7 README covers it).
+`printapp` is a dedicated system account (no login shell, no home dir)
+in the `lp` group.  The `lp` group is the canonical Linux printer-access
+group; the udev rule grants `lp` read/write on the Brother USB device
+node so `printapp` can open it without running as root.
+
+**Ubuntu install pattern for USB device permissions:**
+
+1. **udev rule** (`99-brother-hl5170dn.rules`) — sets `GROUP=lp
+   MODE=0660` on the device node matched by vendor/product ID.
+   Installed by `make install` to `/etc/udev/rules.d/`.
+2. **Dedicated system user** — `useradd -r -M -G lp -s /usr/sbin/nologin
+   printapp` — no home directory, below UID 1000, in the lp group.
+   `make install` creates this user idempotently (guards with `id -u`).
+3. **Systemd unit** sets `User=printapp Group=lp`.  systemd applies
+   supplementary group membership on service start so the process has
+   the `lp` GID without needing `newgrp`.
+
+`plugdev` is an alternative Ubuntu group for libusb devices, but `lp`
+is semantically correct for a printer and more portable across distros.
+Do NOT add the real login user to `lp` permanently — use the dedicated
+service account and udev instead.
 
 #### 1.11 — Exit criterion and verification
 
@@ -570,8 +589,10 @@ reference material for anyone else looking at this printer.
 ### Phase 7 — Build, packaging, deployment
 
 - Finalise `Makefile` and `make install` targets:
-  binary → `/usr/local/bin`, unit file → `/etc/systemd/system`.
-- `printapp` user creation step in install.
+  binary → `/usr/local/bin`, unit file → `/etc/systemd/system`,
+  udev rule → `/etc/udev/rules.d/99-brother-hl5170dn.rules`.
+- `make install` creates the `printapp` system user (idempotent via
+  `id -u` guard) and reloads udev rules.  See §1.10 for rationale.
 - README rewrite. Cover:
   - Build dependencies (`libpappl-dev`, `libcupsfilters-dev`,
     `ghostscript`, `libusb-1.0-0-dev`) with pinned versions.

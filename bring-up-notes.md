@@ -127,32 +127,29 @@ verify in Phase 4 (Observability).
 `tail -f runtime.log` from a second terminal. Functionally identical
 to the web log viewer for debugging purposes.
 
-## 5. Integer-last-digit truncation in PAPPL's logger (both 1.3 and 1.4)
+## 5. Integer-last-digit truncation in PAPPL's logger — fixed in 1.4.10
 
-PAPPL's `papplLog` formatter chops the last decimal digit of every
-integer it prints. Examples seen on this build:
+PAPPL's `papplLog` formatter was chopping the last decimal digit of
+every integer it printed.  Examples seen on early builds against 1.3.1
+(and incorrectly attributed to 1.4.10 as well):
 
-| Actual value | What the log shows |
+| Actual value | What the broken log showed |
 |---|---|
 | `port 8000`               | `:800`               |
 | `MAX_CLIENTS 32768`       | `up to 3276`         |
 | `data->ppm = 21`          | `Driver reports ppm 2` |
 | `data->x_resolution = 300`| `printer-resolution-default=30x30dpi` |
 
-Confirmed present in both 1.3.1 and 1.4.10. **Cosmetic only** — the
-internal values PAPPL uses are correct (text-test.pdf prints crisply
-at 300 dpi, which wouldn't happen if PAPPL believed the printer was
-30 dpi). But it makes log-reading misleading.
+**Update (2026-05-08):** The 2026-05-08 startup log against the
+confirmed-1.4.10 binary shows all integers printed correctly:
+`8000`, `32768`, `300x300dpi`, `ppm 21`.  The truncation bug was
+most likely present only in 1.3.1 (or an early 1.4.x), and was fixed
+by 1.4.10.  The earlier note "confirmed in 1.4.10" was made before the
+`-Wl,-rpath` fix landed — at that point `ldd` still showed the binary
+using the 1.3.1 apt library, so the "1.4" test was actually 1.3.1.
 
-When debugging, treat PAPPL's own log lines (`I [...]` and `D [...]`
-banners) as approximate and rely on driver-side `papplLogJob` lines
-for ground truth. Our `rstartjob_cb` logs `start job: %ddpi, %u
-bytes/line` — `%ddpi` shows the actual value PAPPL handed us via
-`options->header.HWResolution[0]`, so that's the trustworthy
-"what resolution is the engine working at" reading.
-
-Worth filing upstream once we have a reduced repro. Out of scope for
-shipping the driver.
+**Conclusion:** with PAPPL 1.4.10 linked correctly, the logger is
+trustworthy.  No need to treat PAPPL's own log lines as approximate.
 
 ## 6. PAPPL 1.3.1 → 1.4 API drifts the agent had to fix
 
@@ -260,7 +257,106 @@ printer gets two PJL headers) the fix is:
      of calling the raster callbacks.  This bypasses PJL wrapping but should
      still print if the printer accepts bare PCL.
 
-## 11. PDF→PBM via gs pbmraw — verified format matches rwriteline_cb
+## 11. papplJobFilterImage — full read confirms raster call sequence and dither
+
+Read `job-filter.c` for the authoritative call sequence PAPPL uses for
+image jobs (JPEG, PNG):
+
+1. `malloc(options->header.cupsBytesPerLine)` — allocates the line buffer
+   with the value from `papplJobCreatePrintOptions`, which is always
+   non-zero by this point.
+2. `rstartjob_cb(job, options, device)`.
+3. For each copy and page:
+   - `rstartpage_cb(job, options, device, page)`.
+   - Leading blank lines (above image top): `memset(line, white, …)`,
+     then `rwriteline_cb` for each.
+   - Image lines: dither/scale from decoded pixels, then `rwriteline_cb`.
+   - Trailing blank lines: same as leading.
+   - `rendpage_cb(job, options, device, page)`.
+4. `rendjob_cb(job, options, device)`.
+
+The `white` value used for blank lines is `0x00` for `CUPS_CSPACE_K`
+(which `PAPPL_PWG_RASTER_TYPE_BLACK_1` maps to) and `0xff` for grayscale.
+In PCL, `0x00` = all-white (no ink), which is correct.
+
+The dither threshold for 1-bit black is: `if (*pixptr <= dither[x & 15])`.
+Smaller pixel values (darker) are more likely to set a dot.  This only
+works if `dither` contains the real dither matrix — see §12 for the blank-
+page bug caused by zeroing it.
+
+## 12. Do NOT memset the driver data struct in driver_cb — it wipes the dither tables
+
+`papplPrinterCreate` (in `printer.c`) calls `_papplPrinterInitDriverData(&data)`
+**before** calling your `driver_cb`.  That internal function:
+
+1. Zeroes the whole struct.
+2. Installs a 16×16 clustered-dot dither matrix in `data.gdither`.
+3. Installs a 16×16 blue-noise dither matrix in `data.pdither`.
+4. Sets a handful of sane defaults (`orient_default`, `quality_default`, etc.).
+
+If your `driver_cb` then does `memset(data, 0, sizeof(*data))`, you wipe out
+both dither tables.  `papplJobCreatePrintOptions` later copies the (now
+all-zero) table into `options->dither`.  Inside `papplJobFilterImage` the
+dither threshold check is:
+
+```c
+if (*pixptr <= dither[x & 15])   // set a dot?
+    byte |= bit;
+```
+
+With `dither = 0`, only pixels with value **exactly 0** (pure black) produce
+a dot.  Every gray or white pixel is silently dropped.  The result:
+
+- **Pure-black text** (pixel value 0 from gs) → prints correctly.
+- **Photos / anything with midtones or whites** → nearly blank page.
+
+This is why `text-test.pdf` passed Phase 1 verification but every photo or
+iPhone print produced a blank page.
+
+**Fix:** Do NOT call `memset` in `driver_cb`.  PAPPL's initialisation already
+zeroed the struct and set the dither tables.  Your callback should only set
+the fields it cares about on top of those defaults.  If you genuinely need to
+zero a specific sub-struct, target it by field name.
+
+Discovered by reading `_papplPrinterInitDriverData` in `printer-driver.c`
+and `papplJobFilterImage` in `job-filter.c` from the PAPPL 1.4.10 source.
+
+## 13. Port 8000 "Address already in use" on startup
+
+PAPPL logs `listening for connections on 'hostname:8000'` in its very
+first startup line, then immediately tries to bind.  If another process
+already holds port 8000 (most commonly a previous instance of the
+printer app that wasn't killed cleanly), both IPv4 and IPv6 bind
+attempts fail:
+
+```
+E [...] Unable to create listener socket for '0.0.0.0:8000': Address already in use
+E [...] Unable to create listener socket for '[v1.::]:8000': Address already in use
+```
+
+PAPPL continues to start (the Unix domain socket still works for local
+IPC), but the IPP/AirPrint port is unavailable.  Clients (iPhone,
+Mac) will discover the printer via mDNS but get `Connection refused`
+when they try to print.  The printer appears online but every job
+silently fails.
+
+**Fix for development:** always kill any running instance before
+restarting:
+
+```bash
+pkill -x hl5170dn-printer-app; sleep 1
+sudo ./hl5170dn-printer-app server 2>&1 | tee runtime.log
+```
+
+**Fix for production (systemd):** the `Restart=on-failure` in the unit
+file is sufficient — when systemd restarts the service after a crash the
+old process is gone and the port is free.  Only becomes a problem if you
+manually start a second instance alongside the managed service.
+
+**Finding the culprit:** `ss -tlnp | grep 8000` or `lsof -i :8000`
+shows what process holds the port.
+
+## 14. PDF→PBM via gs pbmraw — verified format matches rwriteline_cb
 
 `gs -sDEVICE=pbmraw` produces P4 (raw PBM): 1-bit, MSB-first, pixels packed
 8 per byte, rows padded to byte boundaries.  Width in bytes = ceil(width/8).

@@ -37,4 +37,8 @@ clean:
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 hl5170dn-printer-app.service /etc/systemd/system/
+	install -m 644 99-brother-hl5170dn.rules /etc/udev/rules.d/
+	id -u printapp 2>/dev/null || \
+	    useradd -r -M -G lp -s /usr/sbin/nologin printapp
+	udevadm control --reload-rules && udevadm trigger
 	systemctl daemon-reload
