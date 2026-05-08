@@ -119,6 +119,53 @@ summary lifted into this file under Phase 1 once they're in.
    All required callbacks and device APIs present and compiling.
    Re-check for Phase 3 (vendor options / job-creation hooks).
 
+**Deployment note — rendering host.** The printer-app may run directly on
+a Mac or Linux laptop with the Pi as a pure USB pass-through, or on the Pi
+itself acting as an IPP server. Render times below are Pi 3B+ baselines;
+a modern laptop renders 5–10× faster, which eliminates the keepalive risk
+and makes 600 dpi the practical default everywhere except Pi-hosted photo
+jobs.
+
+**Rendering and halftoning architecture.** There are three distinct paths,
+and the choice of *who halftones* (driver vs. printer) determines both
+quality and Pi render time:
+
+| Path | GS device | Input res | Text quality | Photo quality | Pi render (text/photo) |
+|------|-----------|-----------|-------------|---------------|------------------------|
+| 300 dpi threshold (current) | `pbmraw` | 300 dpi | Marginal | Poor | 0.8 s / 21 s |
+| 600 dpi 1-bit + ordered dither | `pgmraw` | 600 dpi | Excellent | Very good | ~3 s / ~45 s |
+| APT Mode 1024 (printer halftones) | `pgmraw` | ≤150 dpi | Poor† | Potentially best | ~0.5 s / ~5 s |
+
+† APT at 150 dpi rasterises text poorly; APT is the right path for photo
+pages only. For mixed content, 600 dpi 1-bit is the safe single path.
+
+**Path 1 — 300 dpi threshold:** Current `pdf_filter_cb` calls
+`gs -sDEVICE=pbmraw -r300`, reads the 1-bit PBM, and feeds rows directly
+to `rwriteline_cb`. GS applies a simple 50% threshold — no halftoning.
+Acceptable for pure-black vector text; poor for anything with midtones.
+
+**Path 2 — 600 dpi 1-bit with driver-side ordered dithering:** Change GS
+device to `pgmraw` (8-bit grayscale) at 600 dpi, then apply an ordered
+dither (clustered-dot or blue-noise) in `pdf_filter_cb` before calling
+`rwriteline_cb`. This matches what the legacy CUPS filter did (`ljet4` at
+600 dpi uses GS's internal dither screen). At 600 dpi a 16×16 dither screen
+is ~75 lpi — near offset-press quality. **Requires keepalive** (see below):
+45 s photo render on Pi 3B+ exceeds USB idle-sleep threshold.
+
+**Path 3 — APT via PCL Mode 1024 (printer-side halftoning):** The Brother
+PCL manual §6.3.8 documents Mode 1024: send an 8-bit grayscale TIFF file
+as a single `ESC*b###W` payload (the 32,767-byte limit is lifted in this
+mode). When `Bits/Sample=8` and the printer is in 600 dpi mode, the printer
+activates **APT (Automatic Photo Technology)** — its own halftoning
+algorithm, tuned for this laser engine's dot gain and toner. The manual
+recommends ≤150 dpi input to reduce data size; the printer scales and
+halftones internally. The HL-5170DN is explicitly listed as APT-capable
+in the PJL manual (line 859: `APT ON or OFF`). TIFF construction is ~30
+lines of C (fixed header, raw pixels). This path is **untested** — quality
+unknown until printed. If it works, it is the highest-quality photo path
+*and* the fastest on the Pi (5 s photo render vs. 45 s for 600 dpi). Phase
+6 investigates this.
+
 **Open question from Phase 0 — USB keepalive during rendering.**
 GS render takes 21–45 s for image input, which exceeds the printer's
 USB idle-sleep threshold. PAPPL owns the USB device, but the render
@@ -414,6 +461,14 @@ against the Investigation 1 stream byte-by-byte before changing logic.
 
 ### Phase 2 — Feature parity with the baseline filter
 
+**Status: in progress (2026-05-08).** Phase 2.0 unblocking steps complete:
+PDF→PWG MIME filter wired (commit `b4f955a`); blank-page dither bug fixed by
+removing `memset(data,0)` in `driver_cb` (commit `be2c90f`; details in
+[`bring-up-notes.md`](bring-up-notes.md) §12); `rwriteline` y=0 diagnostic
+added. Remaining: drop `force_raster_type` (§2.0 step 2), promote rwriteline
+trace to y%256 DEBUG form (§2.0 step 3), full feature expansion (§2.1),
+and Phase 2.2 exit-criteria verification.
+
 #### 2.0 — Start here: unblock iPhone AirPrint, then add features
 
 Three small changes go first because they unblock everything else and
@@ -455,7 +510,14 @@ mapping table in the PRD (§"PJL command mapping") is copied verbatim
 from `legacy/brother-hl5170dn-pjl`; it's known-good against this
 printer.
 
-- Resolutions: 300 + 600. (HQ1200 deferred to Phase 6.)
+- Resolutions: 300 + 600. (HQ1200 deferred to Phase 6.) At 600 dpi the
+  `pdf_filter_cb` must switch from `pbmraw` to `pgmraw` (8-bit grayscale)
+  and apply ordered dithering before calling `rwriteline_cb` — simple
+  threshold at 600 dpi is fine for text but still poor for photos. **Add
+  keepalive (`@PJL SET POWERSAVE=OFF` in `rstartjob_cb`) at the same time
+  as 600 dpi** — the 45 s Pi render for photo PDFs at 600 dpi exceeds USB
+  idle-sleep threshold. On a laptop the render is 5–10× faster and the risk
+  is lower, but keepalive is cheap and correct regardless of host.
 - Media sizes: A4, A5, A6, Legal, Executive, plus envelope variants
   (DL, C5, Com10, Monarch, ISOB5).
 - Sources: `tray-1`, `by-pass-tray`, `auto`.
@@ -565,26 +627,54 @@ without it and document the attempt.
 Exit criterion: PRD test item 5 — web UI shows *something* sensible
 (a level, or "unknown"). Not a crash.
 
-### Phase 6 — HQ1200 (stretch)
+### Phase 6 — HQ1200 + APT photo quality (stretch)
 
-Strategy depends on Phase 0 investigation 1.
+Two investigations in one phase, either of which is a worthwhile
+standalone result:
 
-- **If pi-printer's "HQ1200" is nominal-only** (no Mode 1027 in the
-  capture): match it. Declare `HQ1200`, set `@PJL SET RESOLUTION=1200`,
-  emit standard 600 dpi mode-2 raster. Document the limitation.
-  This is PRD option 2.
-- **If pi-printer is actually emitting Mode 1027 / 1024 / 1152**, or
-  if we choose to chase actual 2400×600 output regardless: implement
-  Brother's mode 1024 + 1152 raster compression from `Tech_Manual_Ch2_PCL`
-  (Brother manual §6.3.8 + §6.3 "Horizontal 1200-dpi image format
-  mode," roughly pages 89–101 of the PCL chapter). This is PRD
-  option 3 and is the most interesting outcome for the meta-goal of
-  evaluating agentic coding on undocumented vendor protocols. **Time-box
-  this** — if focused effort doesn't yield working output, fall back
-  to the nominal approach with documentation.
+#### 6A — APT photo path (Mode 1024)
 
-Either way: publish the byte-level investigation. It's useful
-reference material for anyone else looking at this printer.
+Implement the highest-quality photo rendering path discovered during
+Phase 2 planning (see rendering architecture note above).
+
+1. In `pdf_filter_cb`, detect whether the job's print-quality attribute
+   is `high` (IPP value 5) or a future `photo` mode. If so, activate the
+   APT path instead of the 600 dpi 1-bit path.
+2. Render the PDF with `gs -sDEVICE=pgmraw -r150` (8-bit grayscale,
+   150 dpi — the manual's recommended APT input resolution).
+3. Wrap the raw PGM pixels in a minimal TIFF: IFD with tags
+   `ImageWidth`, `ImageLength`, `BitsPerSample=8`,
+   `Compression=1` (no compression), `PhotometricInterpretation=1`
+   (min-is-black), `SamplesPerPixel=1`, `XResolution=150`,
+   `YResolution=150`, `StripOffsets`, `StripByteCounts`.
+   Total header ≈ 136 bytes; image data follows immediately.
+4. Emit PCL sequence: `@PJL SET RESOLUTION=600`, `ESC*t600R`,
+   `ESC*b1024M`, `ESC*r1A`, single `ESC*b<size>W<TIFF bytes>`, `ESC*rC`.
+5. Print `image-test.pdf` and a photo PDF. Assess output quality
+   side-by-side with the 600 dpi 1-bit path from Phase 2.
+
+If APT quality is good: make it the default for `print-quality=high`
+and document it. If quality is poor or the printer rejects the TIFF:
+document the attempt and stay on 600 dpi 1-bit for photos.
+
+#### 6B — HQ1200
+
+Phase 0 investigation 1 found the baseline uses standard 1200 dpi
+packbits — no Mode 1027. Strategy is therefore PRD option 2:
+
+Declare `HQ1200`, set `@PJL SET RESOLUTION=1200`, run GS at 1200 dpi,
+emit mode-2 packbits. Text quality approaches typeset at 1200 dpi;
+photos at 1200 dpi are impractical on Pi (render ~180 s) but fine on a
+laptop. Recommend `HQ1200` only for text-dominant jobs on Pi, or
+unrestricted on laptop.
+
+If there is appetite for true 2400×600 output via Mode 1027, that is
+PRD option 3: implement Brother's Mode 1027 raster format from
+`Tech_Manual_Ch2_PCL` §6.3.13 (pages 98–100). **Time-box strictly** —
+if a day of effort doesn't yield working output, fall back to option 2
+and document the attempt.
+
+Either way: publish the byte-level investigation.
 
 ### Phase 7 — Build, packaging, deployment
 
