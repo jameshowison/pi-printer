@@ -111,8 +111,8 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
      * Remove once printing is confirmed working. */
     if (y == 0) {
         papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-            "rwriteline y=0: bytes_per_line=%zu line[0]=0x%02x line[1]=0x%02x",
-            bytes_per_line, line[0], bytes_per_line > 1 ? line[1] : 0u);
+            "rwriteline y=0: bytes_per_line=%u line[0]=0x%02x line[1]=0x%02x",
+            (unsigned)bytes_per_line, line[0], bytes_per_line > 1 ? line[1] : 0u);
     }
 
     encoded_len = packbits_encode(line, bytes_per_line, jd->line_buf);
