@@ -15,10 +15,15 @@ shipping today) is preserved in git at tag **`cups-filter-baseline`**
 (`4602cfc`). Diff against that tag if you need to recover any decision
 or operational note from the prior architecture.
 
+The document `hl5170dn_revised_plan.md` records the architectural
+decision made after Phase 1 to adopt driver-owned streaming raster
+generation. That decision is incorporated here; the revised plan file
+is kept as a historical record.
+
 ## Why a rewrite
 
 The CUPS-filter baseline works for the 95% case (Mac/text PDFs) but has
-three structural problems the filter architecture can't fix from inside:
+structural problems the filter architecture can't fix from inside:
 
 1. **AirPrint photo prints from iOS stall.** Job 10 sat for 1.5 h with
    the CUPS USB backend looping `Waiting for printer to become available`
@@ -29,22 +34,91 @@ three structural problems the filter architecture can't fix from inside:
    resolution step) to work, and CUPS doesn't give a filter that hook.
 3. **No web admin UI, no live log viewer, no per-printer log level.**
    PAPPL provides all of these for free; CUPS does not.
+4. **Generic upstream halftoning quality is poor.** Framework-owned
+   `BLACK_1` raster throws away grayscale information before the driver
+   can act on it.
 
-A native PAPPL driver fixes all three by collapsing the pipeline into
+A native PAPPL driver fixes all four by collapsing the pipeline into
 one process that owns the IPP attributes, the raster generation, the
 USB device, and the web UI together.
+
+## Architectural decision (post-Phase-1)
+
+Phase 1 validated PAPPL integration, USB transport ownership, PJL/PCL
+correctness, and minimal raster output. It also revealed a fundamental
+limitation of the `BLACK_1` bring-up path:
+
+```
+PDF → PAPPL raster → BLACK_1 → PCL
+```
+
+throws away grayscale information too early, preventing printer-aware
+halftoning, adaptive photo handling, and APT experimentation.
+
+**The Phase 1 `BLACK_1` architecture is a bring-up simplification, not
+the final architecture.**
+
+### Division of responsibility from Phase 2 onward
+
+**PAPPL owns:** IPP, AirPrint, printer discovery, web UI, logging, USB
+device ownership, job lifecycle, queue management.
+
+**The driver owns:** Ghostscript invocation, grayscale raster generation,
+halftoning, PCL encoding, raster streaming, print-quality strategy.
+
+`papplSystemAddMIMEFilter()` is used only to accept document formats and
+route them into the driver's rendering pipeline. PAPPL is not the owner
+of final raster generation.
+
+### Why the driver owns halftoning
+
+Gutenprint evolved specifically because generic upstream dithering was
+visually inferior, lacked printer-specific tuning, and could not adapt
+to printer characteristics. The same considerations apply here. The
+HL-5170DN is simpler than a photo inkjet — monochrome, fixed dot size —
+but toner/dot gain behaviour and visible halftone structure still matter.
+Grayscale data should remain intact as long as possible.
+
+### Internal raster representation
+
+The driver's canonical internal representation from Phase 2 onward is
+**8-bit grayscale**, not 1-bit. Ghostscript produces grayscale pages
+(`pgmraw`); the driver then decides threshold vs. ordered dither,
+resolution, compression, and whether printer firmware should halftone.
+
+### Streaming architecture
+
+The original Phase 1 model buffered full raster before transmission.
+That model increases memory usage, delays first-page output, complicates
+cancellation, and creates long USB idle periods that risk printer
+sleep-mode wedging.
+
+Phase 2 adopts streaming:
+
+```
+Ghostscript stdout
+    ↓
+driver-side halftone
+    ↓
+PackBits encoder
+    ↓
+papplDeviceWrite()
+```
+
+Rows are processed incrementally. Benefits: minimal USB silence, low RAM
+usage, responsive cancellation, immediate first-page output, and simpler
+handling of large photo jobs. Streaming is the primary mitigation for
+both Pi render latency and USB keepalive risk.
 
 ## Constraints carried over from the baseline plan
 
 - **Keep the Brother HL-5170DN.** 2003-vintage USB+Ethernet mono laser.
   Mechanically excellent, toner is cheap.
-- **Pi 3B+ as the print server.** Day-zero investigation 2 confirms
-  whether GS render is fast enough; if not, the Pi 5 / 300 dpi default
-  / Ethernet-instead-of-USB / new-printer escape hatches from the
-  baseline plan still apply.
-- **USB only.** The PRD explicitly drops Ethernet; using
-  `socket://...:9100` would route around the interesting hard parts
-  (USB back-channel, libusb plumbing, sleep-mode quirks).
+- **Pi 3B+ as the print server.** Phase 0 investigation 2 confirms
+  render times; streaming architecture mitigates the keepalive risk.
+- **USB only.** Using `socket://...:9100` would route around the
+  interesting hard parts (USB back-channel, libusb plumbing,
+  sleep-mode quirks).
 
 ## Goals (mirroring the PRD; tracked here for status)
 
@@ -68,35 +142,13 @@ The phasing is deliberately "skeleton first, features second, polish
 third." Each phase ends in something printable so we can reality-check
 against the physical printer rather than against our model of it.
 
-### Phase 0 — Day-zero investigations (do before writing driver code)
+---
 
-These are the PRD's "open questions." Each one shapes the architecture
-of later phases, so all four happen first. Time-box: one day total,
-parallelise where possible.
+### Phase 0 — Day-zero investigations
 
-**Run on the Pi**, not in the Cowork sandbox — they all need physical
-access to the printer or to Pi 3B+ silicon. The runbook lives at
-[`phase-0-investigations.md`](phase-0-investigations.md) with concrete
-commands, expected output, and decision rules. In short:
+**Status: complete (2026-05-07).**
 
-1. **Capture the baseline filter's USB byte stream at HQ1200.** Use
-   `usbmon` while a `cupsPrintQuality=High` job runs through the
-   CUPS filter (now in `legacy/`). Look for `<ESC>*r1027`, mode 1024,
-   mode 1152. Outcome determines Phase 6 strategy.
-2. **Time `gs -sDEVICE=ljet4 -r600` on the Pi 3B+** for `text-test.pdf`
-   and `image-test.pdf`. If a photo PDF takes >10 s, plan on `300dpi`
-   as the default for Phase 1.
-3. **Verify `papplDeviceRead()` returns back-channel bytes** from
-   this printer. Probe binary in the runbook. Outcome shapes Phase 5:
-   if it works, supply polling is feasible; if not, Phase 5 ships as
-   "unknown" and we move on.
-4. **Build PAPPL from source on Raspberry Pi OS 64-bit** if
-   `libpappl-dev` from apt is too old. Pin the version.
-
-Deliverable: findings recorded in `phase-0-investigations.md`,
-summary lifted into this file under Phase 1 once they're in.
-
-**Phase 0 complete (2026-05-07). Summary of findings:**
+**Phase 0 findings:**
 
 1. **HQ1200 byte stream** — baseline uses genuine 1200 dpi raster with
    standard PCL5e mode-2 (packbits) and mode-3 (delta row) compression;
@@ -105,110 +157,75 @@ summary lifted into this file under Phase 1 once they're in.
    emit mode-2 packbits. No proprietary encoding work required.
 
 2. **GS render timing** — text PDF @ 600 dpi: ~0.8 s (fine). Image PDF
-   @ 600 dpi: ~45 s; @ 300 dpi: ~21 s. Both exceed the safe USB-keepalive
-   window for photo input. **Phase 1 defaults to 300 dpi.** Pi 5 is the
-   upgrade path for 600 dpi photo performance.
+   @ 600 dpi: ~45 s; @ 300 dpi: ~21 s. Both exceed the safe USB
+   keepalive window for photo input at 300 and 600 dpi.
+   Streaming (Option C below) is the primary mitigation; Phase 1 defaults
+   to 300 dpi as a conservative fallback. Pi 5 is the upgrade path for
+   600 dpi photo performance without streaming.
 
-3. **papplDeviceRead() back-channel** — works. Response in ~400 ms from
-   sleep. STATUS codes: `CODE=10001` = READY, `CODE=40000` = SLEEP.
+3. **`papplDeviceRead()` back-channel** — works. Response in ~400 ms
+   from sleep. STATUS codes: `CODE=10001` = READY, `CODE=40000` = SLEEP.
    `INFO SUPPLIES` returns `"?"` — toner level unavailable. Phase 5 can
    poll ready/sleep state; `marker-levels` will be `-2` (unknown).
    USB URI: `usb://Brother/HL-5170DN%20series?serial=L4J624176`.
 
-4. **libpappl-dev version** — apt 1.3.1 is sufficient for Phases 1–5.
-   All required callbacks and device APIs present and compiling.
-   Re-check for Phase 3 (vendor options / job-creation hooks).
+4. **libpappl-dev version** — apt 1.3.1 is present on the Pi but
+   source-built PAPPL 1.4.10 is the pinned baseline (required for
+   `papplSystemAddMIMEFilter()` and related APIs). All required
+   callbacks and device APIs present and compiling.
 
 **Deployment note — rendering host.** The printer-app may run directly on
 a Mac or Linux laptop with the Pi as a pure USB pass-through, or on the Pi
-itself acting as an IPP server. Render times below are Pi 3B+ baselines;
-a modern laptop renders 5–10× faster, which eliminates the keepalive risk
-and makes 600 dpi the practical default everywhere except Pi-hosted photo
-jobs.
+itself acting as an IPP server. Render times above are Pi 3B+ baselines;
+a modern laptop renders 5–10× faster.
 
-**Rendering and halftoning architecture.** There are three distinct paths,
-and the choice of *who halftones* (driver vs. printer) determines both
-quality and Pi render time:
+**Rendering and halftoning paths:**
 
 | Path | GS device | Input res | Text quality | Photo quality | Pi render (text/photo) |
 |------|-----------|-----------|-------------|---------------|------------------------|
-| 300 dpi threshold (current) | `pbmraw` | 300 dpi | Marginal | Poor | 0.8 s / 21 s |
-| 600 dpi 1-bit + ordered dither | `pgmraw` | 600 dpi | Excellent | Very good | ~3 s / ~45 s |
+| 300 dpi threshold | `pgmraw` | 300 dpi | Marginal | Poor | 0.8 s / 21 s |
+| 600 dpi driver-side ordered dither | `pgmraw` | 600 dpi | Excellent | Very good | ~3 s / ~45 s |
 | APT Mode 1024 (printer halftones) | `pgmraw` | ≤150 dpi | Poor† | Potentially best | ~0.5 s / ~5 s |
 
-† APT at 150 dpi rasterises text poorly; APT is the right path for photo
-pages only. For mixed content, 600 dpi 1-bit is the safe single path.
+† APT at 150 dpi rasterises text poorly; APT is right for photo pages
+only. For mixed content, 600 dpi ordered dither is the safe single path.
 
-**Path 1 — 300 dpi threshold:** Current `pdf_filter_cb` calls
-`gs -sDEVICE=pbmraw -r300`, reads the 1-bit PBM, and feeds rows directly
-to `rwriteline_cb`. GS applies a simple 50% threshold — no halftoning.
-Acceptable for pure-black vector text; poor for anything with midtones.
+**Content-type strategy:**
 
-**Path 2 — 600 dpi 1-bit with driver-side ordered dithering:** Change GS
-device to `pgmraw` (8-bit grayscale) at 600 dpi, then apply an ordered
-dither (clustered-dot or blue-noise) in `pdf_filter_cb` before calling
-`rwriteline_cb`. This matches what the legacy CUPS filter did (`ljet4` at
-600 dpi uses GS's internal dither screen). At 600 dpi a 16×16 dither screen
-is ~75 lpi — near offset-press quality. **Requires keepalive** (see below):
-45 s photo render on Pi 3B+ exceeds USB idle-sleep threshold.
+| Content type | Planned render path |
+|---|---|
+| Text / vector-heavy | 600 or 1200 dpi driver-side dither |
+| Mixed office documents | 600 dpi driver-side dither |
+| Full-page photo jobs | APT Mode 1024 (if validated in Phase 6) |
 
-**Path 3 — APT via PCL Mode 1024 (printer-side halftoning):** The Brother
-PCL manual §6.3.8 documents Mode 1024: send an 8-bit grayscale TIFF file
-as a single `ESC*b###W` payload (the 32,767-byte limit is lifted in this
-mode). When `Bits/Sample=8` and the printer is in 600 dpi mode, the printer
-activates **APT (Automatic Photo Technology)** — its own halftoning
-algorithm, tuned for this laser engine's dot gain and toner. The manual
-recommends ≤150 dpi input to reduce data size; the printer scales and
-halftones internally. The HL-5170DN is explicitly listed as APT-capable
-in the PJL manual (line 859: `APT ON or OFF`). TIFF construction is ~30
-lines of C (fixed header, raw pixels). This path is **untested** — quality
-unknown until printed. If it works, it is the highest-quality photo path
-*and* the fastest on the Pi (5 s photo render vs. 45 s for 600 dpi). Phase
-6 investigates this.
-
-**Open question from Phase 0 — USB keepalive during rendering.**
-GS render takes 21–45 s for image input, which exceeds the printer's
-USB idle-sleep threshold. PAPPL owns the USB device, but the render
-runs before `rstartjob_cb` is called (or inside it via GS pipe); the
-printer sees silence and may enter sleep, requiring a ~400 ms re-wake
-that can stall or wedge the job. Investigate before or during Phase 1:
+**USB keepalive options (documented for reference; streaming is primary):**
 
 - **Option A — PJL ping thread**: spawn a background thread in
   `rstartjob_cb` that sends `@PJL INFO STATUS\r\n` every ~8 s over
-  the USB back-channel and reads (drains) the reply, keeping the link
-  active. Thread is cancelled and joined before the first PCL byte
-  goes out. Risk: overlapping PJL/PCL traffic if thread and main
-  disagree on timing.
+  the USB back-channel and drains the reply. Thread cancelled and joined
+  before the first PCL byte goes out. Risk: overlapping PJL/PCL traffic.
 - **Option B — disable printer sleep via PJL**: send
-  `@PJL SET POWERSAVE=OFF\r\n` in `rstartjob_cb`'s PJL header (before
-  `ENTER LANGUAGE=PCL`), re-enable with `@PJL SET POWERSAVE=ON` at
-  `rendjob_cb`. Check `Tech_Manual_Ch5_PJL` §POWERSAVE for whether the
-  HL-5170DN honours this command. Cleanest solution if it works;
-  downside is the printer stays on when idle between jobs.
-- **Option C — stream GS output**: instead of buffering full raster
-  before sending, pipe GS stdout directly into the PCL send path so
-  bytes start flowing to the printer immediately after the PJL header.
-  Eliminates the silent gap entirely at the cost of a more complex
-  `rstartjob_cb` / `rwriteline_cb` wiring (GS must be launched as a
-  child process with a pipe, and `rwriteline_cb` reads from that pipe).
-  This is architecturally cleanest and also removes the intermediate
-  buffer allocation for large photo pages.
+  `@PJL SET POWERSAVE=OFF\r\n` in `rstartjob_cb`'s PJL header, re-enable
+  with `@PJL SET POWERSAVE=ON` at `rendjob_cb`. Cleanest if the
+  HL-5170DN honours it; downside is the printer stays on between jobs.
+  Check `Tech_Manual_Ch5_PJL` §POWERSAVE before relying on this.
+- **Option C — streaming (adopted)**: pipe GS stdout directly into the
+  PCL send path so bytes start flowing to the printer immediately after
+  the PJL header. Eliminates the silent gap entirely. This is the
+  Phase 2 architecture; A/B become fallbacks if streaming reveals
+  edge-case stalls.
 
-Recommendation: try Option B first (single PJL line, no threading);
-if the HL-5170DN doesn't honour `POWERSAVE=OFF`, fall back to Option A.
-Reserve Option C for Phase 2 if A/B still produce stalls on real photo
-input, because it requires restructuring the job-start path. Record the
-outcome in this section before Phase 2 begins.
+---
 
-### Phase 1 — Skeleton driver: one page of text at 600 dpi
+### Phase 1 — Skeleton driver: one page of text at 300 dpi
 
 **Status: complete (2026-05-07).** `text-test.pdf` prints cleanly on
-the physical HL-5170DN at 300 dpi (commit `2594fe8`). PAPPL's web admin
-UI is reachable at `http://tuttle-pi.local:8000/` after enabling the
+the physical HL-5170DN at 300 dpi (commit `2594fe8`). PAPPL web admin
+UI reachable at `http://tuttle-pi.local:8000/` after enabling
 `_WEB_INTERFACE | _WEB_LOG | _WEB_REMOTE` SOPTIONS flags and supplying
 a non-NULL `footer_html` to `papplMainloop`. Final default resolution
 is 300 dpi (Investigation 2 finding); 600 dpi and HQ1200 deferred to
-Phases 2 and 6 respectively.
+Phases 2 and 6.
 
 Phase 1 surfaced more PAPPL bring-up gotchas than expected — the
 1.3.1 → 1.4.10 source-build upgrade, the `papplLocGetString` /
@@ -219,17 +236,16 @@ last-decimal-digit truncation bug in PAPPL's logger present in both
 [`bring-up-notes.md`](bring-up-notes.md) so the next person hitting
 them has a head start.
 
-Smallest thing that prints. Resolves the PAPPL API shape before we
-commit to feature work. All files live in a new top-level `src/`
-directory; the repo root stays clean.
+Phase 1 intentionally prioritised protocol correctness over image
+quality architecture. The `BLACK_1` path is now retired.
 
-#### 1.1 — Source layout
+#### Source layout (established in Phase 1)
 
 ```
 src/
   main.c          # papplMainloop() entry point, system/printer setup
   driver.c        # driver_cb, all raster callbacks, identify_cb, status_cb
-  pjl.c           # PJL header construction helpers (extracted so Phase 2 can extend)
+  pjl.c           # PJL header construction helpers
   pjl.h
   packbits.c      # packbits encoder (used in rwriteline_cb)
   packbits.h
@@ -237,172 +253,7 @@ Makefile
 hl5170dn-printer-app.service   # systemd unit template
 ```
 
-No single-file approach — keeping `pjl.c` and `packbits.c` separate
-means Phase 2 can extend PJL without touching raster code.
-
-#### 1.2 — Makefile
-
-`pkg-config`-driven; no autotools. Targets:
-
-- `all` → `hl5170dn-printer-app`
-- `install` → binary to `/usr/local/bin`, unit to
-  `/etc/systemd/system/`, then `systemctl daemon-reload`
-- `clean`
-
-Flags: `-Wall -Wextra -g` for Phase 1 (strip `-g` in Phase 7).
-Dependencies: `pappl`, `cupsfilters` (for `cfOneBitLine()`). No direct
-`libusb` link — PAPPL's USB backend owns the device; the driver never
-calls libusb directly.
-
-#### 1.3 — `main.c`
-
-```c
-papplMainloop(argc, argv,
-    "1.0",                      // version string
-    NULL,                       // footer HTML
-    1, drivers, driver_cb,      // one driver entry
-    NULL,                       // setup_cb (unused)
-    NULL);                      // subcmd_name / subcmd_cb (unused)
-```
-
-`drivers[]` is a single `pappl_pr_driver_t` entry:
-`{ "hl5170dn", "Brother HL-5170DN", NULL, NULL }`.
-
-`driver_cb` signature: `pappl_pr_driver_data_t *data, ipp_t **attrs,
-const char *driver_name, void *cbdata` — fill `data` in place.
-
-System creation via `papplSystemCreate()` with:
-- `PAPPL_SOPTIONS_MULTI_QUEUE` off (single printer),
-- hostname `NULL` (use system default / Bonjour),
-- port 8000,
-- `NULL` TLS options (plain HTTP for Phase 1).
-
-Printer added via `papplSystemAddPrinter()` after system create, with
-device URI from `argv` or hardcoded
-`usb://Brother/HL-5170DN%20series?serial=L4J624176` for Phase 1 (make
-it a `#define` so Phase 7 can replace it with a CLI flag).
-
-#### 1.4 — `driver_cb` (in `driver.c`)
-
-Fills `pappl_pr_driver_data_t`:
-
-| Field | Phase 1 value |
-|---|---|
-| `input_face_up` | `false` |
-| `has_copies` | `false` (Phase 2) |
-| `identify_supported` | `PAPPL_IDENTIFY_ACTIONS_SOUND` (no-op stub) |
-| `num_resolution` | 1 |
-| `x_resolution[0]`, `y_resolution[0]` | 300 (Phase 0 finding 2: default 300 dpi) |
-| `x_default`, `y_default` | 300 |
-| `raster_types` | `PAPPL_PWG_RASTER_TYPE_BLACK_1` |
-| `force_raster_type` | same |
-| `num_media` | 1 — `"na_letter_8.5x11in"` |
-| `media_default` | Letter, 300 dpi, `"tray-1"`, `"stationery"` |
-| `num_source` | 2 — `"tray-1"`, `"by-pass-tray"` |
-| `num_type` | 1 — `"stationery"` |
-| `duplex` | `PAPPL_DUPLEX_NONE` |
-| Callbacks | set all five: `rstartjob`, `rstartpage`, `rwriteline`, `rendpage`, `rendjob` |
-| `status_cb` | stub returning immediately |
-| `identify_cb` | stub returning immediately |
-
-Note: `x_resolution` / `y_resolution` are in dots-per-inch as `int`.
-`raster_types` must include `PAPPL_PWG_RASTER_TYPE_BLACK_1` so PAPPL
-knows to give us 1-bit-per-pixel lines.
-
-#### 1.5 — `rstartjob_cb`
-
-Emits the PJL job header via `papplDeviceWrite()`. Exact byte sequence
-(from Investigation 1 capture, verbatim field order):
-
-```
-<ESC>%-12345X
-@PJL SET RESOLUTION=300\r\n
-@PJL SET ECONOMODE=OFF\r\n
-@PJL SET DUPLEX=OFF\r\n
-@PJL SET SOURCETRAY=AUTO\r\n
-@PJL SET MEDIATYPE=REGULAR\r\n
-@PJL SET COPIES=1\r\n
-@PJL SET LPARM : PCL PAPER=LETTER\r\n
-@PJL ENTER LANGUAGE=PCL\r\n
-```
-
-Follow immediately with `papplDeviceFlush()`. Store the job-start
-timestamp in the `job_data` pointer (allocated with `calloc`, freed in
-`rendjob_cb`) — Phase 4 uses this for the log prefix. For Phase 1 the
-struct can be a single `time_t`.
-
-USB keepalive experiment lives here: before the PJL header, try
-`@PJL SET POWERSAVE=OFF\r\n` and note whether it generates an error
-response on the back-channel at `rendpage_cb` teardown time.
-
-#### 1.6 — `rstartpage_cb`
-
-Called once per page. Emits PCL raster setup:
-
-```
-<ESC>E                 (printer reset — clears any leftover state)
-<ESC>*t300R            (raster resolution = 300 dpi)
-<ESC>*r0F              (presentation mode: portrait, don't rotate)
-<ESC>*b2M              (compression method: TIFF packbits)
-<ESC>*r1A              (start raster at current cursor, 1 = top-left origin)
-```
-
-No paper size / source PCL commands — PJL owns those. `<ESC>E` resets
-any previous raster state cleanly; safe to emit every page.
-
-#### 1.7 — `rwriteline_cb`
-
-Receives a `pappl_pr_line_t` with pre-halftoned 1-bit data from PAPPL
-(forced by `force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1`).
-PAPPL handles the halftoning; `cfOneBitLine()` is **not** needed in
-Phase 1 — simplifies the dependency chain.
-
-Per line:
-
-1. Skip trailing blank lines at the bottom of the page by tracking
-   the last non-blank line (defer the emit until we know it's not the
-   final skip; or emit all lines — blank lines compress to near zero,
-   so skip the optimisation for Phase 1).
-2. Packbits-encode the line bytes using `packbits_encode()` from
-   `packbits.c`.
-3. Emit `<ESC>*b<n>W<encoded-bytes>` where `<n>` is the encoded length
-   as a decimal ASCII integer.
-
-`packbits.c` implements standard TIFF packbits (identical to what GS
-ljet4 emits, confirmed by Investigation 1). The encoder fits in ~40
-lines:
-
-- Scan forward for runs of identical bytes → emit run-length token
-  `(1 - runlen)` followed by the repeated byte.
-- Scan forward for literal sequences → emit count-1 followed by the
-  bytes verbatim.
-- Output buffer is at most `ceil(n * 1.5) + 1` bytes; allocate once
-  per job (store in `job_data`), reuse per line.
-
-#### 1.8 — `rendpage_cb`
-
-End of page:
-
-```
-<ESC>*rC               (end raster)
-0x0C                   (form feed — eject the page)
-<ESC>E                 (printer reset — clears raster mode cleanly)
-```
-
-#### 1.9 — `rendjob_cb`
-
-End of job (UEL bookend):
-
-```
-<ESC>%-12345X
-@PJL EOJ\r\n
-<ESC>%-12345X
-```
-
-If Option B keepalive was used, re-enable sleep here:
-`@PJL SET POWERSAVE=ON\r\n` before `EOJ`. Free `job_data`.
-
-#### 1.10 — Systemd unit (`hl5170dn-printer-app.service`)
+#### Systemd unit and USB permissions
 
 ```ini
 [Unit]
@@ -421,139 +272,108 @@ WantedBy=multi-user.target
 ```
 
 `printapp` is a dedicated system account (no login shell, no home dir)
-in the `lp` group.  The `lp` group is the canonical Linux printer-access
-group; the udev rule grants `lp` read/write on the Brother USB device
-node so `printapp` can open it without running as root.
+in the `lp` group. The udev rule (`99-brother-hl5170dn.rules`) sets
+`GROUP=lp MODE=0660` on the device node matched by vendor/product ID.
+`make install` creates the user idempotently (guards with `id -u`) and
+installs the udev rule. Do NOT add the real login user to `lp`
+permanently — use the dedicated service account and udev instead.
 
-**Ubuntu install pattern for USB device permissions:**
+---
 
-1. **udev rule** (`99-brother-hl5170dn.rules`) — sets `GROUP=lp
-   MODE=0660` on the device node matched by vendor/product ID.
-   Installed by `make install` to `/etc/udev/rules.d/`.
-2. **Dedicated system user** — `useradd -r -M -G lp -s /usr/sbin/nologin
-   printapp` — no home directory, below UID 1000, in the lp group.
-   `make install` creates this user idempotently (guards with `id -u`).
-3. **Systemd unit** sets `User=printapp Group=lp`.  systemd applies
-   supplementary group membership on service start so the process has
-   the `lp` GID without needing `newgrp`.
+### Phase 2 — Driver-owned raster pipeline
 
-`plugdev` is an alternative Ubuntu group for libusb devices, but `lp`
-is semantically correct for a printer and more portable across distros.
-Do NOT add the real login user to `lp` permanently — use the dedicated
-service account and udev instead.
+**Status: in progress (2026-05-08).** Phase 2.0 unblocking steps
+complete: PDF→PWG MIME filter wired (commit `b4f955a`); blank-page
+dither bug fixed by removing `memset(data,0)` in `driver_cb`
+(commit `be2c90f`; details in [`bring-up-notes.md`](bring-up-notes.md)
+§12); `rwriteline` y=0 diagnostic added.
 
-#### 1.11 — Exit criterion and verification
+Remaining: complete §2.0 steps 2–3, then §2.1 feature expansion and
+§2.2 exit-criteria verification.
 
-1. Build without warnings on the Pi: `make 2>&1 | grep -c warning`
-   should be 0.
-2. Run under `sudo` (or after adding `printapp` to `lp` group):
-   `sudo ./hl5170dn-printer-app`.
-3. `lp -d hl5170dn text-test.pdf` from the Pi.
-4. Physical page comes out. No garbled header, no blank page.
-5. Byte-diff: capture `papplDeviceWrite()` output by temporarily
-   wrapping it (or use `usbmon`) and diff the PCL section against the
-   baseline `cups-filter-baseline` stream for `text-test.pdf` at 300
-   dpi. The PJL header should match field-for-field; the raster section
-   should have the same compression mode and similar line counts.
-
-If the page is blank or garbled, attach `usbmon` output and compare
-against the Investigation 1 stream byte-by-byte before changing logic.
-
-### Phase 2 — Feature parity with the baseline filter
-
-**Status: in progress (2026-05-08).** Phase 2.0 unblocking steps complete:
-PDF→PWG MIME filter wired (commit `b4f955a`); blank-page dither bug fixed by
-removing `memset(data,0)` in `driver_cb` (commit `be2c90f`; details in
-[`bring-up-notes.md`](bring-up-notes.md) §12); `rwriteline` y=0 diagnostic
-added. Remaining: drop `force_raster_type` (§2.0 step 2), promote rwriteline
-trace to y%256 DEBUG form (§2.0 step 3), full feature expansion (§2.1),
-and Phase 2.2 exit-criteria verification.
-
-#### 2.0 — Start here: unblock iPhone AirPrint, then add features
+#### 2.0 — Start here: finish unblocking, then add features
 
 Three small changes go first because they unblock everything else and
 two of them are one-liners:
 
-1. **Wire PDF via `papplSystemAddMIMEFilter()`** — the headline fix.
-   PAPPL 1.3.1's bring-up log said `JPEG is supported, PDF is not
-   supported`; iPhone AirPrint sends `application/pdf` for photos, so
-   this is why the iPhone test prints a blank page. PAPPL 1.4 added
-   `papplSystemAddMIMEFilter()` for exactly this case. The Ghostscript
-   Printer Application
-   ([`OpenPrinting/ghostscript-printer-app`](https://github.com/OpenPrinting/ghostscript-printer-app))
-   is the cleanest reference for the call signature and the GS
-   invocation pattern — read its filter registration first, graft into
-   our `system_cb`. Verification: reprint the iPhone photo that
-   produced a blank page in Phase 1; expect a recognisable photo on
-   paper. This also satisfies Phase 2 exit-criterion 2 (iPhone AirPrint
-   of a photo).
-2. **Drop `data->force_raster_type`** in `driver.c`. Comment out or
-   remove the `force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1`
-   line — `raster_types` alone declares what we accept, and the
-   `force_raster_type` hint's behaviour in 1.4 is unclear. If the
-   iPhone print still misbehaves after wiring PDF, this is the next
-   variable to remove.
-3. **Add a per-line trace** in `rwriteline_cb`: `if ((y % 256) == 0)
-   papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "rwriteline y=%u bytes=%u",
-   y, encoded_len);`. Two lines of code; gives us "are rasterlines
-   actually being called, and at what dimensions" visibility from
-   `runtime.log` without flooding it. Useful for the rest of Phase 2
-   and beyond.
+1. **Wire PDF via `papplSystemAddMIMEFilter()`** — **done** (commit
+   `b4f955a`). iPhone AirPrint sends `application/pdf` for photos; this
+   routes them into the driver's rendering pipeline.
+2. **Drop `data->force_raster_type`** in `driver.c` — **remaining**.
+   Remove `force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1`. The
+   driver's internal representation is now 8-bit grayscale; `BLACK_1`
+   must not override that.
+3. **Add a per-line trace** in `rwriteline_cb` — **remaining**:
+   `if ((y % 256) == 0) papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+   "rwriteline y=%u bytes=%u", y, encoded_len);`. Gives visibility
+   into rasterline dimensions from `runtime.log` without flooding it.
 
-Once iPhone AirPrint of a photo prints something recognisable,
-Phase 2 feature work proper:
+#### 2.1 — Establish streaming grayscale pipeline
 
-#### 2.1 — Feature expansion
+Replace the Phase 1 buffered path with the canonical streaming
+architecture:
 
-Adds every IPP attribute the baseline filter respects. The PJL
-mapping table in the PRD (§"PJL command mapping") is copied verbatim
-from `legacy/brother-hl5170dn-pjl`; it's known-good against this
-printer.
+```
+Ghostscript stdout (pgmraw, 8-bit)
+    ↓
+driver-side halftone (threshold @ 300 dpi; ordered dither @ 600 dpi)
+    ↓
+PackBits encoder
+    ↓
+papplDeviceWrite()
+```
 
-- Resolutions: 300 + 600. (HQ1200 deferred to Phase 6.) At 600 dpi the
-  `pdf_filter_cb` must switch from `pbmraw` to `pgmraw` (8-bit grayscale)
-  and apply ordered dithering before calling `rwriteline_cb` — simple
-  threshold at 600 dpi is fine for text but still poor for photos. **Add
-  keepalive (`@PJL SET POWERSAVE=OFF` in `rstartjob_cb`) at the same time
-  as 600 dpi** — the 45 s Pi render for photo PDFs at 600 dpi exceeds USB
-  idle-sleep threshold. On a laptop the render is 5–10× faster and the risk
-  is lower, but keepalive is cheap and correct regardless of host.
-- Media sizes: A4, A5, A6, Legal, Executive, plus envelope variants
-  (DL, C5, Com10, Monarch, ISOB5).
-- Sources: `tray-1`, `by-pass-tray`, `auto`.
-- Media types: per `legacy/brother-hl5170dn-pjl`'s mapping
+- Launch GS as a child process; read stdout pipe incrementally.
+- No full-page raster buffering.
+- At 300 dpi: simple 50% threshold acceptable initially.
+- At 600 dpi: clustered-dot ordered dither (deterministic, low CPU).
+  Error diffusion is deferred.
+- Add timing log entries: render start, first byte out, first page
+  complete, job complete, periodic rasterline counters. Goal: distinguish
+  render bottlenecks from USB bottlenecks.
+
+#### 2.2 — Feature expansion
+
+Adds every IPP attribute the baseline filter respects. The PJL mapping
+table in `legacy/brother-hl5170dn-pjl` is known-good against this
+printer and is the authoritative source for all PJL command values.
+
+- **Resolutions:** 300 + 600 dpi. (HQ1200 deferred to Phase 6.)
+- **Media sizes:** `na_letter_8.5x11in`, `iso_a4_210x297mm`,
+  `iso_a5_148x210mm`, `iso_a6_105x148mm`, `na_legal_8.5x14in`,
+  `na_executive_7.25x10.5in`, plus envelope variants (DL, C5, Com10,
+  Monarch, ISOB5).
+- **Sources:** `tray-1`, `by-pass-tray`, `auto`.
+- **Media types:** per `legacy/brother-hl5170dn-pjl` mapping
   (`REGULAR`, `THICK`, `THICK2`, etc.).
-- Duplex: `one-sided`, `two-sided-long-edge`, `two-sided-short-edge`.
-  `BINDING` only emitted when `DUPLEX=ON`.
-- Print quality: 3/4/5 → econo+300 / normal+600 / 1200
-  (1200 nominal-only until Phase 6 confirms).
-- Copies.
+- **Duplex:** `one-sided`, `two-sided-long-edge`,
+  `two-sided-short-edge`. `BINDING` only emitted when `DUPLEX=ON`.
+- **Print quality:** IPP values 3/4/5 → econo+300 / normal+600 /
+  1200 (1200 nominal-only until Phase 6 confirms).
+- **Copies.**
 
-#### 2.2 — Phase 2 exit criteria
+#### 2.3 — Exit criteria
 
 Manual test pass against:
 
 1. `text-test.pdf` and `image-test.pdf` at 300 and 600 dpi, compared
    side-by-side with baseline output.
 2. iPhone AirPrint of a photo: confirm a single rasterisation
-   (PWG → PCL, no PDF detour) by reading the per-line trace added in
-   §2.0 step 3. This is the test that reproduces the iOS stall
-   scenario from the baseline; the new architecture (Option B
-   keepalive in PJL header + 300 dpi default) should not exhibit it.
+   (PDF → GS → PCL, not PAPPL's `BLACK_1` path) by reading the
+   per-line trace added in §2.0 step 3. No stall.
 3. Multi-page PDF, duplex long-edge and short-edge.
-4. Mid-print job cancel: PAPPL aborts cleanly, printer is not stuck
-   in a bad PJL state on the next job.
+4. Mid-print job cancel: PAPPL aborts cleanly, printer not stuck in
+   a bad PJL state on the next job.
 
-#### 2.3 — Phase 3 prerequisite check
+#### 2.4 — Phase 3 prerequisite check
 
-Before starting Phase 3 (media substitution), confirm the job-creation
-hooks needed are present in PAPPL 1.4.10. Investigation 4's outcome
-flagged this as a re-check item: `papplJobSetState()` and the early
-job-attribute inspection point both need to exist for the
-media-coercion logic to work. Quick verification — grep
+Before starting Phase 3, confirm the job-creation hooks needed are
+present in PAPPL 1.4.10. Grep
 `/usr/local/include/pappl/job.h` for `papplJobSetState` and any
-`papplPrinterSetCreateCB` / job-creation callback registrations
-before writing Phase 3 code.
+`papplPrinterSetCreateCB` / job-creation callback registrations before
+writing Phase 3 code.
+
+---
 
 ### Phase 3 — Media substitution
 
@@ -563,7 +383,10 @@ because the IPP-attribute hook is PAPPL-version-specific.
 - Hook the job-creation path. Inspect IPP `media`. If it matches the
   PRD coercion table (Letter loaded → A4/A5/A6/Legal/Executive get
   rewritten to Letter; envelopes pass through unchanged), rewrite
-  the attribute and mark the job substituted.
+  the attribute **and** the raster dimensions to match the substituted
+  media. The raster dimensions themselves must match the substituted
+  media — not just the PJL paper claim — or the tray-mismatch pause
+  persists despite the substitution log entry.
 - Letter-loaded coercion table from PRD §"Media substitution".
   Inverse table when loaded paper is configured as A4.
 - PAPPL vendor option `media-mismatch-action` with values `substitute`
@@ -581,18 +404,16 @@ Verification — PRD test items 6 and 7:
 
 - Default `substitute` mode: A4 PDF from Mac (or `lp -o media=a4`)
   prints on Letter, content scaled to fit (no clipping), web UI log
-  shows the substitution, `lpstat -W` / `ipptool` shows the
-  `job-state-reasons` value. Envelope at envelope size *not* coerced.
+  shows the substitution, `ipptool` shows the `job-state-reasons` value.
+  Envelope at envelope size *not* coerced.
 - `reject` mode: A4 PDF fails before printing, client surfaces the
   error, no paper.
 
-Risk: if the IPP-attribute rewrite isn't hooked at the right point,
-PAPPL may set up its raster pipeline for A4 *before* the coercion
-takes effect, producing an A4-sized raster with PJL claiming Letter
-— the exact tray-mismatch the feature is meant to prevent. Mitigation
-per PRD: capture `papplDeviceWrite()` output and verify the raster
-header bytes show Letter dimensions before declaring the feature
-working.
+Verification of correct raster dimensions: capture `papplDeviceWrite()`
+output and confirm the raster header bytes show Letter dimensions before
+declaring the feature working.
+
+---
 
 ### Phase 4 — Observability
 
@@ -600,9 +421,9 @@ Mechanical work, but matters for debugging the rest of the project.
 
 - Construct rich job-prefix per PRD §"Logging and observability":
   `Job N: <doc-or-job-name> from <host-or-user>`, ≤60 chars,
-  control-char-stripped, newlines-replaced, source attributes are
-  `document-name` / `job-name` / `document-format` / `job-originating-host-name`
-  / `requesting-user-name`.
+  control-char-stripped, newlines-replaced. Source attributes:
+  `document-name` / `job-name` / `document-format` /
+  `job-originating-host-name` / `requesting-user-name`.
 - Apply prefix to every `papplLogJob()` call in driver code:
   substitution events, PJL command summary at job start, supply
   polling, USB errors, page completions.
@@ -610,6 +431,8 @@ Mechanical work, but matters for debugging the rest of the project.
   exposes per-printer log level.
 - Sanitisation tests: submit a job with embedded newlines / control
   chars in `job-name` and confirm logs render cleanly.
+
+---
 
 ### Phase 5 — Supply level polling
 
@@ -619,43 +442,54 @@ without it and document the attempt.
 - In `status_cb` (and once at `rendjob_cb` end), send the PJL
   `INFO STATUS` + `INFO PAGECOUNT` block, read with `papplDeviceRead()`
   on a 500 ms timeout.
-- Parse per Brother's `Tech_Manual_Ch5_PJL` documentation. Map
-  ready / low / out responses to `marker-levels` 75 / 10 / 0 if the
-  printer reports state rather than a percentage.
-- Fall back to `marker-levels=-2` (unknown) on no response.
+- Parse per `Tech_Manual_Ch5_PJL` documentation. Map ready / low / out
+  responses to `marker-levels` 75 / 10 / 0 if the printer reports
+  state rather than a percentage. Phase 0 confirmed `INFO SUPPLIES`
+  returns `"?"` — toner level unavailable; `marker-levels=-2` (unknown)
+  is the expected fallback.
+- Fall back to `marker-levels=-2` on no response. Ready/sleep state
+  (`CODE=10001` / `CODE=40000`) can still be surfaced even if toner
+  level cannot.
 
-Exit criterion: PRD test item 5 — web UI shows *something* sensible
+Exit criterion: PRD test item 5 — web UI shows something sensible
 (a level, or "unknown"). Not a crash.
+
+---
 
 ### Phase 6 — HQ1200 + APT photo quality (stretch)
 
 Two investigations in one phase, either of which is a worthwhile
-standalone result:
+standalone result.
 
 #### 6A — APT photo path (Mode 1024)
 
-Implement the highest-quality photo rendering path discovered during
-Phase 2 planning (see rendering architecture note above).
+Implement the highest-quality photo rendering path identified in
+Phase 0.
 
-1. In `pdf_filter_cb`, detect whether the job's print-quality attribute
-   is `high` (IPP value 5) or a future `photo` mode. If so, activate the
-   APT path instead of the 600 dpi 1-bit path.
+1. In the render path, detect whether the job's print-quality attribute
+   is `high` (IPP value 5) or a future `photo` mode. If so, activate
+   the APT path.
 2. Render the PDF with `gs -sDEVICE=pgmraw -r150` (8-bit grayscale,
    150 dpi — the manual's recommended APT input resolution).
 3. Wrap the raw PGM pixels in a minimal TIFF: IFD with tags
    `ImageWidth`, `ImageLength`, `BitsPerSample=8`,
-   `Compression=1` (no compression), `PhotometricInterpretation=1`
-   (min-is-black), `SamplesPerPixel=1`, `XResolution=150`,
-   `YResolution=150`, `StripOffsets`, `StripByteCounts`.
+   `Compression=1` (no compression),
+   `PhotometricInterpretation=1` (min-is-black),
+   `SamplesPerPixel=1`, `XResolution=150`, `YResolution=150`,
+   `StripOffsets`, `StripByteCounts`.
    Total header ≈ 136 bytes; image data follows immediately.
 4. Emit PCL sequence: `@PJL SET RESOLUTION=600`, `ESC*t600R`,
    `ESC*b1024M`, `ESC*r1A`, single `ESC*b<size>W<TIFF bytes>`, `ESC*rC`.
 5. Print `image-test.pdf` and a photo PDF. Assess output quality
-   side-by-side with the 600 dpi 1-bit path from Phase 2.
+   side-by-side with the 600 dpi ordered-dither path from Phase 2.
 
 If APT quality is good: make it the default for `print-quality=high`
 and document it. If quality is poor or the printer rejects the TIFF:
-document the attempt and stay on 600 dpi 1-bit for photos.
+document the attempt and stay on 600 dpi ordered dither for photos.
+
+`Tech_Manual_Ch2_PCL.pdf` §6.3.8 is the authoritative source; the
+HL-5170DN is explicitly listed as APT-capable in the PJL manual
+(line 859: `APT ON or OFF`).
 
 #### 6B — HQ1200
 
@@ -674,7 +508,7 @@ PRD option 3: implement Brother's Mode 1027 raster format from
 if a day of effort doesn't yield working output, fall back to option 2
 and document the attempt.
 
-Either way: publish the byte-level investigation.
+---
 
 ### Phase 7 — Build, packaging, deployment
 
@@ -682,18 +516,19 @@ Either way: publish the byte-level investigation.
   binary → `/usr/local/bin`, unit file → `/etc/systemd/system`,
   udev rule → `/etc/udev/rules.d/99-brother-hl5170dn.rules`.
 - `make install` creates the `printapp` system user (idempotent via
-  `id -u` guard) and reloads udev rules.  See §1.10 for rationale.
+  `id -u` guard) and reloads udev rules.
 - README rewrite. Cover:
   - Build dependencies (`libpappl-dev`, `libcupsfilters-dev`,
     `ghostscript`, `libusb-1.0-0-dev`) with pinned versions.
-  - Manual PAPPL build steps if the apt version is too old.
-  - First-run setup, web UI URL, where the systemd unit logs to,
-    how to change the loaded-paper vendor option, how to enable
-    `reject` mode.
-  - Comparison-to-baseline section: what the rewrite improved
-    (iOS stall, media substitution, web UI), what it didn't
-    (USB-only constraint, Pi 3B+ render speed), what regressed
-    (if anything — re-evaluate after Phase 2).
+    Manual PAPPL 1.4.10 build steps (apt ships 1.3.1).
+  - First-run setup, web UI URL, where systemd logs to, how to change
+    the loaded-paper vendor option, how to enable `reject` mode.
+  - Comparison-to-baseline: what the rewrite improved (iOS stall,
+    media substitution, web UI, image quality), what it didn't (USB-only
+    constraint, Pi 3B+ render speed for photos), what regressed
+    (re-evaluate after Phase 2).
+
+---
 
 ### Phase 8 — Ship
 
@@ -703,6 +538,8 @@ Either way: publish the byte-level investigation.
 - Write the agent-coding journal: which parts the agent got right
   first try, which needed iteration, which had to be done by hand.
   Publish alongside the README.
+
+---
 
 ## What "done" looks like (PRD §"What 'done' looks like")
 
@@ -717,53 +554,61 @@ Either way: publish the byte-level investigation.
   baseline comparison.
 - Agent-coding journal documents the iteration story.
 
-## Risks (from PRD §Risks; restated as project tracking items)
+---
+
+## Risks
 
 | Risk | Symptom | Mitigation | Phase |
 |---|---|---|---|
 | PCL 5e encoding bugs | Blank/garbled pages, printer errors | Tee `papplDeviceWrite()` output, byte-diff against `cups-filter-baseline` | 1, 2 |
-| PAPPL API mismatch | Build/runtime failures | Pin a known-good PAPPL version | 0, 7 |
+| MIME routing mismatch | AirPrint bypasses driver renderer | Explicit logging and byte tracing | 2 |
+| Streaming lifecycle mismatch | PAPPL renders before callbacks fire | Verify experimentally during Phase 2 | 2 |
+| PAPPL API mismatch | Build/runtime failures | Pin PAPPL 1.4.10 | 0, 7 |
 | USB back-channel doesn't work | Supply polling hangs | Aggressive timeout, fall back to "unknown" | 0, 5 |
 | HQ1200 raster encoding undocumented | HQ1200 prints blank or at 600 dpi | Skip for v1 (Phase 1–5); attempt Mode 1027 only as Phase 6 stretch | 6 |
-| Media coercion at wrong layer | Tray-mismatch pause despite substitution log entry | Verify raster header bytes show Letter before declaring done | 3 |
-| Halftoning quality | Photo prints look poor | Start with libcupsfilters ordered dither (option 1); revisit if complaints | 1 |
-| Pi 3B+ too slow on photo PDFs | Long render, possibly stalls | Phase 0 timing measurement; fall back to 300 dpi default or recommend Pi 5 | 0 |
+| Media coercion at wrong layer | Tray-mismatch pause despite substitution log entry | Verify raster header bytes show Letter dimensions before declaring done | 3 |
+| Halftoning quality | Photo prints look poor | Ordered dither as default; APT as Phase 6 stretch | 2, 6 |
+| Pi 3B+ too slow on photo PDFs | Long render, possibly stalls | Streaming architecture; 300 dpi default; Pi 5 upgrade path | 0, 2 |
+| APT quality poor | Ugly photos | Keep driver-side dither as fallback | 6 |
 
-## Open questions parked for the implementation phase
+---
 
-From PRD §"Open questions for the implementation phase":
+## Open questions
 
-- What does the baseline filter actually emit at HQ1200? — answered
-  in Phase 0.
-- Is GS render fast enough on Pi 3B+? — answered in Phase 0.
-- Does `papplDeviceRead()` deliver back-channel data reliably? —
-  answered in Phase 0.
-- Default port 8000 vs something distinctive? — go with 8000, match
-  `gutenprint-printer-app`. Override available in the systemd unit.
+- Does PAPPL 1.4.10 permit true incremental raster streaming through
+  the driver's job lifecycle? (Verify during Phase 2.)
+- Is APT visually superior enough to justify the complexity?
+- Should per-page content heuristics exist eventually (text vs. photo
+  detection to switch halftoning mode mid-job)?
+- Is clustered-dot ordered dither sufficient, or is error diffusion
+  worthwhile on this printer's dot gain curve?
+
+---
 
 ## Reference material in this repo
 
 | File | Purpose |
 |------|---------|
 | `PRD-printer-applicance-rewrite-hl5170dn-pappl-driver.md` | The spec this plan operationalises |
-| `phase-0-investigations.md` | Pi-side runbook for the four day-zero investigations. Findings get recorded inline. |
-| `bring-up-notes.md` | PAPPL 1.3/1.4 quirks and other things learned during Phase 1 implementation that aren't in the PRD or vendor manuals. |
+| `hl5170dn_revised_plan.md` | Records the Phase 1→2 architectural decision (driver-owned streaming raster); now incorporated here |
+| `phase-0-investigations.md` | Pi-side runbook for the four day-zero investigations. Findings recorded inline. |
+| `bring-up-notes.md` | PAPPL 1.3/1.4 quirks and other things learned during Phase 1 that aren't in the PRD or vendor manuals |
 | `legacy/brother-hl5170dn-pjl` | Baseline CUPS filter — source of truth for the PJL mapping table |
 | `legacy/Brother-HL5170DN-PCL.ppd` | Baseline PPD — historical reference for media/source/type names |
-| `legacy/install.sh` | Installs the legacy filter; usable from any CWD via `$(dirname "$0")` resolution |
+| `legacy/install.sh` | Installs the legacy filter |
 | `legacy/README.md` | Why the legacy directory exists and how to install from it |
 | `Tech_Manual_AD.pdf` | Full Brother PCL/PJL Technical Reference Guide |
-| `Tech_Manual_Ch2_PCL.pdf` / `.md` | Chapter 2: PCL. **§6.3.8 + §6.3 are the only authoritative source for HQ1200 mode 1024/1152.** |
-| `Tech_Manual_Ch5_PJL.pdf` / `.md` | Chapter 5: PJL. Source for `INFO STATUS` response format used in Phase 5. |
+| `Tech_Manual_Ch2_PCL.pdf` / `.md` | Chapter 2: PCL. §6.3.8 is the authoritative source for APT Mode 1024; §6.3.13 for Mode 1027. |
+| `Tech_Manual_Ch5_PJL.pdf` / `.md` | Chapter 5: PJL. Source for `INFO STATUS` response format (Phase 5) and `POWERSAVE` command. |
 | `text-test.pdf`, `image-test.pdf` | Manual-test inputs, reused from the baseline |
 | Git tag `cups-filter-baseline` (`4602cfc`) | Frozen state of the previous CUPS-filter implementation, for diff/reference |
+
+---
 
 ## What this project is testing about agent coding
 
 (Per PRD's closing section — copied here so the meta-goal stays
-visible during implementation.) The interesting question is not
-"can a working HL-5170DN driver be written" — the baseline already
-does that adequately. It's:
+visible during implementation.)
 
 - Can an agentic coding loop navigate an unfamiliar C API (PAPPL)
   with thin documentation, learning from comparable drivers
