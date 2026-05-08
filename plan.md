@@ -282,36 +282,38 @@ permanently — use the dedicated service account and udev instead.
 
 ### Phase 2 — Driver-owned raster pipeline
 
-**Status: in progress (2026-05-08).** Phase 2.0 unblocking steps
-complete: PDF→PWG MIME filter wired (commit `b4f955a`); blank-page
-dither bug fixed by removing `memset(data,0)` in `driver_cb`
-(commit `be2c90f`; details in [`bring-up-notes.md`](bring-up-notes.md)
-§12); `rwriteline` y=0 diagnostic added.
+**Status: implementation complete (2026-05-08); pending physical print
+verification (§2.3 exit criteria).** §2.0–§2.2 implemented in one
+pass: streaming pgmraw pipeline, ordered halftoning, full feature
+expansion, and PJL parameterisation.
 
-Remaining: complete §2.0 steps 2–3, then §2.1 feature expansion and
-§2.2 exit-criteria verification.
+**Key implementation notes:**
+- `force_raster_type` removed; `raster_types = SGRAY_8` so PAPPL
+  delivers 8-bit grayscale to `rwriteline_cb` for the PWG/JPEG/PNG path.
+- `pdf_filter_cb` now uses `popen()` with `pgmraw` — GS stdout is read
+  incrementally, no temp file. PCL bytes reach the printer as soon as
+  GS produces the first row.
+- `pjl_write_job_header` refactored to accept `pjl_job_params_t`; all
+  job params (duplex/paper/source/type/economode) derived from IPP
+  options in `pjl_params_from_options()`.
+- Per-page buffer allocation moved from `rstartjob_cb` to
+  `rstartpage_cb` (we don't know page width at job start for the PDF path).
+- `rendjob_cb` guards against `jd == NULL` (OOM in rstartjob) and
+  `pdf_filter_cb` uses a `job_started` flag to avoid calling
+  `rendjob_cb` if rstartjob never succeeded.
 
 #### 2.0 — Start here: finish unblocking, then add features
 
-Three small changes go first because they unblock everything else and
-two of them are one-liners:
-
 1. **Wire PDF via `papplSystemAddMIMEFilter()`** — **done** (commit
-   `b4f955a`). iPhone AirPrint sends `application/pdf` for photos; this
-   routes them into the driver's rendering pipeline.
-2. **Drop `data->force_raster_type`** in `driver.c` — **remaining**.
-   Remove `force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1`. The
-   driver's internal representation is now 8-bit grayscale; `BLACK_1`
-   must not override that.
-3. **Add a per-line trace** in `rwriteline_cb` — **remaining**:
-   `if ((y % 256) == 0) papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-   "rwriteline y=%u bytes=%u", y, encoded_len);`. Gives visibility
-   into rasterline dimensions from `runtime.log` without flooding it.
+   `b4f955a`).
+2. **Drop `data->force_raster_type`** — **done**. Changed
+   `raster_types` to `SGRAY_8`.
+3. **Add a per-line trace** in `rwriteline_cb` — **done**:
+   logs at y=0 and every 256 lines.
 
-#### 2.1 — Establish streaming grayscale pipeline
+#### 2.1 — Establish streaming grayscale pipeline — **done**
 
-Replace the Phase 1 buffered path with the canonical streaming
-architecture:
+Streaming architecture implemented:
 
 ```
 Ghostscript stdout (pgmraw, 8-bit)
@@ -332,9 +334,9 @@ papplDeviceWrite()
   complete, job complete, periodic rasterline counters. Goal: distinguish
   render bottlenecks from USB bottlenecks.
 
-#### 2.2 — Feature expansion
+#### 2.2 — Feature expansion — **done**
 
-Adds every IPP attribute the baseline filter respects. The PJL mapping
+All IPP attributes from the baseline filter are now wired: The PJL mapping
 table in `legacy/brother-hl5170dn-pjl` is known-good against this
 printer and is the authoritative source for all PJL command values.
 

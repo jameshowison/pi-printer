@@ -7,30 +7,45 @@
 static const char UEL[] = "\x1b%-12345X";
 #define UEL_LEN (sizeof(UEL) - 1)
 
-void pjl_write_job_header(pappl_device_t *dev, int resolution,
-                          bool powersave_off)
+void pjl_write_job_header(pappl_device_t *dev, const pjl_job_params_t *p)
 {
     char buf[512];
     int  n;
 
-    /* UEL written directly — snprintf would misinterpret the '%' in %-12345X. */
     papplDeviceWrite(dev, UEL, UEL_LEN);
 
+    /* Block 1: @PJL preamble, POWERSAVE, RESOLUTION, ECONOMODE, DUPLEX */
     n = snprintf(buf, sizeof(buf),
         "@PJL\r\n"
-        "%s"   /* POWERSAVE=OFF if requested */
+        "%s"
         "@PJL SET RESOLUTION=%d\r\n"
-        "@PJL SET ECONOMODE=OFF\r\n"
-        "@PJL SET DUPLEX=OFF\r\n"
-        "@PJL SET SOURCETRAY=AUTO\r\n"
-        "@PJL SET MEDIATYPE=REGULAR\r\n"
-        "@PJL SET COPIES=1\r\n"
-        "@PJL SET LPARM : PCL PAPER=LETTER\r\n"
-        "@PJL ENTER LANGUAGE=PCL\r\n",
-        powersave_off ? "@PJL SET POWERSAVE=OFF\r\n" : "",
-        resolution);
-
+        "@PJL SET ECONOMODE=%s\r\n"
+        "@PJL SET DUPLEX=%s\r\n",
+        p->powersave_off ? "@PJL SET POWERSAVE=OFF\r\n" : "",
+        p->resolution,
+        p->economode ? "ON" : "OFF",
+        p->duplex    ? "ON" : "OFF");
     papplDeviceWrite(dev, buf, (size_t)n);
+
+    /* BINDING only when DUPLEX=ON, and must follow DUPLEX */
+    if (p->duplex && p->binding) {
+        n = snprintf(buf, sizeof(buf), "@PJL SET BINDING=%s\r\n", p->binding);
+        papplDeviceWrite(dev, buf, (size_t)n);
+    }
+
+    /* Block 2: remaining settings + ENTER LANGUAGE */
+    n = snprintf(buf, sizeof(buf),
+        "@PJL SET SOURCETRAY=%s\r\n"
+        "@PJL SET MEDIATYPE=%s\r\n"
+        "@PJL SET COPIES=%d\r\n"
+        "@PJL SET LPARM : PCL PAPER=%s\r\n"
+        "@PJL ENTER LANGUAGE=PCL\r\n",
+        p->source    ? p->source    : "AUTO",
+        p->mediatype ? p->mediatype : "REGULAR",
+        p->copies > 0 ? p->copies : 1,
+        p->paper     ? p->paper     : "LETTER");
+    papplDeviceWrite(dev, buf, (size_t)n);
+
     papplDeviceFlush(dev);
 }
 
@@ -44,9 +59,8 @@ void pjl_write_job_trailer(pappl_device_t *dev, bool restore_powersave)
 
     n = snprintf(buf, sizeof(buf),
         "@PJL EOJ\r\n"
-        "%s",    /* POWERSAVE=ON if restoring */
+        "%s",
         restore_powersave ? "@PJL SET POWERSAVE=ON\r\n" : "");
-
     papplDeviceWrite(dev, buf, (size_t)n);
 
     /* Final UEL closes the PJL session. */

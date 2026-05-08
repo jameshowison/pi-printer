@@ -1,12 +1,25 @@
-/* PI-SIDE BUILD NOTES (PAPPL 1.3.1)
+/* Phase 2: driver-owned streaming raster pipeline.
+ *
+ * Architecture: PAPPL owns IPP/AirPrint/USB/job lifecycle.
+ * This driver owns: GS invocation, 8-bit grayscale halftoning,
+ * packbits encoding, PCL/PJL byte stream, USB back-channel.
+ *
+ * Raster path (PDF input):
+ *   Ghostscript (pgmraw, 8-bit grayscale) → popen pipe
+ *       → threshold (300 dpi) or ordered dither (600 dpi)
+ *       → packbits → papplDeviceWrite()
+ *
+ * Raster path (PWG/JPEG/PNG via PAPPL internal filter):
+ *   PAPPL delivers SGRAY_8 rows → rwriteline_cb halftones them.
+ *
+ * PI-SIDE BUILD NOTES (PAPPL 1.3.1)
  * If the compiler complains about field names in pappl_pr_driver_data_t:
- *   - "force_raster_type" — field may not exist; remove the assignment and
- *     rely on raster_types alone to select 1-bit black.
+ *   - "force_raster_type" — field may not exist; this driver no longer
+ *     uses it (removed in Phase 2).
  *   - "identify_actions" — may be "identify_actions_supported"; check the
  *     pappl/printer.h header and rename accordingly.
  *   - source[] / type[] — if declared as "const char *" not "char[][64]",
- *     replace the strncpy calls with direct pointer assignments:
- *       data->source[0] = "tray-1";
+ *     replace the strncpy calls with direct pointer assignments.
  */
 
 #include <pappl/pappl.h>
@@ -15,8 +28,8 @@
 #include <stdio.h>
 #include <time.h>
 #include <errno.h>
-#include <unistd.h>   /* unlink */
-#include <limits.h>   /* INT_MAX */
+#include <unistd.h>
+#include <limits.h>
 #include "pjl.h"
 #include "packbits.h"
 
@@ -24,74 +37,217 @@
 
 typedef struct {
     time_t         start_time;
-    unsigned char *line_buf;       /* packbits output buffer, reused per line */
+    int            resolution;      /* effective dpi, cached in rstartjob */
+    unsigned       page_width;      /* pixels; allocated on first rstartpage */
+    unsigned char *halftone_buf;    /* 1-bit packed row, (page_width+7)/8 bytes */
+    unsigned char *line_buf;        /* packbits output buffer */
     size_t         line_buf_size;
 } hl5170dn_job_t;
+
+/* ---- Halftoning ------------------------------------------------------- */
+
+/* 8×8 clustered-dot ordered dither, values 0–63.
+ * Threshold = val*4+2 (range 2–254); pixel < threshold → black (bit=1). */
+static const unsigned char dither8[8][8] = {
+    { 24, 10, 12, 26, 35, 47, 49, 37 },
+    {  8,  0,  2, 14, 45, 59, 61, 51 },
+    { 22,  6,  4, 16, 43, 57, 63, 53 },
+    { 30, 20, 18, 28, 33, 41, 55, 39 },
+    { 34, 46, 48, 36, 25, 11, 13, 27 },
+    { 44, 58, 60, 50,  9,  1,  3, 15 },
+    { 42, 56, 62, 52, 23,  7,  5, 17 },
+    { 32, 40, 54, 38, 31, 21, 19, 29 },
+};
+
+/* 50% threshold: 8-bit grayscale (0=black, 255=white) → 1-bit packed (1=black). */
+static void threshold_row(const unsigned char *src, unsigned char *dst, unsigned w)
+{
+    memset(dst, 0, (w + 7u) / 8u);
+    for (unsigned x = 0; x < w; x++) {
+        if (src[x] < 128u)
+            dst[x >> 3] |= (unsigned char)(0x80u >> (x & 7u));
+    }
+}
+
+/* Ordered dither with the 8×8 clustered-dot matrix. */
+static void dither_row(const unsigned char *src, unsigned char *dst,
+                       unsigned w, unsigned y)
+{
+    unsigned row = y & 7u;
+    memset(dst, 0, (w + 7u) / 8u);
+    for (unsigned x = 0; x < w; x++) {
+        unsigned thr = (unsigned)dither8[row][x & 7u] * 4u + 2u;
+        if ((unsigned)src[x] < thr)
+            dst[x >> 3] |= (unsigned char)(0x80u >> (x & 7u));
+    }
+}
+
+/* ---- IPP → PJL mapping helpers --------------------------------------- */
+
+static const char *size_name_to_pjl(const char *name)
+{
+    if (!strcmp(name, "na_letter_8.5x11in"))          return "LETTER";
+    if (!strcmp(name, "na_legal_8.5x14in"))            return "LEGAL";
+    if (!strcmp(name, "na_executive_7.25x10.5in"))     return "EXECUTIVE";
+    if (!strcmp(name, "iso_a4_210x297mm"))              return "A4";
+    if (!strcmp(name, "iso_a5_148x210mm"))              return "A5";
+    if (!strcmp(name, "iso_a6_105x148mm"))              return "A6";
+    if (!strcmp(name, "na_number-10_4.125x9.5in"))     return "COM10";
+    if (!strcmp(name, "na_monarch_3.875x7.5in"))        return "MONARCH";
+    if (!strcmp(name, "iso_dl_110x220mm"))              return "DL";
+    if (!strcmp(name, "iso_c5_162x229mm"))              return "C5";
+    if (!strcmp(name, "iso_b5_176x250mm"))              return "B5";
+    return "LETTER";
+}
+
+static const char *size_name_to_gs(const char *name)
+{
+    if (!strcmp(name, "na_letter_8.5x11in"))          return "letter";
+    if (!strcmp(name, "na_legal_8.5x14in"))            return "legal";
+    if (!strcmp(name, "na_executive_7.25x10.5in"))     return "executive";
+    if (!strcmp(name, "iso_a4_210x297mm"))              return "a4";
+    if (!strcmp(name, "iso_a5_148x210mm"))              return "a5";
+    if (!strcmp(name, "iso_a6_105x148mm"))              return "a6";
+    if (!strcmp(name, "na_number-10_4.125x9.5in"))     return "com10";
+    if (!strcmp(name, "na_monarch_3.875x7.5in"))        return "monarch";
+    if (!strcmp(name, "iso_dl_110x220mm"))              return "dl";
+    if (!strcmp(name, "iso_c5_162x229mm"))              return "c5";
+    if (!strcmp(name, "iso_b5_176x250mm"))              return "isob5";
+    return "letter";
+}
+
+static const char *source_to_pjl(const char *source)
+{
+    if (!strcmp(source, "tray-1"))       return "TRAY1";
+    if (!strcmp(source, "by-pass-tray")) return "MP";
+    return "AUTO";
+}
+
+static const char *type_to_pjl(const char *type)
+{
+    if (!strcmp(type, "stationery"))             return "REGULAR";
+    if (!strcmp(type, "stationery-lightweight")) return "THIN";
+    if (!strcmp(type, "cardstock"))              return "THICK";
+    if (!strcmp(type, "cardstock-heavy"))        return "THICK2";
+    if (!strcmp(type, "bond"))                   return "BOND";
+    if (!strcmp(type, "envelope"))               return "ENVELOPES";
+    if (!strcmp(type, "envelope-heavy"))         return "ENVTHICK";
+    if (!strcmp(type, "envelope-lightweight"))   return "ENVTHIN";
+    return "REGULAR";
+}
+
+/* Build PJL params from PAPPL print options.  Called in rstartjob_cb. */
+static void pjl_params_from_options(const pappl_pr_options_t *opts,
+                                    pjl_job_params_t *p)
+{
+    bool is_duplex = (opts->sides == PAPPL_SIDES_TWO_SIDED_LONG_EDGE ||
+                      opts->sides == PAPPL_SIDES_TWO_SIDED_SHORT_EDGE);
+
+    p->resolution    = (int)opts->header.HWResolution[0];
+    p->powersave_off = true;
+    p->duplex        = is_duplex;
+    p->binding       = (opts->sides == PAPPL_SIDES_TWO_SIDED_SHORT_EDGE)
+                       ? "SHORTEDGE" : "LONGEDGE";
+    p->paper         = size_name_to_pjl(opts->media.size_name);
+    p->source        = source_to_pjl(opts->media.source);
+    p->mediatype     = type_to_pjl(opts->media.type);
+    p->economode     = (opts->print_quality == IPP_QUALITY_DRAFT);
+    p->copies        = opts->copies > 0 ? opts->copies : 1;
+
+    /* Draft quality forces 300 dpi + economode regardless of resolution attr. */
+    if (p->economode && p->resolution > 300)
+        p->resolution = 300;
+}
 
 /* ---- Raster callbacks -------------------------------------------------- */
 
 static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
                                 pappl_device_t *device)
 {
-    int resolution = (int)options->header.HWResolution[0];
-    size_t bytes_per_line = (size_t)options->header.cupsBytesPerLine;
-
     hl5170dn_job_t *jd = calloc(1, sizeof(*jd));
     if (!jd) {
-        papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "out of memory for job data");
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "rstartjob: out of memory");
         return false;
     }
 
-    jd->start_time    = time(NULL);
-    jd->line_buf_size = packbits_max(bytes_per_line);
-    jd->line_buf      = malloc(jd->line_buf_size);
-    if (!jd->line_buf) {
-        free(jd);
-        papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "out of memory for line buffer");
-        return false;
-    }
+    pjl_job_params_t pjl;
+    pjl_params_from_options(options, &pjl);
+
+    jd->start_time = time(NULL);
+    jd->resolution = pjl.resolution;
+    /* halftone_buf and line_buf are NULL/0 from calloc; allocated in rstartpage */
 
     papplJobSetData(job, jd);
 
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "start job: %ddpi, %u bytes/line", resolution, (unsigned)bytes_per_line);
+        "start job: %ddpi duplex=%s paper=%s source=%s type=%s econo=%s copies=%d",
+        pjl.resolution,
+        pjl.duplex ? (pjl.binding ? pjl.binding : "ON") : "OFF",
+        pjl.paper    ? pjl.paper    : "?",
+        pjl.source   ? pjl.source   : "?",
+        pjl.mediatype? pjl.mediatype: "?",
+        pjl.economode? "ON" : "OFF",
+        pjl.copies);
 
-    /* Send PJL header.  POWERSAVE=OFF keeps the printer awake during the
-     * raster render that happens before rstartpage_cb is called.
-     * See plan.md §"USB keepalive", Option B. */
-    pjl_write_job_header(device, resolution, /*powersave_off=*/true);
-
+    pjl_write_job_header(device, &pjl);
     return true;
 }
 
 static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
                                  pappl_device_t *device, unsigned page)
 {
-    int resolution = (int)options->header.HWResolution[0];
-    char buf[64];
-    int n;
+    hl5170dn_job_t *jd  = papplJobGetData(job);
+    unsigned        w   = options->header.cupsWidth;
+    char            buf[64];
+    int             n;
 
-    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "start page %u at %ddpi", page, resolution);
+    if (w == 0) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "rstartpage page=%u: cupsWidth=0", page);
+        return false;
+    }
 
-    /* PCL raster setup (per PRD §rstartpage_cb):
-     *   ESC E          — printer reset, clears any leftover raster state
-     *   ESC *t<N>R     — raster resolution N dpi
-     *   ESC *r0F       — presentation: portrait, no rotation
-     *   ESC *b2M       — compression: TIFF packbits (mode 2)
-     *   ESC *r1A       — start raster at top-left of page
-     * Paper size, source, and duplex are already set by PJL; no PCL
-     * paper commands here. */
+    /* Allocate/resize per-line buffers when page width changes. */
+    if (w != jd->page_width) {
+        size_t row1bit    = (w + 7u) / 8u;
+        size_t packed_max = packbits_max(row1bit);
+        unsigned char *hbuf = malloc(row1bit);
+        unsigned char *lbuf = malloc(packed_max);
+        if (!hbuf || !lbuf) {
+            free(hbuf);
+            free(lbuf);
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "rstartpage: OOM allocating %zu + %zu bytes", row1bit, packed_max);
+            return false;
+        }
+        free(jd->halftone_buf);
+        free(jd->line_buf);
+        jd->halftone_buf  = hbuf;
+        jd->line_buf      = lbuf;
+        jd->line_buf_size = packed_max;
+        jd->page_width    = w;
+    }
+
+    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+        "start page %u: %ux%u px at %ddpi",
+        page, w, options->header.cupsHeight, jd->resolution);
+
+    /* PCL raster setup:
+     *   ESC E        — printer reset (clears any leftover raster state)
+     *   ESC *t<N>R   — raster resolution N dpi
+     *   ESC *r0F     — presentation: portrait, no rotation
+     *   ESC *b2M     — compression: TIFF packbits (mode 2)
+     *   ESC *r1A     — start raster at top-left of page
+     * Paper/tray/duplex are already set by PJL and persist across ESC E. */
     n = snprintf(buf, sizeof(buf),
-        "\033E"         /* PCL reset */
-        "\x1b*t%dR"     /* raster resolution */
-        "\x1b*r0F"      /* presentation */
-        "\x1b*b2M"      /* compression = packbits */
-        "\x1b*r1A",     /* start raster */
-        resolution);
-
+        "\033E"
+        "\x1b*t%dR"
+        "\x1b*r0F"
+        "\x1b*b2M"
+        "\x1b*r1A",
+        jd->resolution);
     papplDeviceWrite(device, buf, (size_t)n);
     papplDeviceFlush(device);
-
     return true;
 }
 
@@ -99,23 +255,25 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
                                  pappl_device_t *device, unsigned y,
                                  const unsigned char *line)
 {
-    hl5170dn_job_t *jd = papplJobGetData(job);
-    size_t bytes_per_line = (size_t)options->header.cupsBytesPerLine;
-    char   hdr[32];
-    int    hdr_len;
-    size_t encoded_len;
+    hl5170dn_job_t *jd  = papplJobGetData(job);
+    unsigned        w   = options->header.cupsWidth;
+    char            hdr[32];
+    int             hdr_len;
+    size_t          encoded_len;
 
-    /* Diagnostic: log the very first line of each job so we can verify that
-     * (a) rwriteline_cb is being called at all, (b) bytes_per_line is non-zero,
-     * and (c) the pixel data contains non-zero bytes (actual image content).
-     * Remove once printing is confirmed working. */
-    if (y == 0) {
-        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-            "rwriteline y=0: bytes_per_line=%u line[0]=0x%02x line[1]=0x%02x",
-            (unsigned)bytes_per_line, line[0], bytes_per_line > 1 ? line[1] : 0u);
-    }
+    /* Periodic trace: y=0 and every 256 lines thereafter. */
+    if ((y % 256) == 0)
+        papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+            "rwriteline y=%u width=%u line[0]=0x%02x",
+            y, w, line[0]);
 
-    encoded_len = packbits_encode(line, bytes_per_line, jd->line_buf);
+    /* Halftone 8-bit grayscale → 1-bit packed row in halftone_buf. */
+    if (jd->resolution >= 600)
+        dither_row(line, jd->halftone_buf, w, y);
+    else
+        threshold_row(line, jd->halftone_buf, w);
+
+    encoded_len = packbits_encode(jd->halftone_buf, (w + 7u) / 8u, jd->line_buf);
 
     /* PCL transfer raster data: ESC *b <count> W <data> */
     hdr_len = snprintf(hdr, sizeof(hdr), "\x1b*b%uW", (unsigned)encoded_len);
@@ -138,7 +296,6 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
     papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "end page %u", page);
     papplDeviceWrite(device, end_page, sizeof(end_page) - 1);
     papplDeviceFlush(device);
-
     return true;
 }
 
@@ -146,19 +303,20 @@ static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
                               pappl_device_t *device)
 {
     hl5170dn_job_t *jd = papplJobGetData(job);
-
     (void)options;
+
+    if (!jd)
+        return true;   /* rstartjob_cb failed before setting job data */
 
     papplLogJob(job, PAPPL_LOGLEVEL_INFO, "end job (elapsed %lds)",
         (long)(time(NULL) - jd->start_time));
 
-    /* UEL + EOJ + restore sleep mode */
     pjl_write_job_trailer(device, /*restore_powersave=*/true);
 
+    free(jd->halftone_buf);
     free(jd->line_buf);
     free(jd);
     papplJobSetData(job, NULL);
-
     return true;
 }
 
@@ -183,6 +341,22 @@ static bool hl5170dn_status(pappl_printer_t *printer)
 
 /* ---- Driver registration ---------------------------------------------- */
 
+/* Helper: fill a pappl_media_col_t for a standard paper size. */
+static void fill_media(pappl_media_col_t *m, const char *size_name,
+                       int width_100mm, int length_100mm, const char *source)
+{
+    memset(m, 0, sizeof(*m));
+    strncpy(m->size_name, size_name, sizeof(m->size_name) - 1);
+    m->size_width    = width_100mm;
+    m->size_length   = length_100mm;
+    m->left_margin   = 500;
+    m->right_margin  = 500;
+    m->top_margin    = 500;
+    m->bottom_margin = 500;
+    strncpy(m->source, source, sizeof(m->source) - 1);
+    strncpy(m->type, "stationery", sizeof(m->type) - 1);
+}
+
 bool driver_cb(pappl_system_t *system, const char *driver_name,
                const char *device_uri, const char *device_id,
                pappl_pr_driver_data_t *data, ipp_t **attrs, void *cbdata)
@@ -196,18 +370,14 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     if (strcmp(driver_name, "hl5170dn") != 0)
         return false;
 
-    /* Do NOT memset(data, 0) here.  PAPPL calls _papplPrinterInitDriverData()
-     * before invoking driver_cb, which zeroes the struct and installs proper
-     * 16×16 dither matrices in data->gdither (clustered-dot) and data->pdither
-     * (blue-noise).  Wiping them to zero causes all pixels with value > 0
-     * (any non-black pixel) to be dropped by the dither check in
-     * papplJobFilterImage, producing a blank page for anything except pure
-     * black text.  We only set the fields we actually care about; PAPPL's
-     * defaults for everything else are correct. */
+    /* Do NOT memset(data, 0).  PAPPL pre-initialises dither matrices
+     * in data->gdither / data->pdither before calling driver_cb.
+     * Zeroing them causes blank pages for grayscale content.
+     * Only set the fields this driver actually needs. */
 
     strncpy(data->make_and_model, "Brother HL-5170DN",
             sizeof(data->make_and_model) - 1);
-    data->ppm = 21; /* HL-5170DN rated 21 ppm */
+    data->ppm = 21;
 
     /* Callbacks */
     data->identify_cb   = hl5170dn_identify;
@@ -218,72 +388,78 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     data->rendpage_cb   = hl5170dn_rendpage;
     data->rendjob_cb    = hl5170dn_rendjob;
 
-    /* Phase 1: 300 dpi only (Investigation 2: 600 dpi takes 45s for photos,
-     * which exceeds the safe USB-keepalive window).  Phase 2 adds 600. */
-    data->num_resolution   = 1;
-    data->x_resolution[0]  = 300;
-    data->y_resolution[0]  = 300;
-    data->x_default        = 300;
-    data->y_default        = 300;
+    /* Resolutions: 300 (default) and 600 dpi.
+     * HQ1200 deferred to Phase 6 (see plan.md §6B). */
+    data->num_resolution  = 2;
+    data->x_resolution[0] = 300; data->y_resolution[0] = 300;
+    data->x_resolution[1] = 600; data->y_resolution[1] = 600;
+    data->x_default       = 300; data->y_default       = 300;
 
-    /* Force 1-bit black raster; PAPPL halftones for us. */
-    data->raster_types      = PAPPL_PWG_RASTER_TYPE_BLACK_1;
-    data->force_raster_type = PAPPL_PWG_RASTER_TYPE_BLACK_1;
+    /* Driver owns halftoning: request 8-bit grayscale from PAPPL.
+     * No force_raster_type — do not override to BLACK_1. */
+    data->raster_types = PAPPL_PWG_RASTER_TYPE_SGRAY_8;
 
     /* Monochrome only. */
     data->color_supported = PAPPL_COLOR_MODE_MONOCHROME;
     data->color_default   = PAPPL_COLOR_MODE_MONOCHROME;
 
-    /* PAPPL 1.3.1 calls _papplContentString / _papplScalingString with these
-     * values and passes the result directly to strlcpy — a NULL return (from
-     * value 0) causes a SIGSEGV.  Set valid defaults for all three. */
     data->content_default = PAPPL_CONTENT_AUTO;
     data->scaling_default = PAPPL_SCALING_AUTO;
     data->quality_default = IPP_QUALITY_NORMAL;
 
-    /* No duplex in Phase 1. */
-    data->duplex        = PAPPL_DUPLEX_NONE;
-    data->input_face_up = false;
+    /* Duplex: HL-5170DN has a physical duplex unit. */
+    data->duplex = PAPPL_DUPLEX_NORMAL;
+    data->sides_supported = PAPPL_SIDES_ONE_SIDED |
+                            PAPPL_SIDES_TWO_SIDED_LONG_EDGE |
+                            PAPPL_SIDES_TWO_SIDED_SHORT_EDGE;
+    data->sides_default   = PAPPL_SIDES_TWO_SIDED_LONG_EDGE;
+    data->input_face_up   = false;
 
     /* Identify: declare SOUND but the callback is a no-op. */
     data->identify_default   = PAPPL_IDENTIFY_ACTIONS_SOUND;
     data->identify_supported = PAPPL_IDENTIFY_ACTIONS_SOUND;
 
-    /* Media: Letter only, from tray-1 and by-pass-tray. */
-    data->num_media = 1;
+    /* Media sizes (IPP PWG names).  PJL names in size_name_to_pjl(). */
+    data->num_media = 11;
     data->media[0]  = "na_letter_8.5x11in";
+    data->media[1]  = "iso_a4_210x297mm";
+    data->media[2]  = "iso_a5_148x210mm";
+    data->media[3]  = "iso_a6_105x148mm";
+    data->media[4]  = "na_legal_8.5x14in";
+    data->media[5]  = "na_executive_7.25x10.5in";
+    data->media[6]  = "na_number-10_4.125x9.5in";
+    data->media[7]  = "na_monarch_3.875x7.5in";
+    data->media[8]  = "iso_dl_110x220mm";
+    data->media[9]  = "iso_c5_162x229mm";
+    data->media[10] = "iso_b5_176x250mm";
 
-    memset(&data->media_default, 0, sizeof(data->media_default));
-    strncpy(data->media_default.size_name, "na_letter_8.5x11in",
-            sizeof(data->media_default.size_name) - 1);
-    data->media_default.size_width    = 21590; /* 8.5" in hundredths of mm */
-    data->media_default.size_length   = 27940; /* 11" in hundredths of mm */
-    data->media_default.left_margin   = 500;
-    data->media_default.right_margin  = 500;
-    data->media_default.top_margin    = 500;
-    data->media_default.bottom_margin = 500;
-    strncpy(data->media_default.source, "tray-1",
-            sizeof(data->media_default.source) - 1);
-    strncpy(data->media_default.type, "stationery",
-            sizeof(data->media_default.type) - 1);
+    /* Default: Letter in tray-1. */
+    fill_media(&data->media_default, "na_letter_8.5x11in",
+               21590, 27940, "tray-1");
 
     /* Sources */
-    data->num_source = 2;
+    data->num_source = 3;
     data->source[0]  = "tray-1";
     data->source[1]  = "by-pass-tray";
+    data->source[2]  = "auto";
 
-    /* media_ready: tray-1 has Letter loaded; by-pass-tray inherits same */
-    data->media_ready[0] = data->media_default;
-    data->media_ready[1] = data->media_default;
-    strncpy(data->media_ready[1].source, "by-pass-tray",
-            sizeof(data->media_ready[1].source) - 1);
+    /* media_ready: all sources report Letter loaded. */
+    fill_media(&data->media_ready[0], "na_letter_8.5x11in", 21590, 27940, "tray-1");
+    fill_media(&data->media_ready[1], "na_letter_8.5x11in", 21590, 27940, "by-pass-tray");
+    fill_media(&data->media_ready[2], "na_letter_8.5x11in", 21590, 27940, "auto");
 
-    /* Media types */
-    data->num_type = 1;
+    /* Media types (IPP names).  PJL names in type_to_pjl(). */
+    data->num_type = 8;
     data->type[0]  = "stationery";
+    data->type[1]  = "stationery-lightweight";
+    data->type[2]  = "cardstock";
+    data->type[3]  = "cardstock-heavy";
+    data->type[4]  = "bond";
+    data->type[5]  = "envelope";
+    data->type[6]  = "envelope-heavy";
+    data->type[7]  = "envelope-lightweight";
 
-    /* Output bin — PAPPL 1.3.1 calls strlcpy(options->output_bin,
-     * data->bin[data->bin_default]) without a num_bin > 0 guard. */
+    /* Output bin */
     data->num_bin    = 1;
     data->bin[0]     = "face-down";
     data->bin_default = 0;
@@ -291,58 +467,36 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     return true;
 }
 
-/* ---- PDF → PCL filter (via Ghostscript) --------------------------------- *
+/* ---- PDF → PCL filter (streaming via Ghostscript) ---------------------- *
  *
- * PAPPL 1.3.1 has no papplSystemAddMIMEFilter(); this function exists only
- * when built against PAPPL 1.4+.  The Makefile currently links whatever
- * version pkg-config finds; see bring-up-notes.md §1 for the source-build
- * steps that install 1.4.x to /usr/local.
+ * Registered via papplSystemAddMIMEFilter() (requires PAPPL 1.4+).
+ * iPhone AirPrint sends application/pdf; this routes it through GS.
  *
- * Design: iPhone AirPrint sends application/pdf.  PAPPL's built-in raster
- * filters handle PWG/Apple raster and JPEG/PNG natively.  For PDF we
- * register a MIME filter here that:
- *   1. Shells out to ghostscript to render the PDF as 1-bit PBM ("pbmraw")
- *      — one P4 block per page.
- *   2. Calls our own raster callbacks directly, page by page, to emit the
- *      packbits-encoded PCL wrapped in PJL.
- *
- * The PAPPL docs (§ "Processing Jobs") say: "A raster filter that needs to
- * print more than one image must use the raster callback functions in the
- * pappl_pr_driver_data_t structure directly."  We do exactly that.
- *
- * Why PBM (pbmraw) and not pwgraster?
- *   - PBM is trivial to parse (P4 magic + "w h" header + raw bits, MSB=left).
- *   - Our rwriteline_cb already expects 1-bit, MSB-first packed bytes —
- *     exactly what gs pbmraw produces.  No intermediate colour conversion
- *     or raster library needed.
- *
- * Build note: papplJobCreatePrintOptions is confirmed to take (job, num_pages)
- * in PAPPL ≤1.4.  The third arg (false) is speculative — remove it if the
- * compiler complains "too many arguments".  If you get "too few", check the
- * local pappl/job.h for the actual third parameter type.
+ * Streaming design: GS writes pgmraw (8-bit grayscale) to stdout, which
+ * we read through a popen() pipe.  PCL bytes reach the printer as soon
+ * as GS produces the first raster row — no silent USB gap, no full-page
+ * buffer, responsive to job cancel.
  */
-
 static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata)
 {
-    const char          *filename = papplJobGetFilename(job);
-    pappl_printer_t     *printer  = papplJobGetPrinter(job);
+    const char         *filename = papplJobGetFilename(job);
+    pappl_printer_t    *printer  = papplJobGetPrinter(job);
     pappl_pr_driver_data_t drv;
-    pappl_pr_options_t  *options;
-    char                 gs_cmd[4096];
-    char                 pbm_path[256];
-    char                 line[256];
-    FILE                *pbm = NULL;
-    unsigned             pagenum = 0;
-    bool                 ok = false;
+    pappl_pr_options_t *options;
+    char                gs_cmd[4096];
+    char                line[256];
+    FILE               *gs        = NULL;
+    unsigned char      *rowbuf    = NULL;
+    unsigned            prev_w    = 0;
+    unsigned            pagenum   = 0;
+    bool                ok        = false;
+    bool                job_started = false;
 
     (void)cbdata;
 
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "pdf_filter: converting '%s' via gs pbmraw", filename);
+        "pdf_filter: '%s' via gs pgmraw (streaming)", filename);
 
-    /* Build print options from the job's IPP attributes.
-     * INT_MAX for num_pages = "unknown", which preserves the driver's duplex
-     * default rather than forcing single-sided (see PAPPL issue #60). */
     options = papplJobCreatePrintOptions(job, (unsigned)INT_MAX, false);
     if (!options) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
@@ -350,146 +504,136 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         return false;
     }
 
-    /* Force 300 dpi.  Phase 0 investigation showed 600 dpi photo render
-     * takes ~45s on Pi 3B+ — beyond the USB keepalive window.  300 dpi is
-     * safe for both text and photos. */
-    options->header.HWResolution[0] = 300;
-    options->header.HWResolution[1] = 300;
-
-    /* Get driver callbacks so we can drive the raster pipeline ourselves. */
     papplPrinterGetDriverData(printer, &drv);
 
-    /* Temp output file — named by job ID to avoid collisions if two jobs
-     * run concurrently (unlikely on a single-USB printer, but be safe). */
-    snprintf(pbm_path, sizeof(pbm_path),
-             "/tmp/hl5170dn-pdf-%d.pbm", (int)papplJobGetID(job));
-
-    /* gs renders the PDF as 1-bit monochrome PBM.
-     *   -dSAFE   : prevents PostScript programs in the PDF from calling
-     *              system(), accessing the network, or writing arbitrary files.
-     *   -dFitPage: scales each page to fill the paper without clipping.
-     *   -r300    : 300 dpi output — matches the driver's Phase 1 resolution.
-     * Stderr is redirected so gs diagnostic output doesn't corrupt the PBM
-     * stream; inspect /tmp/hl5170dn-gs.log when debugging. */
-    snprintf(gs_cmd, sizeof(gs_cmd),
-        "gs -dBATCH -dNOPAUSE -dSAFE "
-        "-sDEVICE=pbmraw -r300 -dFitPage -sPAPERSIZE=letter "
-        "-sOutputFile='%s' '%s' 2>/tmp/hl5170dn-gs.log",
-        pbm_path, filename);
-
-    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "pdf_filter: gs cmd: %s", gs_cmd);
-
-    if (system(gs_cmd) != 0) {
-        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-            "pdf_filter: gs failed (exit non-zero) — "
-            "inspect /tmp/hl5170dn-gs.log");
-        goto done;
-    }
-
-    pbm = fopen(pbm_path, "rb");
-    if (!pbm) {
-        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-            "pdf_filter: cannot open gs output '%s': %s",
-            pbm_path, strerror(errno));
-        goto done;
-    }
-
-    /* Send the PJL job header once, before any page data. */
+    /* Start the job: sends PJL header (POWERSAVE=OFF, RESOLUTION, etc.).
+     * jd->resolution is set here; we use it for the GS command below. */
     if (!drv.rstartjob_cb(job, options, device)) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
             "pdf_filter: rstartjob_cb failed");
         goto done;
     }
+    job_started = true;
 
-    /* Each P4 block in the PBM file is one page of the PDF.
-     * fgets reads lines; the PBM binary pixel data follows immediately
-     * after the header, so we must switch to fread for pixel rows. */
-    while (fgets(line, sizeof(line), pbm)) {
-        int           w, h;
-        size_t        rowbytes;
-        unsigned char *rowbuf;
-        bool          page_ok = true;
+    {
+        hl5170dn_job_t *jd  = papplJobGetData(job);
+        int             res = jd->resolution;
+        const char     *gs_paper = size_name_to_gs(options->media.size_name);
 
-        /* Skip until we see the P4 magic (raw PBM). */
-        if (strncmp(line, "P4", 2) != 0)
+        /* GS renders the PDF as 8-bit grayscale PGM to stdout.
+         * pgmraw: P5 blocks, one per page, 8-bit pixels (0=black, 255=white).
+         * -dFitPage: scale pages to fill declared paper without clipping.
+         * -dSAFE: block PostScript file/network access. */
+        snprintf(gs_cmd, sizeof(gs_cmd),
+            "gs -dBATCH -dNOPAUSE -dSAFE "
+            "-sDEVICE=pgmraw -r%d -dFitPage -sPAPERSIZE=%s "
+            "-sOutputFile=- '%s' 2>/tmp/hl5170dn-gs.log",
+            res, gs_paper, filename);
+
+        papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+            "pdf_filter: gs cmd: %s", gs_cmd);
+    }
+
+    gs = popen(gs_cmd, "r");
+    if (!gs) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "pdf_filter: popen failed: %s", strerror(errno));
+        goto done;
+    }
+
+    /* Each P5 block in the stream is one page of the PDF. */
+    while (fgets(line, sizeof(line), gs)) {
+        int    w, h;
+        bool   page_ok = true;
+
+        if (strncmp(line, "P5", 2) != 0)
             continue;
 
-        /* Skip optional comment lines after the magic. */
+        /* Skip optional comment lines after the P5 magic. */
         do {
-            if (!fgets(line, sizeof(line), pbm))
-                goto jobs_done;   /* EOF between magic and dimensions */
+            if (!fgets(line, sizeof(line), gs))
+                goto jobs_done;
         } while (line[0] == '#');
 
-        /* "line" now holds "<width> <height>\n". */
+        /* "width height" line */
         if (sscanf(line, "%d %d", &w, &h) != 2 || w <= 0 || h <= 0) {
             papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                "pdf_filter: bad PBM dimensions on page %u", pagenum);
+                "pdf_filter: bad PGM dimensions on page %u", pagenum);
             break;
         }
 
-        rowbytes = (size_t)((w + 7) / 8);   /* bits packed, MSB first */
+        /* maxval line (always "255\n" from GS pgmraw) — consume and discard */
+        if (!fgets(line, sizeof(line), gs))
+            goto jobs_done;
 
-        /* Patch options so the raster callbacks know the page geometry. */
+        /* Update options for this page's geometry.
+         * cupsBytesPerLine = w: one byte per pixel for SGRAY_8. */
         options->header.cupsWidth        = (unsigned)w;
         options->header.cupsHeight       = (unsigned)h;
-        options->header.cupsBytesPerLine = (unsigned)rowbytes;
+        options->header.cupsBytesPerLine = (unsigned)w;
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "pdf_filter: page %u: %dx%d px, %zu bytes/line",
-            pagenum, w, h, rowbytes);
+            "pdf_filter: page %u: %dx%d px", pagenum, w, h);
 
-        rowbuf = malloc(rowbytes);
-        if (!rowbuf) {
-            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                "pdf_filter: out of memory for row buffer (page %u)", pagenum);
-            page_ok = false;
-        } else {
-            drv.rstartpage_cb(job, options, device, pagenum);
-
-            for (int y = 0; y < h && page_ok; y++) {
-                if (fread(rowbuf, 1, rowbytes, pbm) != rowbytes) {
-                    papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                        "pdf_filter: short read at y=%d page %u: %s",
-                        y, pagenum, strerror(errno));
-                    page_ok = false;
-                } else {
-                    drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf);
-                }
-            }
-
-            drv.rendpage_cb(job, options, device, pagenum);
+        /* Grow row buffer if this page is wider than previous pages. */
+        if ((unsigned)w > prev_w) {
             free(rowbuf);
+            rowbuf = malloc((size_t)w);
+            if (!rowbuf) {
+                papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                    "pdf_filter: OOM for row buffer on page %u", pagenum);
+                break;
+            }
+            prev_w = (unsigned)w;
         }
 
+        drv.rstartpage_cb(job, options, device, pagenum);
+
+        for (int y = 0; y < h && page_ok; y++) {
+            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
+                papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                    "pdf_filter: short read y=%d page %u: %s",
+                    y, pagenum, strerror(errno));
+                page_ok = false;
+            } else {
+                drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf);
+            }
+        }
+
+        drv.rendpage_cb(job, options, device, pagenum);
         pagenum++;
         if (!page_ok)
             break;
     }
 
 jobs_done:
-    drv.rendjob_cb(job, options, device);
     ok = (pagenum > 0);
-
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
         "pdf_filter: %s — %u page(s)", ok ? "ok" : "FAILED", pagenum);
 
 done:
-    if (pbm) { fclose(pbm); pbm = NULL; }
-    unlink(pbm_path);   /* harmless if gs failed and file was never created */
+    if (job_started)
+        drv.rendjob_cb(job, options, device);
+
+    if (gs) {
+        int gs_status = pclose(gs);
+        if (gs_status != 0)
+            papplLogJob(job, PAPPL_LOGLEVEL_WARN,
+                "pdf_filter: gs exited with status %d", gs_status);
+    }
+
+    free(rowbuf);
     papplJobDeletePrintOptions(options);
     return ok;
 }
 
-/* Called from system_cb (main.c) after papplSystemCreate().
- * Must be called before papplSystemRun() / papplMainloop(). */
+/* Called from system_cb (main.c) after papplSystemCreate(). */
 void register_pdf_filter(pappl_system_t *system)
 {
     papplSystemAddMIMEFilter(
         system,
-        "application/pdf",   /* srctype: iPhone AirPrint sends this */
-        "image/pwg-raster",  /* dsttype: signals raster-capable filter;
-                              * our filter drives the raster callbacks
-                              * directly rather than emitting PWG bytes */
+        "application/pdf",
+        "image/pwg-raster",
         pdf_filter_cb,
         NULL);
     papplLog(system, PAPPL_LOGLEVEL_INFO,
