@@ -1,5 +1,5 @@
-/* Phase 2/3/4: driver-owned streaming raster pipeline + media substitution
- * + rich job-prefix observability logging.
+/* Phase 2/3/4/5: driver-owned streaming raster pipeline + media substitution
+ * + rich job-prefix observability logging + PJL supply/status polling.
  *
  * Architecture: PAPPL owns IPP/AirPrint/USB/job lifecycle.
  * This driver owns: GS invocation, 8-bit grayscale halftoning,
@@ -503,8 +503,68 @@ static void hl5170dn_identify(pappl_printer_t *printer,
 
 static bool hl5170dn_status(pappl_printer_t *printer)
 {
-    (void)printer;
-    /* Phase 5 will poll PJL INFO STATUS here. */
+    /* Always set supply level first — exit criterion met even if device is busy. */
+    pappl_supply_t supply;
+    memset(&supply, 0, sizeof(supply));
+    supply.color       = PAPPL_SUPPLY_COLOR_BLACK;
+    supply.is_consumed = true;
+    supply.level       = -1;   /* unknown — INFO SUPPLIES returns "?" on HL-5170DN */
+    supply.type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
+    strncpy(supply.description, "Black Toner Cartridge",
+            sizeof(supply.description) - 1);
+    papplPrinterSetSupplies(printer, 1, &supply);
+
+    /* Open USB device for PJL back-channel query.
+     * Returns NULL if device is busy (job in progress) — that's fine. */
+    pappl_device_t *device = papplPrinterOpenDevice(printer);
+    if (!device) {
+        papplLogPrinter(printer, PAPPL_LOGLEVEL_DEBUG,
+            "status: device busy, skipping PJL poll");
+        return true;
+    }
+
+    /* Send @PJL INFO STATUS query. */
+    static const char query[] =
+        "\033%-12345X@PJL\r\n"
+        "@PJL INFO STATUS\r\n"
+        "\033%-12345X";
+    papplDeviceWrite(device, query, sizeof(query) - 1);
+    papplDeviceFlush(device);
+
+    /* Read FF-terminated response.  papplDeviceRead() has no timeout parameter;
+     * the USB backend (libusb) handles its own read timeout (~400 ms observed
+     * in Phase 0). */
+    char    buf[1024];
+    ssize_t bytes = papplDeviceRead(device, buf, sizeof(buf) - 1);
+    papplPrinterCloseDevice(printer);
+
+    if (bytes <= 0) {
+        papplLogPrinter(printer, PAPPL_LOGLEVEL_WARN,
+            "status: no response from printer (bytes=%zd)", bytes);
+        return true;
+    }
+    buf[bytes] = '\0';
+
+    /* Parse CODE= and ONLINE= from the response. */
+    int  code   = -1;
+    bool online = false;
+    char *p;
+    if ((p = strstr(buf, "CODE=")) != NULL)
+        code = atoi(p + 5);
+    if ((p = strstr(buf, "ONLINE=")) != NULL)
+        online = (strncmp(p + 7, "TRUE", 4) == 0);
+
+    papplLogPrinter(printer, PAPPL_LOGLEVEL_DEBUG,
+        "status: CODE=%d ONLINE=%s", code, online ? "TRUE" : "FALSE");
+
+    /* Map status code range to printer reasons.
+     * 40000–40999: operator-attention errors (paper empty, cover open, jam).
+     * All other codes (10xxx ready, 40000=sleep per Phase 0) are non-error. */
+    if (code >= 40001 && code <= 40999)
+        papplPrinterSetReasons(printer, PAPPL_PREASON_OTHER, PAPPL_PREASON_NONE);
+    else
+        papplPrinterSetReasons(printer, PAPPL_PREASON_NONE, PAPPL_PREASON_OTHER);
+
     return true;
 }
 
