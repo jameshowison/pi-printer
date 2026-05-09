@@ -484,7 +484,7 @@ standalone result.
 
 #### 6A — APT photo path (Mode 1024)
 
-**Status: implementation complete; pending physical print verification.**
+**Status: T5 offline gate passed (2026-05-09); pending physical print verification (T1–T4, T6–T7).**
 
 ##### What the manual actually says (§6.3.8)
 
@@ -589,14 +589,38 @@ New helper `apt_build_tiff_header(buf, w, h)` in `driver.c` builds the
 | T2 | `text-test.pdf` | `print-quality=high` | APT path; 150 dpi may look soft | Compare vs 600 dpi dither physically |
 | T3 | `image-test.pdf` | `print-quality=normal` | Existing 600 dpi dither; APT NOT taken | Log confirms |
 | T4 | Multi-page PDF | `print-quality=high` | All pages print; one TIFF W-command each | Count page completions in log |
-| T5 | TIFF validation | offline | `tiffinfo captured.tif` accepts the TIFF | Tee device write to file; run tiffinfo |
+| T5 | TIFF validation | offline | `tiffinfo captured.tif` accepts the TIFF | **PASSED** — `test_apt_tiff.c` generates Letter TIFF; tiffinfo confirms correct layout |
 | T6 | Duplex | `print-quality=high` | Duplex PJL + APT both active | Physical duplex print |
 | T7 | Cancel mid-job | `print-quality=high` | GS killed, pclose called, printer not wedged | Cancel via web UI |
 
-**T5 is the key offline gate:** tee `papplDeviceWrite()` output, extract
-the bytes after `ESC*b<N>W`, run `tiffinfo`.  If tiffinfo accepts the TIFF,
-the header is correct.  If the printer still fails, the problem is PCL
-framing or PJL settings, not the TIFF structure.
+**T5 passed (2026-05-09).** `test_apt_tiff.c` (standalone, no PAPPL) builds the
+same 174-byte header via the same byte-write helpers.  `tiffinfo` output:
+
+```
+Image Width: 1275 Image Length: 1650
+Resolution: 150, 150 pixels/inch
+Bits/Sample: 8
+Compression Scheme: None
+Photometric Interpretation: min-is-black
+Samples/Pixel: 1
+Rows/Strip: 1650
+Planar Configuration: single image plane
+```
+
+All correct.  Header arithmetic is verified.  If the printer fails on T1–T4,
+the problem is PCL framing or PJL settings, not the TIFF structure.
+
+**Next session starts here: T1 on the physical printer.**
+Run the printer app, send `image-test.pdf` with `print-quality=high`, watch
+the log for `apt_render`, and compare physical output to the 600 dpi dither
+baseline.  Command:
+
+```
+lp -d hl5170dn -o print-quality=high image-test.pdf
+```
+
+Then T2 (text at high quality — expect soft output at 150 dpi), T3 (normal
+quality — confirm APT path NOT taken), and T4 (multi-page).
 
 ##### Decision gate
 
