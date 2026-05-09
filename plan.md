@@ -379,8 +379,27 @@ writing Phase 3 code.
 
 ### Phase 3 — Media substitution
 
-The headline new feature, and the part most likely to need iteration
-because the IPP-attribute hook is PAPPL-version-specific.
+**Status: implementation complete (2026-05-08); pending physical print
+verification (§exit criteria).**
+
+**Key implementation notes:**
+- `apply_media_substitution()` in `driver.c` runs at the top of
+  `rstartjob_cb`, before `pjl_params_from_options()`. Rewriting
+  `options->media.size_name` there propagates to both the PJL PAPER=
+  command AND the GS `-sPAPERSIZE=` argument (read from
+  `options->media.size_name` in `pdf_filter_cb` after `rstartjob_cb`
+  returns).
+- PAPPL 1.4.10 has no public `papplJobSetState()` or per-job IPP
+  attribute setter, so `job-state-reasons` uses the standard
+  `PAPPL_JREASON_WARNINGS_DETECTED` / `PAPPL_JREASON_DOCUMENT_UNPRINTABLE_ERROR`
+  bits rather than a custom string value. The substitute/reject distinction
+  is visible in the log and `job-state-message`.
+- Vendor options `loaded-paper` and `media-mismatch-action` are declared
+  in `driver_cb` and settable via web UI or `lp -o loaded-paper=iso_a4_210x297mm`.
+- PWG raster path (JPEG/PNG from PAPPL's internal filter): substitution
+  changes the PJL PAPER= claim and `options->media` but cannot rescale
+  raster data that PAPPL already dimensioned from the original media.
+  Correct behaviour is limited to the PDF path (the primary use case).
 
 - Hook the job-creation path. Inspect IPP `media`. If it matches the
   PRD coercion table (Letter loaded → A4/A5/A6/Legal/Executive get

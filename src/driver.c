@@ -1,4 +1,4 @@
-/* Phase 2: driver-owned streaming raster pipeline.
+/* Phase 2/3: driver-owned streaming raster pipeline + media substitution.
  *
  * Architecture: PAPPL owns IPP/AirPrint/USB/job lifecycle.
  * This driver owns: GS invocation, 8-bit grayscale halftoning,
@@ -11,6 +11,14 @@
  *
  * Raster path (PWG/JPEG/PNG via PAPPL internal filter):
  *   PAPPL delivers SGRAY_8 rows → rwriteline_cb halftones them.
+ *
+ * Phase 3 media substitution:
+ *   apply_media_substitution() runs at the top of rstartjob_cb, before
+ *   pjl_params_from_options().  It rewrites options->media.size_name so
+ *   that BOTH the PJL PAPER= command AND the GS -sPAPERSIZE= argument
+ *   (read from options->media.size_name in pdf_filter_cb after rstartjob_cb
+ *   returns) reflect the loaded paper.  GS -dFitPage scales content to fit.
+ *   Vendor options loaded-paper and media-mismatch-action control behaviour.
  *
  * PI-SIDE BUILD NOTES (PAPPL 1.3.1)
  * If the compiler complains about field names in pappl_pr_driver_data_t:
@@ -116,6 +124,101 @@ static const char *size_name_to_gs(const char *name)
     return "letter";
 }
 
+/* ---- Phase 3: media substitution helpers ------------------------------ */
+
+static bool is_envelope(const char *name)
+{
+    return !strncmp(name, "na_number-10", 12) ||
+           !strncmp(name, "na_monarch",   10) ||
+           !strncmp(name, "iso_dl",        6) ||
+           !strncmp(name, "iso_c5",        6) ||
+           !strncmp(name, "iso_b5",        6);
+}
+
+/* Returns the coerced PWG size name, or NULL if no substitution is needed. */
+static const char *coerce_size(const char *requested, const char *loaded)
+{
+    if (is_envelope(requested) || !strcmp(requested, loaded))
+        return NULL;
+
+    if (!strcmp(loaded, "na_letter_8.5x11in")) {
+        if (!strcmp(requested, "iso_a4_210x297mm")        ||
+            !strcmp(requested, "iso_a5_148x210mm")        ||
+            !strcmp(requested, "iso_a6_105x148mm")        ||
+            !strcmp(requested, "na_legal_8.5x14in")       ||
+            !strcmp(requested, "na_executive_7.25x10.5in"))
+            return "na_letter_8.5x11in";
+    } else if (!strcmp(loaded, "iso_a4_210x297mm")) {
+        if (!strcmp(requested, "na_letter_8.5x11in")      ||
+            !strcmp(requested, "na_legal_8.5x14in")       ||
+            !strcmp(requested, "na_executive_7.25x10.5in") ||
+            !strcmp(requested, "iso_a5_148x210mm")        ||
+            !strcmp(requested, "iso_a6_105x148mm"))
+            return "iso_a4_210x297mm";
+    }
+    return NULL;
+}
+
+/* Dimensions in 100ths of mm for the two supported loaded-paper sizes. */
+static void loaded_paper_dims(const char *size_name, int *w, int *l)
+{
+    if (!strcmp(size_name, "iso_a4_210x297mm"))
+        { *w = 21000; *l = 29700; }
+    else
+        { *w = 21590; *l = 27940; }  /* Letter — default */
+}
+
+/* Apply media substitution to options->media in place.
+ * Returns false (and rejects the job) when mismatch-action=reject.
+ * On substitute, rewrites options->media.size_name + dimensions and sets
+ * job notifications through all three channels (log, message, reasons). */
+static bool apply_media_substitution(pappl_job_t *job, pappl_pr_options_t *options)
+{
+    const char *loaded = cupsGetOption("loaded-paper",
+                             options->num_vendor, options->vendor);
+    if (!loaded || !*loaded)
+        loaded = "na_letter_8.5x11in";
+
+    const char *action = cupsGetOption("media-mismatch-action",
+                             options->num_vendor, options->vendor);
+    if (!action || !*action)
+        action = "substitute";
+
+    const char *coerced = coerce_size(options->media.size_name, loaded);
+    if (!coerced)
+        return true;  /* no substitution needed */
+
+    const char *orig_pjl   = size_name_to_pjl(options->media.size_name);
+    const char *loaded_pjl = size_name_to_pjl(loaded);
+
+    if (!strcmp(action, "reject")) {
+        papplLogJob(job, PAPPL_LOGLEVEL_WARN,
+            "rejecting job: loaded paper is %s, requested %s",
+            loaded_pjl, orig_pjl);
+        papplJobSetMessage(job,
+            "Loaded paper is %s; requested %s. "
+            "Change client setting or reload printer.",
+            loaded_pjl, orig_pjl);
+        papplJobSetReasons(job, PAPPL_JREASON_DOCUMENT_UNPRINTABLE_ERROR,
+            PAPPL_JREASON_NONE);
+        return false;
+    }
+
+    /* substitute mode: rewrite media to the loaded paper */
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "substituted %s for %s (loaded paper)", loaded_pjl, orig_pjl);
+    papplJobSetMessage(job, "Substituted %s for requested %s",
+        loaded_pjl, orig_pjl);
+    papplJobSetReasons(job, PAPPL_JREASON_WARNINGS_DETECTED, PAPPL_JREASON_NONE);
+
+    strncpy(options->media.size_name, coerced,
+            sizeof(options->media.size_name) - 1);
+    options->media.size_name[sizeof(options->media.size_name) - 1] = '\0';
+    loaded_paper_dims(coerced, &options->media.size_width,
+                      &options->media.size_length);
+    return true;
+}
+
 static const char *source_to_pjl(const char *source)
 {
     if (!strcmp(source, "tray-1"))       return "TRAY1";
@@ -167,6 +270,14 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
     hl5170dn_job_t *jd = calloc(1, sizeof(*jd));
     if (!jd) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR, "rstartjob: out of memory");
+        return false;
+    }
+
+    /* Phase 3: rewrite options->media before pjl_params_from_options so that
+     * both PJL PAPER= and the GS -sPAPERSIZE= (read after this callback in
+     * pdf_filter_cb) see the loaded paper, not the client-requested size. */
+    if (!apply_media_substitution(job, options)) {
+        free(jd);
         return false;
     }
 
@@ -463,6 +574,14 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     data->num_bin    = 1;
     data->bin[0]     = "face-down";
     data->bin_default = 0;
+
+    /* Phase 3 vendor options — exposed in web UI printer settings and
+     * settable per-job via lp -o <name>=<value>.
+     *   loaded-paper:          na_letter_8.5x11in (default) | iso_a4_210x297mm
+     *   media-mismatch-action: substitute (default) | reject */
+    data->num_vendor = 2;
+    data->vendor[0]  = "loaded-paper";
+    data->vendor[1]  = "media-mismatch-action";
 
     return true;
 }
