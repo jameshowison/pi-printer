@@ -1,5 +1,6 @@
-/* Phase 2/3/4/5: driver-owned streaming raster pipeline + media substitution
- * + rich job-prefix observability logging + PJL supply/status polling.
+/* Phase 2/3/4/5/6A: driver-owned streaming raster pipeline + media substitution
+ * + rich job-prefix observability logging + PJL supply/status polling
+ * + APT photo path (Mode 1024).
  *
  * Architecture: PAPPL owns IPP/AirPrint/USB/job lifecycle.
  * This driver owns: GS invocation, 8-bit grayscale halftoning,
@@ -312,6 +313,12 @@ static void pjl_params_from_options(const pappl_pr_options_t *opts,
     /* Draft quality forces 300 dpi + economode regardless of resolution attr. */
     if (p->economode && p->resolution > 300)
         p->resolution = 300;
+
+    /* APT: printer-side halftoning for high print quality.
+     * Forces 600 dpi so the printer can upscale from the 150 dpi TIFF input. */
+    p->apt = (opts->print_quality == IPP_QUALITY_HIGH);
+    if (p->apt)
+        p->resolution = 600;
 }
 
 /* ---- Raster callbacks -------------------------------------------------- */
@@ -704,6 +711,224 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     return true;
 }
 
+/* ---- Phase 6A: APT photo path (Mode 1024) -------------------------------- *
+ *
+ * APT (Automatic Photo Tuning) lets the printer halftone 8-bit grayscale
+ * data at 600 dpi equivalent from a low-resolution (≤150 dpi) input.
+ * The entire page travels as one TIFF file inside a single ESC*b<N>W command.
+ *
+ * Manual reference: Tech_Manual_Ch2_PCL §6.3.8.
+ * APT activates when: BitsPerSample=8, Compression=1 (no compression),
+ * and the printer operates at 600 dpi.
+ */
+
+#define APT_TIFF_HDR_SIZE 174u   /* fixed header size for our 12-tag layout */
+#define APT_INPUT_DPI     150    /* recommended by manual for APT input */
+
+/* Write a uint16 little-endian into buf at *off, advance *off. */
+static void pu16(unsigned char *buf, size_t *off, unsigned v)
+{
+    buf[(*off)++] = (unsigned char)(v & 0xff);
+    buf[(*off)++] = (unsigned char)((v >> 8) & 0xff);
+}
+
+/* Write a uint32 little-endian into buf at *off, advance *off. */
+static void pu32(unsigned char *buf, size_t *off, unsigned long v)
+{
+    buf[(*off)++] = (unsigned char)(v & 0xff);
+    buf[(*off)++] = (unsigned char)((v >> 8) & 0xff);
+    buf[(*off)++] = (unsigned char)((v >> 16) & 0xff);
+    buf[(*off)++] = (unsigned char)((v >> 24) & 0xff);
+}
+
+/* Write a 12-byte TIFF IFD entry. type: 3=SHORT, 4=LONG, 5=RATIONAL. */
+static void ptag(unsigned char *buf, size_t *off,
+                 unsigned tag, unsigned type, unsigned long count,
+                 unsigned long value_or_offset)
+{
+    pu16(buf, off, tag);
+    pu16(buf, off, type);
+    pu32(buf, off, count);
+    /* SHORT values are left-justified in the 4-byte value field. */
+    if (type == 3)
+        pu16(buf, off, (unsigned)value_or_offset), pu16(buf, off, 0);
+    else
+        pu32(buf, off, value_or_offset);
+}
+
+/* Build the 174-byte TIFF header for APT Mode 1024.
+ * Little-endian, 12 tags, single strip, no compression, 8 bpp, 150 dpi.
+ * buf must be ≥ APT_TIFF_HDR_SIZE bytes. */
+static void apt_build_tiff_header(unsigned char *buf, unsigned w, unsigned h)
+{
+    size_t off = 0;
+
+    /* TIFF file header */
+    buf[off++] = 0x49; buf[off++] = 0x49;   /* "II" little-endian */
+    pu16(buf, &off, 42);                      /* TIFF magic */
+    pu32(buf, &off, 8);                       /* IFD offset */
+
+    /* IFD: 12 entries */
+    pu16(buf, &off, 12);
+
+    /* Offsets used in RATIONAL entries:
+     *   rational_base = 8 (hdr) + 2 (count) + 12*12 (entries) + 4 (next) = 158
+     *   pixel data    = 158 + 8 + 8 = 174  */
+    const unsigned long rational_base = 158;
+    const unsigned long pixel_offset  = APT_TIFF_HDR_SIZE;
+
+    ptag(buf, &off, 256, 3, 1, w);                    /* ImageWidth */
+    ptag(buf, &off, 257, 3, 1, h);                    /* ImageLength */
+    ptag(buf, &off, 258, 3, 1, 8);                    /* BitsPerSample=8 → APT */
+    ptag(buf, &off, 259, 3, 1, 1);                    /* Compression=none */
+    ptag(buf, &off, 262, 3, 1, 1);                    /* PhotometricInterp=min-is-black */
+    ptag(buf, &off, 273, 4, 1, pixel_offset);         /* StripOffsets */
+    ptag(buf, &off, 277, 3, 1, 1);                    /* SamplesPerPixel */
+    ptag(buf, &off, 278, 4, 1, h);                    /* RowsPerStrip */
+    ptag(buf, &off, 279, 4, 1, (unsigned long)w * h); /* StripByteCounts */
+    ptag(buf, &off, 282, 5, 1, rational_base);        /* XResolution → rational */
+    ptag(buf, &off, 283, 5, 1, rational_base + 8);    /* YResolution → rational */
+    ptag(buf, &off, 296, 3, 1, 2);                    /* ResolutionUnit=inch */
+
+    pu32(buf, &off, 0);   /* next IFD = none */
+
+    /* Rational data: XResolution = 150/1, YResolution = 150/1 */
+    pu32(buf, &off, APT_INPUT_DPI); pu32(buf, &off, 1);
+    pu32(buf, &off, APT_INPUT_DPI); pu32(buf, &off, 1);
+
+    (void)off;   /* off == APT_TIFF_HDR_SIZE (174) here */
+}
+
+/* Render a PDF job using APT Mode 1024 (printer-side halftoning).
+ * Called from pdf_filter_cb when print_quality == IPP_QUALITY_HIGH.
+ * GS renders at APT_INPUT_DPI; each page is wrapped in a 174-byte TIFF
+ * header and sent as a single ESC*b<N>W command. */
+static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
+                            pappl_device_t *device,
+                            pappl_pr_driver_data_t *drv,
+                            const char *filename, const char *ctx)
+{
+    unsigned char  tiff_hdr[APT_TIFF_HDR_SIZE];
+    char           gs_cmd[4096];
+    char           line[256];
+    FILE          *gs      = NULL;
+    unsigned char *rowbuf  = NULL;
+    unsigned       prev_w  = 0;
+    unsigned       pagenum = 0;
+    bool           ok      = false;
+
+    const char *gs_paper = size_name_to_gs(options->media.size_name);
+
+    snprintf(gs_cmd, sizeof(gs_cmd),
+        "gs -dBATCH -dNOPAUSE -dSAFE "
+        "-sDEVICE=pgmraw -r%d -dFitPage -sPAPERSIZE=%s "
+        "-sOutputFile=- '%s' 2>/tmp/hl5170dn-gs-apt.log",
+        APT_INPUT_DPI, gs_paper, filename);
+
+    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+        "%s: apt_render: gs cmd: %s", ctx, gs_cmd);
+
+    gs = popen(gs_cmd, "r");
+    if (!gs) {
+        papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+            "%s: apt_render: popen failed: %s", ctx, strerror(errno));
+        return false;
+    }
+
+    while (fgets(line, sizeof(line), gs)) {
+        int  w, h;
+        bool page_ok = true;
+
+        if (strncmp(line, "P5", 2) != 0)
+            continue;
+
+        /* Skip comment lines */
+        do {
+            if (!fgets(line, sizeof(line), gs))
+                goto done;
+        } while (line[0] == '#');
+
+        if (sscanf(line, "%d %d", &w, &h) != 2 || w <= 0 || h <= 0) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: apt_render: bad PGM dims page %u", ctx, pagenum);
+            break;
+        }
+        /* maxval line — consume and discard */
+        if (!fgets(line, sizeof(line), gs))
+            goto done;
+
+        if ((unsigned)w > prev_w) {
+            free(rowbuf);
+            rowbuf = malloc((size_t)w);
+            if (!rowbuf) {
+                papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                    "%s: apt_render: OOM row buf page %u", ctx, pagenum);
+                break;
+            }
+            prev_w = (unsigned)w;
+        }
+
+        unsigned long tiff_size = APT_TIFF_HDR_SIZE + (unsigned long)w * h;
+
+        papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+            "%s: apt_render: page %u: %dx%d px, TIFF=%lu B",
+            ctx, pagenum, w, h, tiff_size);
+
+        /* PCL framing: reset, set 600 dpi, Mode 1024, start raster, W-command */
+        char pcl[128];
+        int  pcl_len = snprintf(pcl, sizeof(pcl),
+            "\033E"
+            "\x1b*t600R"
+            "\x1b*b1024M"
+            "\x1b*r1A"
+            "\x1b*b%luW",
+            tiff_size);
+        papplDeviceWrite(device, pcl, (size_t)pcl_len);
+
+        /* 174-byte TIFF header */
+        apt_build_tiff_header(tiff_hdr, (unsigned)w, (unsigned)h);
+        papplDeviceWrite(device, tiff_hdr, APT_TIFF_HDR_SIZE);
+
+        /* Stream pixel rows directly from GS stdout — no full-page buffer */
+        for (int y = 0; y < h && page_ok; y++) {
+            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
+                papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                    "%s: apt_render: short read y=%d page %u: %s",
+                    ctx, y, pagenum, strerror(errno));
+                page_ok = false;
+            } else {
+                papplDeviceWrite(device, rowbuf, (size_t)w);
+            }
+        }
+
+        papplDeviceWrite(device, "\x1b*rC\x0c\033E", 7);   /* end raster, eject */
+        papplDeviceFlush(device);
+
+        /* Keep PAPPL job accounting consistent */
+        options->header.cupsWidth  = (unsigned)w;
+        options->header.cupsHeight = (unsigned)h;
+        drv->rendpage_cb(job, options, device, pagenum);
+
+        pagenum++;
+        if (!page_ok)
+            break;
+    }
+
+done:
+    ok = (pagenum > 0);
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "%s: apt_render: %s — %u page(s)", ctx, ok ? "ok" : "FAILED", pagenum);
+
+    if (gs) {
+        int gs_status = pclose(gs);
+        if (gs_status != 0)
+            papplLogJob(job, PAPPL_LOGLEVEL_WARN,
+                "%s: apt_render: gs exited with status %d", ctx, gs_status);
+    }
+    free(rowbuf);
+    return ok;
+}
+
 /* ---- PDF → PCL filter (streaming via Ghostscript) ---------------------- *
  *
  * Registered via papplSystemAddMIMEFilter() (requires PAPPL 1.4+).
@@ -758,9 +983,23 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     job_started = true;
 
     {
-        hl5170dn_job_t *jd  = papplJobGetData(job);
-        int             res = jd->resolution;
-        const char     *gs_paper = size_name_to_gs(options->media.size_name);
+        hl5170dn_job_t *jd = papplJobGetData(job);
+
+        /* Phase 6A: APT path for high print quality.
+         * apt_render_pdf() handles the full page loop and calls rendjob_cb
+         * itself, so we skip the normal GS streaming path below. */
+        if (options->print_quality == IPP_QUALITY_HIGH) {
+            papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                "%s: pdf_filter: using APT Mode 1024 (%d dpi input)",
+                ctx, APT_INPUT_DPI);
+            ok = apt_render_pdf(job, options, device, &drv, filename, ctx);
+            /* rendjob_cb called inside apt_render_pdf via job_started flag */
+            job_started = false;  /* prevent double-call in cleanup below */
+            goto done;
+        }
+
+        const char *gs_paper = size_name_to_gs(options->media.size_name);
+        int         res      = jd->resolution;
 
         /* GS renders the PDF as 8-bit grayscale PGM to stdout.
          * pgmraw: P5 blocks, one per page, 8-bit pixels (0=black, 255=white).

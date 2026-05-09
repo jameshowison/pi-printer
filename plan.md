@@ -484,33 +484,127 @@ standalone result.
 
 #### 6A — APT photo path (Mode 1024)
 
-Implement the highest-quality photo rendering path identified in
-Phase 0.
+**Status: implementation complete; pending physical print verification.**
 
-1. In the render path, detect whether the job's print-quality attribute
-   is `high` (IPP value 5) or a future `photo` mode. If so, activate
-   the APT path.
-2. Render the PDF with `gs -sDEVICE=pgmraw -r150` (8-bit grayscale,
-   150 dpi — the manual's recommended APT input resolution).
-3. Wrap the raw PGM pixels in a minimal TIFF: IFD with tags
-   `ImageWidth`, `ImageLength`, `BitsPerSample=8`,
-   `Compression=1` (no compression),
-   `PhotometricInterpretation=1` (min-is-black),
-   `SamplesPerPixel=1`, `XResolution=150`, `YResolution=150`,
-   `StripOffsets`, `StripByteCounts`.
-   Total header ≈ 136 bytes; image data follows immediately.
-4. Emit PCL sequence: `@PJL SET RESOLUTION=600`, `ESC*t600R`,
-   `ESC*b1024M`, `ESC*r1A`, single `ESC*b<size>W<TIFF bytes>`, `ESC*rC`.
-5. Print `image-test.pdf` and a photo PDF. Assess output quality
-   side-by-side with the 600 dpi ordered-dither path from Phase 2.
+##### What the manual actually says (§6.3.8)
 
-If APT quality is good: make it the default for `print-quality=high`
-and document it. If quality is poor or the printer rejects the TIFF:
-document the attempt and stay on 600 dpi ordered dither for photos.
+`ESC*b1024M` sends the **entire page as one TIFF file** in a single
+`ESC*b<N>W` command — not row-by-row.  Key constraints from the manual:
 
-`Tech_Manual_Ch2_PCL.pdf` §6.3.8 is the authoritative source; the
-HL-5170DN is explicitly listed as APT-capable in the PJL manual
-(line 859: `APT ON or OFF`).
+- "Valid only for 600 dpi data" — printer must be at 600 dpi via PJL
+  and `ESC*t600R`, even though GS input is 150 dpi (the printer upscales).
+- APT activates when: `BitsPerSample=8` + `Compression=1` (no compression)
+  + printer at 600 dpi.  Setting `BitsPerSample=1` gives APT=OFF.
+- Recommended input resolution: ≤150 dpi to keep data small.
+- `SamplesPerPixel` must be 1 (monochrome TIFF only).
+- Tags must be in ascending tag-ID order and must precede pixel data.
+- PJL: `APT` and `IMAGEADAPT` are both settable for HL-5170DN (PJL manual
+  line 859, line 735).  Both set ON in the job header when APT is active.
+
+##### TIFF byte layout (exact)
+
+Little-endian ("II") format, 12 tags, single strip, no libtiff needed.
+
+```
+Offset  Size  Content
+ 0       2    49 49  ("II" little-endian)
+ 2       2    2A 00  (TIFF magic 42)
+ 4       4    08 00 00 00  (IFD offset = 8)
+
+IFD at offset 8:
+ 8       2    0C 00  (12 entries)
+
+Tag entries (12 bytes each, ascending tag ID):
+  256 ImageWidth        SHORT  1  w
+  257 ImageLength       SHORT  1  h
+  258 BitsPerSample     SHORT  1  8   ← triggers APT
+  259 Compression       SHORT  1  1   (no compression)
+  262 PhotometricInterp SHORT  1  1   (min-is-black; matches pgmraw 0=black)
+  273 StripOffsets      LONG   1  174 (pixel data offset)
+  277 SamplesPerPixel   SHORT  1  1
+  278 RowsPerStrip      LONG   1  h   (single strip)
+  279 StripByteCounts   LONG   1  w*h
+  282 XResolution       RATIONAL 1  158 (offset to rational)
+  283 YResolution       RATIONAL 1  166 (offset to rational)
+  296 ResolutionUnit    SHORT  1  2   (inch)
+
+After IFD:
+  4 bytes: 00 00 00 00  (no next IFD)
+
+Rational data at offset 158:
+  158   8   150, 1  (XResolution = 150/1 dpi)
+  166   8   150, 1  (YResolution = 150/1 dpi)
+
+Pixel data at offset 174:
+  w*h bytes  raw 8-bit grayscale (pgmraw order, 0=black, 255=white)
+────────────────────────────────────────────────
+Total header = 174 bytes.  For 150 dpi Letter (1275×1650): ≈ 2.0 MB/page.
+```
+
+##### PCL page sequence
+
+```
+ESC E              reset (clears prior raster state)
+ESC *t 600 R       set resolution 600 dpi
+ESC *b 1024 M      compression mode: TIFF/APT
+ESC *r 1 A         start raster at cursor position
+ESC *b <N> W <TIFF>  N = 174 + w*h; entire TIFF in one command
+ESC *r C           end raster
+\x0c               form feed
+ESC E              reset for next page
+```
+
+##### PJL additions
+
+`pjl_job_params_t` gains `bool apt`.  When true, `pjl_write_job_header()`
+adds before `ENTER LANGUAGE=PCL`:
+
+```
+@PJL SET APT=ON
+@PJL SET IMAGEADAPT=ON
+```
+
+Resolution is forced to 600 in the params when APT is active.
+
+##### Driver integration
+
+APT bypasses `rstartpage_cb` / `rwriteline_cb` / `rendpage_cb`.
+`pdf_filter_cb` branches on `options->print_quality == IPP_QUALITY_HIGH`:
+
+- HIGH → `apt_render_pdf()`: GS at 150 dpi, per-page TIFF-in-W-command
+- else → existing pgmraw streaming path (unchanged)
+
+`apt_render_pdf()` streams pixels: reads PGM header (gets w, h), emits
+PCL framing + 174-byte TIFF header, then forwards GS pixel rows directly
+to `papplDeviceWrite()`.  No full-page buffer needed.
+
+New helper `apt_build_tiff_header(buf, w, h)` in `driver.c` builds the
+174-byte header by direct byte writes (no libtiff dependency).
+
+##### Test cases
+
+| # | Input | Quality | Expected | How to verify |
+|---|-------|---------|----------|---------------|
+| T1 | `image-test.pdf` | `print-quality=high` | APT path; printer-halftoned output | Log "apt_render"; physical output |
+| T2 | `text-test.pdf` | `print-quality=high` | APT path; 150 dpi may look soft | Compare vs 600 dpi dither physically |
+| T3 | `image-test.pdf` | `print-quality=normal` | Existing 600 dpi dither; APT NOT taken | Log confirms |
+| T4 | Multi-page PDF | `print-quality=high` | All pages print; one TIFF W-command each | Count page completions in log |
+| T5 | TIFF validation | offline | `tiffinfo captured.tif` accepts the TIFF | Tee device write to file; run tiffinfo |
+| T6 | Duplex | `print-quality=high` | Duplex PJL + APT both active | Physical duplex print |
+| T7 | Cancel mid-job | `print-quality=high` | GS killed, pclose called, printer not wedged | Cancel via web UI |
+
+**T5 is the key offline gate:** tee `papplDeviceWrite()` output, extract
+the bytes after `ESC*b<N>W`, run `tiffinfo`.  If tiffinfo accepts the TIFF,
+the header is correct.  If the printer still fails, the problem is PCL
+framing or PJL settings, not the TIFF structure.
+
+##### Decision gate
+
+- APT output visually superior to 600 dpi dither → make it default for
+  `print-quality=high`, document in plan.
+- Text looks soft at 150 dpi → restrict APT to photo-only jobs (future).
+- Printer prints blank or garbled → disable APT, stay on 600 dpi dither,
+  document attempt here.
 
 #### 6B — HQ1200
 

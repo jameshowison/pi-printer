@@ -13,6 +13,7 @@ typedef struct {
     const char  *mediatype;      /* PJL MEDIATYPE: "REGULAR", "THICK", … */
     bool         economode;      /* true → ECONOMODE=ON */
     int          copies;
+    bool         apt;            /* true → APT=ON + IMAGEADAPT=ON (Mode 1024) */
 } pjl_job_params_t;
 
 /* Emit UEL + all PJL SET commands + ENTER LANGUAGE=PCL.  Flushes. */

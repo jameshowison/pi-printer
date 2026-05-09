@@ -33,17 +33,27 @@ void pjl_write_job_header(pappl_device_t *dev, const pjl_job_params_t *p)
         papplDeviceWrite(dev, buf, (size_t)n);
     }
 
-    /* Block 2: remaining settings + ENTER LANGUAGE */
+    /* Block 2: remaining settings */
     n = snprintf(buf, sizeof(buf),
         "@PJL SET SOURCETRAY=%s\r\n"
         "@PJL SET MEDIATYPE=%s\r\n"
         "@PJL SET COPIES=%d\r\n"
-        "@PJL SET LPARM : PCL PAPER=%s\r\n"
-        "@PJL ENTER LANGUAGE=PCL\r\n",
+        "@PJL SET LPARM : PCL PAPER=%s\r\n",
         p->source    ? p->source    : "AUTO",
         p->mediatype ? p->mediatype : "REGULAR",
         p->copies > 0 ? p->copies : 1,
         p->paper     ? p->paper     : "LETTER");
+    papplDeviceWrite(dev, buf, (size_t)n);
+
+    /* APT: enable printer-side halftoning for 8-bit grayscale TIFF input. */
+    if (p->apt) {
+        n = snprintf(buf, sizeof(buf),
+            "@PJL SET APT=ON\r\n"
+            "@PJL SET IMAGEADAPT=ON\r\n");
+        papplDeviceWrite(dev, buf, (size_t)n);
+    }
+
+    n = snprintf(buf, sizeof(buf), "@PJL ENTER LANGUAGE=PCL\r\n");
     papplDeviceWrite(dev, buf, (size_t)n);
 
     papplDeviceFlush(dev);
