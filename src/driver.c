@@ -1,4 +1,5 @@
-/* Phase 2/3: driver-owned streaming raster pipeline + media substitution.
+/* Phase 2/3/4: driver-owned streaming raster pipeline + media substitution
+ * + rich job-prefix observability logging.
  *
  * Architecture: PAPPL owns IPP/AirPrint/USB/job lifecycle.
  * This driver owns: GS invocation, 8-bit grayscale halftoning,
@@ -50,7 +51,57 @@ typedef struct {
     unsigned char *halftone_buf;    /* 1-bit packed row, (page_width+7)/8 bytes */
     unsigned char *line_buf;        /* packbits output buffer */
     size_t         line_buf_size;
+    char           ctx[64];         /* rich log prefix: "<name> from <host>" */
 } hl5170dn_job_t;
+
+/* ---- Phase 4: rich job-context prefix --------------------------------- */
+
+/* Build a human-readable job context string stored in buf (≤bufsz bytes).
+ * Format: "<doc-or-job-name> from <host-or-user>", control chars stripped,
+ * truncated to bufsz-1.  Falls back gracefully when attributes are absent. */
+static void make_job_ctx(pappl_job_t *job, char *buf, size_t bufsz)
+{
+    /* Name: prefer document-name, fall back to job-name, then synthesize. */
+    const char *name = NULL;
+    ipp_attribute_t *attr;
+
+    attr = papplJobGetAttribute(job, "document-name");
+    if (attr)
+        name = ippGetString(attr, 0, NULL);
+    if (!name || !*name)
+        name = papplJobGetName(job);
+    if (!name || !*name) {
+        const char *fmt = papplJobGetFormat(job);
+        if      (fmt && strstr(fmt, "pdf"))    name = "<PDF>";
+        else if (fmt && strstr(fmt, "jpeg"))   name = "<photo>";
+        else if (fmt && strstr(fmt, "png"))    name = "<photo>";
+        else if (fmt && strstr(fmt, "raster")) name = "<raster>";
+        else                                   name = "<unknown>";
+    }
+
+    /* Host: prefer job-originating-host-name, fall back to username. */
+    const char *host = NULL;
+    attr = papplJobGetAttribute(job, "job-originating-host-name");
+    if (attr)
+        host = ippGetString(attr, 0, NULL);
+    if (!host || !*host)
+        host = papplJobGetUsername(job);
+
+    char tmp[128];
+    if (host && *host)
+        snprintf(tmp, sizeof(tmp), "%s from %s", name, host);
+    else
+        snprintf(tmp, sizeof(tmp), "%s", name);
+
+    /* Strip control characters (newlines, tabs, etc.). */
+    for (char *p = tmp; *p; p++) {
+        if ((unsigned char)*p < 0x20 || *p == 0x7f)
+            *p = ' ';
+    }
+
+    strncpy(buf, tmp, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+}
 
 /* ---- Halftoning ------------------------------------------------------- */
 
@@ -172,7 +223,8 @@ static void loaded_paper_dims(const char *size_name, int *w, int *l)
  * Returns false (and rejects the job) when mismatch-action=reject.
  * On substitute, rewrites options->media.size_name + dimensions and sets
  * job notifications through all three channels (log, message, reasons). */
-static bool apply_media_substitution(pappl_job_t *job, pappl_pr_options_t *options)
+static bool apply_media_substitution(pappl_job_t *job, pappl_pr_options_t *options,
+                                     const char *ctx)
 {
     const char *loaded = cupsGetOption("loaded-paper",
                              options->num_vendor, options->vendor);
@@ -193,8 +245,8 @@ static bool apply_media_substitution(pappl_job_t *job, pappl_pr_options_t *optio
 
     if (!strcmp(action, "reject")) {
         papplLogJob(job, PAPPL_LOGLEVEL_WARN,
-            "rejecting job: loaded paper is %s, requested %s",
-            loaded_pjl, orig_pjl);
+            "%s: rejecting job: loaded paper is %s, requested %s",
+            ctx, loaded_pjl, orig_pjl);
         papplJobSetMessage(job,
             "Loaded paper is %s; requested %s. "
             "Change client setting or reload printer.",
@@ -206,7 +258,7 @@ static bool apply_media_substitution(pappl_job_t *job, pappl_pr_options_t *optio
 
     /* substitute mode: rewrite media to the loaded paper */
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "substituted %s for %s (loaded paper)", loaded_pjl, orig_pjl);
+        "%s: substituted %s for %s (loaded paper)", ctx, loaded_pjl, orig_pjl);
     papplJobSetMessage(job, "Substituted %s for requested %s",
         loaded_pjl, orig_pjl);
     papplJobSetReasons(job, PAPPL_JREASON_WARNINGS_DETECTED, PAPPL_JREASON_NONE);
@@ -273,10 +325,13 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
         return false;
     }
 
+    /* Phase 4: build rich log context before the first log call. */
+    make_job_ctx(job, jd->ctx, sizeof(jd->ctx));
+
     /* Phase 3: rewrite options->media before pjl_params_from_options so that
      * both PJL PAPER= and the GS -sPAPERSIZE= (read after this callback in
      * pdf_filter_cb) see the loaded paper, not the client-requested size. */
-    if (!apply_media_substitution(job, options)) {
+    if (!apply_media_substitution(job, options, jd->ctx)) {
         free(jd);
         return false;
     }
@@ -291,7 +346,8 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
     papplJobSetData(job, jd);
 
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "start job: %ddpi duplex=%s paper=%s source=%s type=%s econo=%s copies=%d",
+        "%s: start job: %ddpi duplex=%s paper=%s source=%s type=%s econo=%s copies=%d",
+        jd->ctx,
         pjl.resolution,
         pjl.duplex ? (pjl.binding ? pjl.binding : "ON") : "OFF",
         pjl.paper    ? pjl.paper    : "?",
@@ -340,8 +396,8 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
     }
 
     papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-        "start page %u: %ux%u px at %ddpi",
-        page, w, options->header.cupsHeight, jd->resolution);
+        "%s: start page %u: %ux%u px at %ddpi",
+        jd->ctx, page, w, options->header.cupsHeight, jd->resolution);
 
     /* PCL raster setup:
      *   ESC E        — printer reset (clears any leftover raster state)
@@ -375,8 +431,8 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
     /* Periodic trace: y=0 and every 256 lines thereafter. */
     if ((y % 256) == 0)
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "rwriteline y=%u width=%u line[0]=0x%02x",
-            y, w, line[0]);
+            "%s: rwriteline y=%u width=%u line[0]=0x%02x",
+            jd->ctx, y, w, line[0]);
 
     /* Halftone 8-bit grayscale → 1-bit packed row in halftone_buf. */
     if (jd->resolution >= 600)
@@ -404,7 +460,9 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
 
     (void)options;
 
-    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "end page %u", page);
+    hl5170dn_job_t *jd2 = papplJobGetData(job);
+    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "%s: end page %u",
+        jd2 ? jd2->ctx : "?", page);
     papplDeviceWrite(device, end_page, sizeof(end_page) - 1);
     papplDeviceFlush(device);
     return true;
@@ -419,8 +477,8 @@ static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
     if (!jd)
         return true;   /* rstartjob_cb failed before setting job data */
 
-    papplLogJob(job, PAPPL_LOGLEVEL_INFO, "end job (elapsed %lds)",
-        (long)(time(NULL) - jd->start_time));
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO, "%s: end job (elapsed %lds)",
+        jd->ctx, (long)(time(NULL) - jd->start_time));
 
     pjl_write_job_trailer(device, /*restore_powersave=*/true);
 
@@ -610,16 +668,21 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     unsigned            pagenum   = 0;
     bool                ok        = false;
     bool                job_started = false;
+    char                ctx[64];
 
     (void)cbdata;
 
+    /* Phase 4: build ctx for pdf_filter_cb's own log lines (before rstartjob_cb
+     * fires and stores ctx in jd).  After rstartjob_cb we use jd->ctx instead. */
+    make_job_ctx(job, ctx, sizeof(ctx));
+
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "pdf_filter: '%s' via gs pgmraw (streaming)", filename);
+        "%s: pdf_filter: '%s' via gs pgmraw (streaming)", ctx, filename);
 
     options = papplJobCreatePrintOptions(job, (unsigned)INT_MAX, false);
     if (!options) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-            "pdf_filter: papplJobCreatePrintOptions failed");
+            "%s: pdf_filter: papplJobCreatePrintOptions failed", ctx);
         return false;
     }
 
@@ -629,7 +692,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
      * jd->resolution is set here; we use it for the GS command below. */
     if (!drv.rstartjob_cb(job, options, device)) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-            "pdf_filter: rstartjob_cb failed");
+            "%s: pdf_filter: rstartjob_cb failed", ctx);
         goto done;
     }
     job_started = true;
@@ -650,13 +713,13 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             res, gs_paper, filename);
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "pdf_filter: gs cmd: %s", gs_cmd);
+            "%s: pdf_filter: gs cmd: %s", ctx, gs_cmd);
     }
 
     gs = popen(gs_cmd, "r");
     if (!gs) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-            "pdf_filter: popen failed: %s", strerror(errno));
+            "%s: pdf_filter: popen failed: %s", ctx, strerror(errno));
         goto done;
     }
 
@@ -677,7 +740,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         /* "width height" line */
         if (sscanf(line, "%d %d", &w, &h) != 2 || w <= 0 || h <= 0) {
             papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                "pdf_filter: bad PGM dimensions on page %u", pagenum);
+                "%s: pdf_filter: bad PGM dimensions on page %u", ctx, pagenum);
             break;
         }
 
@@ -692,7 +755,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         options->header.cupsBytesPerLine = (unsigned)w;
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "pdf_filter: page %u: %dx%d px", pagenum, w, h);
+            "%s: pdf_filter: page %u: %dx%d px", ctx, pagenum, w, h);
 
         /* Grow row buffer if this page is wider than previous pages. */
         if ((unsigned)w > prev_w) {
@@ -700,7 +763,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             rowbuf = malloc((size_t)w);
             if (!rowbuf) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                    "pdf_filter: OOM for row buffer on page %u", pagenum);
+                    "%s: pdf_filter: OOM for row buffer on page %u", ctx, pagenum);
                 break;
             }
             prev_w = (unsigned)w;
@@ -711,8 +774,8 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         for (int y = 0; y < h && page_ok; y++) {
             if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                    "pdf_filter: short read y=%d page %u: %s",
-                    y, pagenum, strerror(errno));
+                    "%s: pdf_filter: short read y=%d page %u: %s",
+                    ctx, y, pagenum, strerror(errno));
                 page_ok = false;
             } else {
                 drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf);
@@ -728,7 +791,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
 jobs_done:
     ok = (pagenum > 0);
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "pdf_filter: %s — %u page(s)", ok ? "ok" : "FAILED", pagenum);
+        "%s: pdf_filter: %s — %u page(s)", ctx, ok ? "ok" : "FAILED", pagenum);
 
 done:
     if (job_started)
@@ -738,7 +801,7 @@ done:
         int gs_status = pclose(gs);
         if (gs_status != 0)
             papplLogJob(job, PAPPL_LOGLEVEL_WARN,
-                "pdf_filter: gs exited with status %d", gs_status);
+                "%s: pdf_filter: gs exited with status %d", ctx, gs_status);
     }
 
     free(rowbuf);
