@@ -417,14 +417,15 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
         jd->ctx, page, w, options->header.cupsHeight, jd->resolution);
 
     /* PCL raster setup:
-     *   ESC E        — printer reset (clears any leftover raster state)
+     *   ESC E        — printer reset (page 0 only; mid-job reset disrupts duplex)
      *   ESC *t<N>R   — raster resolution N dpi
      *   ESC *r0F     — presentation: portrait, no rotation
      *   ESC *b2M     — compression: TIFF packbits (mode 2)
      *   ESC *r1A     — start raster at top-left of page
-     * Paper/tray/duplex are already set by PJL and persist across ESC E. */
+     * Paper/tray/duplex are set by PJL and must not be cleared mid-job. */
+    if (page == 0)
+        papplDeviceWrite(device, "\033E", 2);
     n = snprintf(buf, sizeof(buf),
-        "\033E"
         "\x1b*t%dR"
         "\x1b*r0F"
         "\x1b*b2M"
@@ -472,8 +473,7 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
 {
     static const char end_page[] =
         "\x1b*rC"   /* ESC *r C — end raster transfer */
-        "\x0c"      /* form feed — eject page */
-        "\033E";    /* PCL reset */
+        "\x0c";     /* form feed — advance page (duplex: hold and flip) */
 
     (void)options;
 
@@ -886,10 +886,12 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
             "%s: apt_render: page %u: %dx%d px, TIFF=%lu B",
             ctx, pagenum, w, h, tiff_size);
 
-        /* PCL framing: reset, set 600 dpi, Mode 1024, start raster, W-command */
+        /* PCL framing: set 600 dpi, Mode 1024, start raster, W-command.
+         * ESC E only on first page — mid-job reset disrupts duplex state. */
+        if (pagenum == 0)
+            papplDeviceWrite(device, "\033E", 2);
         char pcl[128];
         int  pcl_len = snprintf(pcl, sizeof(pcl),
-            "\033E"
             "\x1b*t600R"
             "\x1b*b1024M"
             "\x1b*r1A"
@@ -913,7 +915,7 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
             }
         }
 
-        papplDeviceWrite(device, "\x1b*rC\x0c\033E", 7);   /* end raster, eject */
+        papplDeviceWrite(device, "\x1b*rC\x0c", 5);   /* end raster, advance page */
         papplDeviceFlush(device);
 
         /* Keep PAPPL job accounting consistent */
