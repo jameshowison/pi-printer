@@ -192,6 +192,13 @@ ldd /usr/local/bin/hl5170dn-printer-app | grep pappl
 # expect /usr/local/lib/libpappl.so.1 — NOT /usr/lib/.../libpappl1t64.so
 ```
 
+## Project Management
+
+This project is developed in conjunction with AI agents and the
+[job-jobs](https://github.com/jameshowison/how-jobs) task management system.
+Job state, planning documents, and work logs live in the how-jobs repo rather
+than here, keeping this repo focused on the artifact.
+
 ## Reference material
 
 | File | Purpose |
