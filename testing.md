@@ -4,14 +4,28 @@ Covers Phase 2 exit criteria (§2.3), Phase 3 exit criteria, Phase 4 observabili
 Phase 5 supply level, and Phase 6A APT tests T1–T4, T6–T7 (T5 passed offline
 2026-05-09).
 
-Job submission uses `hl5170dn-printer-app submit` — PAPPL's own CLI — rather than
-`lp`. CUPS client tools construct job URIs as `/printers/name` (CUPS convention)
-but PAPPL's endpoint is `/ipp/print`, so `lp -h localhost:8000` fails with "not
-found" even though `lpstat -h localhost:8000` works. `hl5170dn-printer-app submit`
-knows the correct endpoint. Run all commands from the Pi. `journalctl` commands
-show the last 500 log lines; run them immediately after the job completes. If the
-web UI was recently browsed, active log traffic may push job entries out of a
-shorter window — use `--since "5 minutes ago"` if a grep returns nothing.
+**Job submission protocol:** all jobs are sent directly to PAPPL via `ipptool`
+at `ipp://localhost:8000/ipp/print`. Do NOT use `lp`, `lpr`, or CUPS — CUPS
+rasterizes PDFs to URF before forwarding, which bypasses the PDF/GS path and
+prevents APT from triggering. Do NOT use `hl5170dn-printer-app submit` — it is
+a standalone process that does not route through the running service. The test
+files live in `/home/tuttle/pi-printer/tests/`.
+
+Standard submission form:
+
+```
+ipptool -tv \
+  -f /path/to/input.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/TESTFILE.test
+```
+
+Cancellation (not job submission) still uses the PAPPL CLI:
+
+```
+hl5170dn-printer-app cancel -d hl5170dn
+```
 
 Default throughout: **2-page input, duplex long-edge** (1 sheet, both sides).
 Exceptions are noted per test.
@@ -23,7 +37,8 @@ Exceptions are noted per test.
 Create the 2-page test PDF used in most tests (pages 1–2 of text-test.pdf):
 
 ```
-gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -dFirstPage=1 -dLastPage=2 -sOutputFile=/tmp/2page-test.pdf /home/tuttle/pi-printer/text-test.pdf
+gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -dFirstPage=1 -dLastPage=2 \
+  -sOutputFile=/tmp/2page-test.pdf /home/tuttle/pi-printer/text-test.pdf
 ```
 
 Confirm:
@@ -49,12 +64,13 @@ Expected output: `active`
 ### PRE-2 — Printer is reachable via IPP
 
 ```
-lpstat -h localhost:8000 -p hl5170dn
+ipptool -tv ipp://localhost:8000/ipp/print \
+  /usr/share/cups/ipptool/get-printer-attributes.test
 ```
 
-Expected output: line containing `hl5170dn` and `idle` or `ready`. If this command
-fails, verify `systemctl status hl5170dn-printer-app` and that port 8000 is
-listening (`ss -tlnp | grep 8000`).
+Expected: request succeeds (status `successful-ok`), attributes returned include
+`printer-state`. If this fails, verify `systemctl status hl5170dn-printer-app`
+and that port 8000 is listening (`ss -tlnp | grep 8000`).
 
 ### PRE-3 — Web UI is reachable
 
@@ -68,7 +84,11 @@ printer listed as idle.
 ### P2-T1a — Text at 300 dpi
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=300dpi -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-300.test
 ```
 
 Log check:
@@ -84,7 +104,11 @@ Physical pass: both sides of one sheet printed, text readable. Keep for comparis
 ### P2-T1b — Text at 600 dpi
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-600.test
 ```
 
 Log check:
@@ -100,7 +124,11 @@ Physical pass: sharper than T1a. Keep for baseline comparison.
 ### P2-T1c — Image at 300 dpi
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=300dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+ipptool -tv \
+  -f /home/tuttle/pi-printer/image-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-300.test
 ```
 
 Log check:
@@ -116,7 +144,11 @@ Physical pass: image prints. Keep for comparison with T1d.
 ### P2-T1d — Image at 600 dpi
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+ipptool -tv \
+  -f /home/tuttle/pi-printer/image-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-600.test
 ```
 
 Log check:
@@ -151,7 +183,11 @@ Physical pass: photo prints, no stall, printer not left in a waiting state.
 ### P2-T3a — Duplex long-edge
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-600.test
 ```
 
 Log check:
@@ -167,7 +203,11 @@ Physical pass: both sides of one sheet printed, long-edge (book-style) orientati
 ### P2-T3b — Duplex short-edge
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-short-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-short.test
 ```
 
 Log check:
@@ -185,7 +225,11 @@ Physical pass: both sides of one sheet, short-edge (calendar-style flip) orienta
 Image at 600 dpi takes ~45 s on the Pi 3B+, giving time to cancel.
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+ipptool -tv \
+  -f /home/tuttle/pi-printer/image-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-600.test
 ```
 
 While the printer is actively printing (LED active, paper moving), cancel all jobs:
@@ -205,7 +249,11 @@ Expected log: `pdf_filter: FAILED` or `pdf_filter: gs exited with status` (non-z
 Physical pass: printer not stuck. Confirm with a clean follow-up job:
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-600.test
 ```
 
 Pass: follow-up job prints cleanly.
@@ -219,7 +267,11 @@ The printer has Letter loaded. Default `loaded-paper` is `na_letter_8.5x11in`.
 ### P3-T1 — A4 job substituted to Letter (substitute mode)
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o media=iso_a4_210x297mm -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-a4-duplex-long.test
 ```
 
 Log check:
@@ -242,7 +294,11 @@ sides; this is correct.
 Envelopes must not be substituted. Use single-sided (no duplex on envelopes).
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o media=iso_dl_110x220mm -o sides=one-sided /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-envelope-simplex.test
 ```
 
 Log check:
@@ -260,7 +316,11 @@ the envelope). Cancel from the web UI if the printer waits.
 ### P3-T3 — Reject mode
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o media=iso_a4_210x297mm -o media-mismatch-action=reject -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-a4-reject.test
 ```
 
 Log check:
@@ -281,7 +341,12 @@ Physical pass: nothing prints.
 ### P4-T1 — Control characters in job name are sanitised
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge -o "job-name=$(printf 'test\007bell\nand\ttab')" /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  -d "jobname=$(printf 'test\007bell\nand\ttab')" \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-jobname.test
 ```
 
 Log check — confirm no raw control characters in the start job line:
@@ -332,7 +397,11 @@ T5 passed offline 2026-05-09. These are the physical printer tests.
 ### P6A-T1 — APT path taken, image input
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+ipptool -tv \
+  -f /home/tuttle/pi-printer/image-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-apt.test
 ```
 
 Log check:
@@ -353,7 +422,11 @@ APT decision gate. Record which looks better.
 ### P6A-T2 — APT path taken, text input
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-apt.test
 ```
 
 Log check:
@@ -371,7 +444,11 @@ should be restricted to photo-only jobs.
 ### P6A-T3 — APT NOT taken at normal quality
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o print-quality=4 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+ipptool -tv \
+  -f /home/tuttle/pi-printer/image-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-quality4-duplex-long-600.test
 ```
 
 Log check — confirm APT was not used:
@@ -395,7 +472,11 @@ Physical pass: same output as T1d.
 ### P6A-T4 — APT multi-page
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-apt.test
 ```
 
 Log check:
@@ -411,7 +492,11 @@ Physical pass: both pages print with printer-halftoned output.
 ### P6A-T6 — APT with duplex
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-apt.test
 ```
 
 Log check:
@@ -429,7 +514,11 @@ Physical pass: both sides of one sheet printed with APT halftoning.
 APT at 150 dpi is fast. Use image-test.pdf to ensure enough rendering time to cancel.
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+ipptool -tv \
+  -f /home/tuttle/pi-printer/image-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-apt.test
 ```
 
 While the printer LED is active, cancel:
@@ -449,7 +538,11 @@ Expected log: `apt_render: FAILED` or `gs exited with status` (non-zero), then `
 Physical pass: printer not stuck. Confirm with a clean follow-up:
 
 ```
-hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
+ipptool -tv \
+  -f /tmp/2page-test.pdf \
+  -d filetype=application/pdf \
+  ipp://localhost:8000/ipp/print \
+  /home/tuttle/pi-printer/tests/print-duplex-long-600.test
 ```
 
 Pass: follow-up job prints cleanly.
@@ -491,7 +584,7 @@ cat /tmp/hl5170dn-gs-apt.log
 | Test | Result | Notes |
 |------|--------|-------|
 | PRE-1 service active | | |
-| PRE-2 lpstat reachable | | |
+| PRE-2 IPP reachable | | |
 | PRE-3 web UI loads | | |
 | P2-T1a text 300 dpi | | |
 | P2-T1b text 600 dpi | | |
