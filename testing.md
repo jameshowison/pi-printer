@@ -12,19 +12,14 @@ the last 200 log lines; run them immediately after the job completes.
 
 ## Setup
 
-Run once before starting. Creates the multi-page PDF used in duplex tests.
+Confirm `text-test.pdf` is the multi-page file used for duplex and APT multi-page
+tests. No generated file needed.
 
 ```
-gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=/tmp/multipage-test.pdf /home/tuttle/pi-printer/text-test.pdf /home/tuttle/pi-printer/text-test.pdf /home/tuttle/pi-printer/text-test.pdf /home/tuttle/pi-printer/text-test.pdf
+pdfinfo /home/tuttle/pi-printer/text-test.pdf | grep Pages
 ```
 
-Pass: file exists and has 4 pages.
-
-```
-pdfinfo /tmp/multipage-test.pdf | grep Pages
-```
-
-Expected output: `Pages:          4`
+Expected output: `Pages:          5`
 
 ---
 
@@ -144,7 +139,7 @@ Physical pass: photo prints, no stall, printer not left in a waiting state.
 ### P2-T3a — Multi-page duplex, long-edge binding
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-long-edge /tmp/multipage-test.pdf
+lp -h localhost:8000 -d hl5170dn -o sides=two-sided-long-edge /home/tuttle/pi-printer/text-test.pdf
 ```
 
 Log check:
@@ -153,15 +148,15 @@ Log check:
 journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|start page|end job"
 ```
 
-Expected log: `start job: … duplex=LONGEDGE …`, four `start page` entries, `end job`
+Expected log: `start job: … duplex=LONGEDGE …`, five `start page` entries, `end job`
 
-Physical pass: 4 pages print on 2 sheets, both sides used, correct long-edge
-(book-style) orientation.
+Physical pass: 5 pages on 3 sheets (sheet 3 front only, back blank — correct for an
+odd page count), long-edge (book-style) orientation.
 
 ### P2-T3b — Multi-page duplex, short-edge binding
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-short-edge /tmp/multipage-test.pdf
+lp -h localhost:8000 -d hl5170dn -o sides=two-sided-short-edge /home/tuttle/pi-printer/text-test.pdf
 ```
 
 Log check:
@@ -172,7 +167,7 @@ journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep "start job:"
 
 Expected log: `start job: … duplex=SHORTEDGE …`
 
-Physical pass: 4 pages on 2 sheets, short-edge (calendar-style flip) orientation.
+Physical pass: 5 pages on 3 sheets, short-edge (calendar-style flip) orientation.
 
 ### P2-T4 — Cancel mid-print job
 
@@ -395,7 +390,7 @@ Physical pass: same output as T1d (600 dpi dither), no APT.
 ### P6A-T4 — APT multi-page
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 /tmp/multipage-test.pdf
+lp -h localhost:8000 -d hl5170dn -o print-quality=5 /home/tuttle/pi-printer/text-test.pdf
 ```
 
 Log check:
@@ -404,15 +399,15 @@ Log check:
 journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "apt_render: page|apt_render: ok"
 ```
 
-Expected log: four `apt_render: page N:` lines (pages 0–3) followed by `apt_render:
-ok — 4 page(s)`.
+Expected log: five `apt_render: page N:` lines (pages 0–4) followed by `apt_render:
+ok — 5 page(s)`.
 
 Physical pass: all 4 pages print, each with printer-halftoned output.
 
 ### P6A-T6 — APT with duplex
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/multipage-test.pdf
+lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/text-test.pdf
 ```
 
 Log check:
@@ -421,9 +416,9 @@ Log check:
 journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|apt_render: ok"
 ```
 
-Expected log: `start job: 600dpi duplex=LONGEDGE paper=LETTER … apt_render: ok — 4 page(s)`
+Expected log: `start job: 600dpi duplex=LONGEDGE paper=LETTER …` and `apt_render: ok — 5 page(s)`
 
-Physical pass: 4 pages on 2 sheets, both sides printed, APT halftoning visible.
+Physical pass: 5 pages on 3 sheets, both sides used (sheet 3 front only), APT halftoning visible.
 
 ### P6A-T7 — Cancel mid APT job
 
@@ -431,7 +426,7 @@ APT at 150 dpi is faster than 600 dpi dither, but a 4-page job still takes sever
 seconds. Submit and cancel during rendering:
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 /tmp/multipage-test.pdf
+lp -h localhost:8000 -d hl5170dn -o print-quality=5 /home/tuttle/pi-printer/text-test.pdf
 ```
 
 While the printer LED is active, cancel all jobs:
