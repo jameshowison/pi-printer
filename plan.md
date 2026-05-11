@@ -110,6 +110,41 @@ usage, responsive cancellation, immediate first-page output, and simpler
 handling of large photo jobs. Streaming is the primary mitigation for
 both Pi render latency and USB keepalive risk.
 
+## Development discipline
+
+### Build and install discipline
+
+`make install` must always stop the running service before replacing the
+binary, then start it again. Replacing a binary under a running process
+has no effect on the live service — the old binary keeps running until
+the process is restarted. Forgetting this causes the most common
+service-development mistake: debugging behavior from a stale binary.
+
+The install target follows this sequence:
+
+```
+systemctl stop hl5170dn-printer-app || true
+install binary
+install service unit / udev rules (if changed)
+systemctl daemon-reload
+systemctl start hl5170dn-printer-app
+```
+
+### Version verification
+
+The binary embeds the git hash at build time via `-DGIT_HASH=…` in
+`CFLAGS`. `DRIVER_VERSION` is defined as `"0.1-<hash>"` and logged at
+startup. Before every debugging session, confirm the expected hash is
+running:
+
+```
+journalctl -u hl5170dn-printer-app -n 5   # shows version string at startup
+```
+
+This makes stale-binary confusion immediately visible.
+
+---
+
 ## Constraints carried over from the baseline plan
 
 - **Keep the Brother HL-5170DN.** 2003-vintage USB+Ethernet mono laser.

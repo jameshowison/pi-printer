@@ -5,7 +5,8 @@ CC      = cc
 # libpappl.so.1 there first, regardless of ldconfig search order.
 PKG_CONFIG_PATH := /usr/local/lib/pkgconfig:$(PKG_CONFIG_PATH)
 export PKG_CONFIG_PATH
-CFLAGS  = -Wall -Wextra -g $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags pappl)
+GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+CFLAGS  = -Wall -Wextra -g -DGIT_HASH=\"$(GIT_HASH)\" $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags pappl)
 LIBS    = -Wl,-rpath,/usr/local/lib $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs pappl)
 TARGET  = hl5170dn-printer-app
 
@@ -35,6 +36,7 @@ clean:
 	rm -f $(OBJS) $(TARGET)
 
 install: $(TARGET)
+	systemctl stop hl5170dn-printer-app || true
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 hl5170dn-printer-app.service /etc/systemd/system/
 	install -m 644 99-brother-hl5170dn.rules /etc/udev/rules.d/
@@ -42,3 +44,4 @@ install: $(TARGET)
 	    useradd -r -M -G lp -s /usr/sbin/nologin printapp
 	udevadm control --reload-rules && udevadm trigger
 	systemctl daemon-reload
+	systemctl start hl5170dn-printer-app

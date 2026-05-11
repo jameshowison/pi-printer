@@ -1,6 +1,11 @@
 #include <pappl/pappl.h>
 
 #define APP_VERSION  "0.1.0"
+#ifdef GIT_HASH
+#  define DRIVER_VERSION  APP_VERSION "-" GIT_HASH
+#else
+#  define DRIVER_VERSION  APP_VERSION
+#endif
 #define DRIVER_NAME  "hl5170dn"
 #define PRINTER_NAME "hl5170dn"
 
@@ -47,6 +52,8 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
 
     if (!system)
         return NULL;
+
+    papplLog(system, PAPPL_LOGLEVEL_INFO, "hl5170dn-printer-app %s starting", DRIVER_VERSION);
 
     papplSystemAddListeners(system, NULL);
 
