@@ -356,16 +356,7 @@ printer and is the authoritative source for all PJL command values.
 
 #### 2.3 — Exit criteria
 
-Manual test pass against:
-
-1. `text-test.pdf` and `image-test.pdf` at 300 and 600 dpi, compared
-   side-by-side with baseline output.
-2. iPhone AirPrint of a photo: confirm a single rasterisation
-   (PDF → GS → PCL, not PAPPL's `BLACK_1` path) by reading the
-   per-line trace added in §2.0 step 3. No stall.
-3. Multi-page PDF, duplex long-edge and short-edge.
-4. Mid-print job cancel: PAPPL aborts cleanly, printer not stuck in
-   a bad PJL state on the next job.
+See `testing.md §Phase 2` (P2-T1a through P2-T4).
 
 #### 2.4 — Phase 3 prerequisite check
 
@@ -421,18 +412,7 @@ verification (§exit criteria).**
   - **`job-state-message`**: `Substituted Letter for requested A4`.
   - **`job-state-reasons`**: custom `media-substituted-warning` value.
 
-Verification — PRD test items 6 and 7:
-
-- Default `substitute` mode: A4 PDF from Mac (or `lp -o media=a4`)
-  prints on Letter, content scaled to fit (no clipping), web UI log
-  shows the substitution, `ipptool` shows the `job-state-reasons` value.
-  Envelope at envelope size *not* coerced.
-- `reject` mode: A4 PDF fails before printing, client surfaces the
-  error, no paper.
-
-Verification of correct raster dimensions: capture `papplDeviceWrite()`
-output and confirm the raster header bytes show Letter dimensions before
-declaring the feature working.
+See `testing.md §Phase 3` (P3-T1 through P3-T3) for verification procedure.
 
 ---
 
@@ -448,10 +428,8 @@ Mechanical work, but matters for debugging the rest of the project.
 - Apply prefix to every `papplLogJob()` call in driver code:
   substitution events, PJL command summary at job start, supply
   polling, USB errors, page completions.
-- Confirm PAPPL's web UI at `http://pi.local:8000/` shows logs and
-  exposes per-printer log level.
-- Sanitisation tests: submit a job with embedded newlines / control
-  chars in `job-name` and confirm logs render cleanly.
+
+See `testing.md §Phase 4` (P4-T1) for verification.
 
 ---
 
@@ -472,8 +450,7 @@ without it and document the attempt.
   (`CODE=10001` / `CODE=40000`) can still be surfaced even if toner
   level cannot.
 
-Exit criterion: PRD test item 5 — web UI shows something sensible
-(a level, or "unknown"). Not a crash.
+Exit criterion: see `testing.md §Phase 5` (P5-T1).
 
 ---
 
@@ -583,15 +560,8 @@ New helper `apt_build_tiff_header(buf, w, h)` in `driver.c` builds the
 
 ##### Test cases
 
-| # | Input | Quality | Expected | How to verify |
-|---|-------|---------|----------|---------------|
-| T1 | `image-test.pdf` | `print-quality=high` | APT path; printer-halftoned output | Log "apt_render"; physical output |
-| T2 | `text-test.pdf` | `print-quality=high` | APT path; 150 dpi may look soft | Compare vs 600 dpi dither physically |
-| T3 | `image-test.pdf` | `print-quality=normal` | Existing 600 dpi dither; APT NOT taken | Log confirms |
-| T4 | Multi-page PDF | `print-quality=high` | All pages print; one TIFF W-command each | Count page completions in log |
-| T5 | TIFF validation | offline | `tiffinfo captured.tif` accepts the TIFF | **PASSED** — `test_apt_tiff.c` generates Letter TIFF; tiffinfo confirms correct layout |
-| T6 | Duplex | `print-quality=high` | Duplex PJL + APT both active | Physical duplex print |
-| T7 | Cancel mid-job | `print-quality=high` | GS killed, pclose called, printer not wedged | Cancel via web UI |
+T5 (offline TIFF validation) passed 2026-05-09. Physical printer tests T1–T4, T6–T7:
+see `testing.md §Phase 6A` (P6A-T1 through P6A-T7).
 
 **T5 passed (2026-05-09).** `test_apt_tiff.c` (standalone, no PAPPL) builds the
 same 174-byte header via the same byte-write helpers.  `tiffinfo` output:
@@ -611,24 +581,15 @@ All correct.  Header arithmetic is verified.  If the printer fails on T1–T4,
 the problem is PCL framing or PJL settings, not the TIFF structure.
 
 **Next session starts here: T1 on the physical printer.**
-Run the printer app, send `image-test.pdf` with `print-quality=high`, watch
-the log for `apt_render`, and compare physical output to the 600 dpi dither
-baseline.  Command:
-
-```
-lp -d hl5170dn -o print-quality=high image-test.pdf
-```
-
-Then T2 (text at high quality — expect soft output at 150 dpi), T3 (normal
-quality — confirm APT path NOT taken), and T4 (multi-page).
+Send `image-test.pdf` with `print-quality=high` via `ipptool` using
+`tests/print-apt.test` (see `testing.md §P6A-T1`), watch the log for
+`apt_render`, and compare physical output to the 600 dpi dither baseline
+(P2-T1d). Then run T2–T4 in order.
 
 ##### Decision gate
 
-- APT output visually superior to 600 dpi dither → make it default for
-  `print-quality=high`, document in plan.
-- Text looks soft at 150 dpi → restrict APT to photo-only jobs (future).
-- Printer prints blank or garbled → disable APT, stay on 600 dpi dither,
-  document attempt here.
+See `testing.md §Phase 6A decision gate` for the outcome table and
+next-action rules.
 
 #### 6B — HQ1200
 
