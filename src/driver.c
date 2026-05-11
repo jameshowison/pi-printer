@@ -160,20 +160,30 @@ static const char *size_name_to_pjl(const char *name)
     return "LETTER";
 }
 
-static const char *size_name_to_gs(const char *name)
+/* Imageable area in PostScript points (72 dpi basis) for each supported
+ * media size.  Values from legacy/Brother-HL5170DN-PCL.ppd ImageableArea
+ * entries: all sizes have 18pt side margins and 12pt top/bottom margins.
+ * GS is given these dimensions via -dFIXEDMEDIA so it renders exactly the
+ * printable area — no overflow at the bottom edge. */
+static void paper_imageable_pts(const char *name, int *w_pts, int *h_pts)
 {
-    if (!strcmp(name, "na_letter_8.5x11in"))          return "letter";
-    if (!strcmp(name, "na_legal_8.5x14in"))            return "legal";
-    if (!strcmp(name, "na_executive_7.25x10.5in"))     return "executive";
-    if (!strcmp(name, "iso_a4_210x297mm"))              return "a4";
-    if (!strcmp(name, "iso_a5_148x210mm"))              return "a5";
-    if (!strcmp(name, "iso_a6_105x148mm"))              return "a6";
-    if (!strcmp(name, "na_number-10_4.125x9.5in"))     return "com10";
-    if (!strcmp(name, "na_monarch_3.875x7.5in"))        return "monarch";
-    if (!strcmp(name, "iso_dl_110x220mm"))              return "dl";
-    if (!strcmp(name, "iso_c5_162x229mm"))              return "c5";
-    if (!strcmp(name, "iso_b5_176x250mm"))              return "isob5";
-    return "letter";
+    static const struct { const char *n; int w, h; } t[] = {
+        { "na_letter_8.5x11in",           576, 768 },
+        { "na_legal_8.5x14in",            576, 984 },
+        { "na_executive_7.25x10.5in",     486, 732 },
+        { "iso_a4_210x297mm",             559, 818 },
+        { "iso_a5_148x210mm",             385, 571 },
+        { "iso_a6_105x148mm",             261, 396 },
+        { "na_number-10_4.125x9.5in",     261, 660 },
+        { "na_monarch_3.875x7.5in",       243, 516 },
+        { "iso_dl_110x220mm",             276, 600 },
+        { "iso_c5_162x229mm",             423, 625 },
+        { "iso_b5_176x250mm",             445, 685 },
+    };
+    for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
+        if (!strcmp(name, t[i].n)) { *w_pts = t[i].w; *h_pts = t[i].h; return; }
+    }
+    *w_pts = 576; *h_pts = 768;  /* fallback: letter */
 }
 
 /* ---- Phase 3: media substitution helpers ------------------------------ */
@@ -817,13 +827,15 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
     unsigned       pagenum = 0;
     bool           ok      = false;
 
-    const char *gs_paper = size_name_to_gs(options->media.size_name);
+    int gs_w_pts, gs_h_pts;
+    paper_imageable_pts(options->media.size_name, &gs_w_pts, &gs_h_pts);
 
     snprintf(gs_cmd, sizeof(gs_cmd),
         "gs -dBATCH -dNOPAUSE -dSAFE "
-        "-sDEVICE=pgmraw -r%d -dFitPage -sPAPERSIZE=%s "
+        "-sDEVICE=pgmraw -r%d -dFitPage "
+        "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
         "-sOutputFile=- '%s' 2>/tmp/hl5170dn-gs-apt.log",
-        APT_INPUT_DPI, gs_paper, filename);
+        APT_INPUT_DPI, gs_w_pts, gs_h_pts, filename);
 
     papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
         "%s: apt_render: gs cmd: %s", ctx, gs_cmd);
@@ -998,18 +1010,21 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             goto done;
         }
 
-        const char *gs_paper = size_name_to_gs(options->media.size_name);
-        int         res      = jd->resolution;
+        int gs_w_pts, gs_h_pts;
+        paper_imageable_pts(options->media.size_name, &gs_w_pts, &gs_h_pts);
+        int res = jd->resolution;
 
         /* GS renders the PDF as 8-bit grayscale PGM to stdout.
-         * pgmraw: P5 blocks, one per page, 8-bit pixels (0=black, 255=white).
-         * -dFitPage: scale pages to fill declared paper without clipping.
-         * -dSAFE: block PostScript file/network access. */
+         * Render to the imageable area dimensions (not the full page) so the
+         * PCL raster fills the printable area exactly with no bottom overflow.
+         * -dFIXEDMEDIA + DEVICEWIDTHPOINTS/HEIGHTPOINTS set the canvas size.
+         * -dFitPage scales the PDF content to fill that canvas. */
         snprintf(gs_cmd, sizeof(gs_cmd),
             "gs -dBATCH -dNOPAUSE -dSAFE "
-            "-sDEVICE=pgmraw -r%d -dFitPage -sPAPERSIZE=%s "
+            "-sDEVICE=pgmraw -r%d -dFitPage "
+            "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
             "-sOutputFile=- '%s' 2>/tmp/hl5170dn-gs.log",
-            res, gs_paper, filename);
+            res, gs_w_pts, gs_h_pts, filename);
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
             "%s: pdf_filter: gs cmd: %s", ctx, gs_cmd);
