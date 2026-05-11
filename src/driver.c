@@ -416,22 +416,21 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
         "%s: start page %u: %ux%u px at %ddpi",
         jd->ctx, page, w, options->header.cupsHeight, jd->resolution);
 
-    /* PCL raster setup (page 0 only: reset + duplex mode):
-     *   ESC E          — printer reset; page 0 only (mid-job reset disrupts duplex)
+    /* PCL raster setup (page 0 only: duplex mode):
      *   ESC &l<N>S     — PCL duplex mode: 0=simplex, 1=long-edge, 2=short-edge
-     *                    Must be set in PCL as well as PJL for HL-5170DN
+     *                    Sent first, before any other PCL, so it takes effect on
+     *                    page 1. ESC E before this command defers it to page 2.
      *   ESC *t<N>R     — raster resolution N dpi
      *   ESC *r0F       — presentation: portrait, no rotation
      *   ESC *b2M       — compression: TIFF packbits (mode 2)
      *   ESC *r1A       — start raster at top-left of page */
     if (page == 0) {
-        papplDeviceWrite(device, "\033E", 2);
-        /* PCL duplex command — printer requires this in addition to PJL DUPLEX */
         if (options->sides == PAPPL_SIDES_TWO_SIDED_SHORT_EDGE)
             papplDeviceWrite(device, "\x1b&l2S", 5);
         else if (options->sides == PAPPL_SIDES_TWO_SIDED_LONG_EDGE)
             papplDeviceWrite(device, "\x1b&l1S", 5);
-        /* else: simplex — ESC E reset already set printer to simplex default */
+        else
+            papplDeviceWrite(device, "\x1b&l0S", 5);  /* explicit simplex */
     }
     n = snprintf(buf, sizeof(buf),
         "\x1b*t%dR"
@@ -894,14 +893,15 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
             "%s: apt_render: page %u: %dx%d px, TIFF=%lu B",
             ctx, pagenum, w, h, tiff_size);
 
-        /* PCL framing: set 600 dpi, Mode 1024, start raster, W-command.
-         * ESC E + duplex command only on first page. */
+        /* PCL framing: duplex mode (page 0 only), then 600 dpi, Mode 1024.
+         * ESC &l<N>S must come before ESC E — otherwise it defers to page 2. */
         if (pagenum == 0) {
-            papplDeviceWrite(device, "\033E", 2);
             if (options->sides == PAPPL_SIDES_TWO_SIDED_SHORT_EDGE)
                 papplDeviceWrite(device, "\x1b&l2S", 5);
             else if (options->sides == PAPPL_SIDES_TWO_SIDED_LONG_EDGE)
                 papplDeviceWrite(device, "\x1b&l1S", 5);
+            else
+                papplDeviceWrite(device, "\x1b&l0S", 5);
         }
         char pcl[128];
         int  pcl_len = snprintf(pcl, sizeof(pcl),
