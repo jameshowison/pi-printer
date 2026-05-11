@@ -9,7 +9,9 @@ Job submission uses `hl5170dn-printer-app submit` — PAPPL's own CLI — rather
 but PAPPL's endpoint is `/ipp/print`, so `lp -h localhost:8000` fails with "not
 found" even though `lpstat -h localhost:8000` works. `hl5170dn-printer-app submit`
 knows the correct endpoint. Run all commands from the Pi. `journalctl` commands
-show the last 200 log lines; run them immediately after the job completes.
+show the last 500 log lines; run them immediately after the job completes. If the
+web UI was recently browsed, active log traffic may push job entries out of a
+shorter window — use `--since "5 minutes ago"` if a grep returns nothing.
 
 Default throughout: **2-page input, duplex long-edge** (1 sheet, both sides).
 Exceptions are noted per test.
@@ -72,7 +74,7 @@ hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=300dpi -o sides=tw
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|pdf_filter: ok"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|pdf_filter: ok"
 ```
 
 Expected log: `start job: 300dpi duplex=LONGEDGE paper=LETTER` … `pdf_filter: ok — 2 page(s)`
@@ -88,7 +90,7 @@ hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=tw
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|gs cmd:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|gs cmd:"
 ```
 
 Expected log: `start job: 600dpi duplex=LONGEDGE` and `gs cmd: gs … -r600 …`
@@ -104,7 +106,7 @@ hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=300dpi -o sides=tw
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|pdf_filter: ok"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|pdf_filter: ok"
 ```
 
 Expected log: `start job: 300dpi duplex=LONGEDGE` … `pdf_filter: ok`
@@ -120,7 +122,7 @@ hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=tw
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|gs cmd:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|gs cmd:"
 ```
 
 Expected log: `start job: 600dpi duplex=LONGEDGE` and `gs cmd: gs … -r600 …`
@@ -135,7 +137,7 @@ On the iPhone: open a photo in Photos → Share → Print → select "hl5170dn" 
 Log check immediately after job completes:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "pdf_filter:|start job:|end job"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "pdf_filter:|start job:|end job"
 ```
 
 Expected log:
@@ -155,7 +157,7 @@ hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|start page"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|start page"
 ```
 
 Expected log: `start job: … duplex=LONGEDGE …`, two `start page` entries.
@@ -171,7 +173,7 @@ hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-short-edge /tmp/2page
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep "start job:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep "start job:"
 ```
 
 Expected log: `start job: … duplex=SHORTEDGE …`
@@ -195,7 +197,7 @@ hl5170dn-printer-app cancel -d hl5170dn
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "pdf_filter:|gs exited|end job"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "pdf_filter:|gs exited|end job"
 ```
 
 Expected log: `pdf_filter: FAILED` or `pdf_filter: gs exited with status` (non-zero), then `end job`.
@@ -223,7 +225,7 @@ hl5170dn-printer-app submit -d hl5170dn -o media=iso_a4_210x297mm -o sides=two-s
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "substituted|gs cmd:|start job:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "substituted|gs cmd:|start job:"
 ```
 
 Expected log:
@@ -246,7 +248,7 @@ hl5170dn-printer-app submit -d hl5170dn -o media=iso_dl_110x220mm -o sides=one-s
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "substituted|start job:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "substituted|start job:"
 ```
 
 Expected log: `start job: … paper=DL …` and NO `substituted` line.
@@ -264,7 +266,7 @@ hl5170dn-printer-app submit -d hl5170dn -o media=iso_a4_210x297mm -o media-misma
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "rejecting job|pdf_filter:|start job:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "rejecting job|pdf_filter:|start job:"
 ```
 
 Expected log: `rejecting job: loaded paper is LETTER, requested A4`. No `start job:`
@@ -315,7 +317,7 @@ on this printer). Page must not crash.
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep "status:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep "status:"
 ```
 
 Expected log: `status: CODE=10001 ONLINE=TRUE` (ready) or `CODE=40000` (sleep).
@@ -336,7 +338,7 @@ hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-lo
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "APT Mode|apt_render:"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "APT Mode|apt_render:"
 ```
 
 Expected log:
@@ -357,7 +359,7 @@ hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-lo
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "APT Mode|apt_render: ok"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "APT Mode|apt_render: ok"
 ```
 
 Expected log: `using APT Mode 1024` … `apt_render: ok — 2 page(s)`
@@ -375,7 +377,7 @@ hl5170dn-printer-app submit -d hl5170dn -o print-quality=4 -o sides=two-sided-lo
 Log check — confirm APT was not used:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -c "using APT Mode"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -c "using APT Mode"
 ```
 
 Expected output: `0`
@@ -383,7 +385,7 @@ Expected output: `0`
 Confirm normal 600 dpi path:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "gs cmd:|pdf_filter: ok"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "gs cmd:|pdf_filter: ok"
 ```
 
 Expected log: `gs cmd: gs … -r600 …` (not -r150) and `pdf_filter: ok`
@@ -399,7 +401,7 @@ hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-lo
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "apt_render: page|apt_render: ok"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "apt_render: page|apt_render: ok"
 ```
 
 Expected log: two `apt_render: page N:` lines (pages 0–1) then `apt_render: ok — 2 page(s)`.
@@ -415,7 +417,7 @@ hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-lo
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "start job:|apt_render: ok"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|apt_render: ok"
 ```
 
 Expected log: `start job: 600dpi duplex=LONGEDGE paper=LETTER` and `apt_render: ok — 2 page(s)`
@@ -439,7 +441,7 @@ hl5170dn-printer-app cancel -d hl5170dn
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 200 --no-pager | grep -E "apt_render:|gs exited"
+journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "apt_render:|gs exited"
 ```
 
 Expected log: `apt_render: FAILED` or `gs exited with status` (non-zero), then `end job`.

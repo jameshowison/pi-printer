@@ -834,7 +834,7 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
         "gs -dBATCH -dNOPAUSE -dSAFE "
         "-sDEVICE=pgmraw -r%d -dFitPage "
         "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
-        "-sOutputFile=- '%s' 2>/tmp/hl5170dn-gs-apt.log",
+        "-sOutputFile=- '%s'",
         APT_INPUT_DPI, gs_w_pts, gs_h_pts, filename);
 
     papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
@@ -1023,7 +1023,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             "gs -dBATCH -dNOPAUSE -dSAFE "
             "-sDEVICE=pgmraw -r%d -dFitPage "
             "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
-            "-sOutputFile=- '%s' 2>/tmp/hl5170dn-gs.log",
+            "-sOutputFile=- '%s'",
             res, gs_w_pts, gs_h_pts, filename);
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
