@@ -89,13 +89,19 @@ hl5170dn-printer-app cancel -d hl5170dn
 
 ## Log inspection
 
-```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager
-journalctl -u hl5170dn-printer-app --since "5 minutes ago" --no-pager
-```
+`-o cat` strips journalctl's metadata prefix and shows only the PAPPL log line
+(`I [timestamp] message`), eliminating double-timestamp noise.
 
-Use `-n 500` (not `-n 200`) — web UI page loads generate ~15–20 lines each and
-can push job entries out of a shorter window.
+```
+# Interactive reading (paged, follow recent output)
+SYSTEMD_LESS=FRXMK journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago"
+
+# Grep pipeline (standard form used in test log checks)
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep "..."
+
+# Follow live
+journalctl -u hl5170dn-printer-app -o cat -f
+```
 
 GS error logs:
 - Normal path: `/tmp/hl5170dn-gs.log`

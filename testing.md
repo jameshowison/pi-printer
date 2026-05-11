@@ -94,7 +94,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|pdf_filter: ok"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "start job:|pdf_filter: ok"
 ```
 
 Expected log: `start job: 300dpi duplex=LONGEDGE paper=LETTER` … `pdf_filter: ok — 2 page(s)`
@@ -114,7 +114,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|gs cmd:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "start job:|gs cmd:"
 ```
 
 Expected log: `start job: 600dpi duplex=LONGEDGE` and `gs cmd: gs … -r600 …`
@@ -134,7 +134,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|pdf_filter: ok"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "start job:|pdf_filter: ok"
 ```
 
 Expected log: `start job: 300dpi duplex=LONGEDGE` … `pdf_filter: ok`
@@ -154,7 +154,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|gs cmd:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "start job:|gs cmd:"
 ```
 
 Expected log: `start job: 600dpi duplex=LONGEDGE` and `gs cmd: gs … -r600 …`
@@ -169,7 +169,7 @@ On the iPhone: open a photo in Photos → Share → Print → select "hl5170dn" 
 Log check immediately after job completes:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "pdf_filter:|start job:|end job"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "pdf_filter:|start job:|end job"
 ```
 
 Expected log:
@@ -193,7 +193,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|start page"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "start job:|start page"
 ```
 
 Expected log: `start job: … duplex=LONGEDGE …`, two `start page` entries.
@@ -213,7 +213,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep "start job:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep "start job:"
 ```
 
 Expected log: `start job: … duplex=SHORTEDGE …`
@@ -241,7 +241,7 @@ hl5170dn-printer-app cancel -d hl5170dn
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "pdf_filter:|gs exited|end job"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "pdf_filter:|gs exited|end job"
 ```
 
 Expected log: `pdf_filter: FAILED` or `pdf_filter: gs exited with status` (non-zero), then `end job`.
@@ -277,7 +277,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "substituted|gs cmd:|start job:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "substituted|gs cmd:|start job:"
 ```
 
 Expected log:
@@ -304,7 +304,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "substituted|start job:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "substituted|start job:"
 ```
 
 Expected log: `start job: … paper=DL …` and NO `substituted` line.
@@ -326,7 +326,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "rejecting job|pdf_filter:|start job:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "rejecting job|pdf_filter:|start job:"
 ```
 
 Expected log: `rejecting job: loaded paper is LETTER, requested A4`. No `start job:`
@@ -352,7 +352,7 @@ ipptool -tv \
 Log check — confirm no raw control characters in the start job line:
 
 ```
-journalctl -u hl5170dn-printer-app -n 100 --no-pager | grep "start job:" | grep -cP "[\x01-\x08\x0b-\x1f\x7f]"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep "start job:" | grep -cP "[\x01-\x08\x0b-\x1f\x7f]"
 ```
 
 Expected output: `0`
@@ -360,7 +360,7 @@ Expected output: `0`
 Confirm the line is human-readable:
 
 ```
-journalctl -u hl5170dn-printer-app -n 100 --no-pager | grep "start job:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep "start job:"
 ```
 
 Expected: job context prefix shows something like `test bell and tab from <user>` —
@@ -382,7 +382,7 @@ on this printer). Page must not crash.
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep "status:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep "status:"
 ```
 
 Expected log: `status: CODE=10001 ONLINE=TRUE` (ready) or `CODE=40000` (sleep).
@@ -407,7 +407,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "APT Mode|apt_render:"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "APT Mode|apt_render:"
 ```
 
 Expected log:
@@ -432,7 +432,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "APT Mode|apt_render: ok"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "APT Mode|apt_render: ok"
 ```
 
 Expected log: `using APT Mode 1024` … `apt_render: ok — 2 page(s)`
@@ -454,7 +454,7 @@ ipptool -tv \
 Log check — confirm APT was not used:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -c "using APT Mode"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -c "using APT Mode"
 ```
 
 Expected output: `0`
@@ -462,7 +462,7 @@ Expected output: `0`
 Confirm normal 600 dpi path:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "gs cmd:|pdf_filter: ok"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "gs cmd:|pdf_filter: ok"
 ```
 
 Expected log: `gs cmd: gs … -r600 …` (not -r150) and `pdf_filter: ok`
@@ -482,7 +482,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "apt_render: page|apt_render: ok"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "apt_render: page|apt_render: ok"
 ```
 
 Expected log: two `apt_render: page N:` lines (pages 0–1) then `apt_render: ok — 2 page(s)`.
@@ -490,6 +490,10 @@ Expected log: two `apt_render: page N:` lines (pages 0–1) then `apt_render: ok
 Physical pass: both pages print with printer-halftoned output.
 
 ### P6A-T6 — APT with duplex
+
+Same command as T4 — the distinction is what you check in the log: T4 verifies
+multi-page rendering (two `apt_render: page` lines), T6 verifies the duplex
+PJL framing (`start job:` shows `duplex=LONGEDGE`).
 
 ```
 ipptool -tv \
@@ -502,7 +506,7 @@ ipptool -tv \
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "start job:|apt_render: ok"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "start job:|apt_render: ok"
 ```
 
 Expected log: `start job: 600dpi duplex=LONGEDGE paper=LETTER` and `apt_render: ok — 2 page(s)`
@@ -530,7 +534,7 @@ hl5170dn-printer-app cancel -d hl5170dn
 Log check:
 
 ```
-journalctl -u hl5170dn-printer-app -n 500 --no-pager | grep -E "apt_render:|gs exited"
+journalctl -u hl5170dn-printer-app -o cat --since "5 minutes ago" --no-pager | grep -E "apt_render:|gs exited"
 ```
 
 Expected log: `apt_render: FAILED` or `gs exited with status` (non-zero), then `end job`.

@@ -37,6 +37,7 @@ clean:
 
 install: $(TARGET)
 	systemctl stop hl5170dn-printer-app || true
+	rm -f /tmp/hl5170dn-printer-app*.state
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 hl5170dn-printer-app.service /etc/systemd/system/
 	install -m 644 99-brother-hl5170dn.rules /etc/udev/rules.d/
@@ -44,4 +45,5 @@ install: $(TARGET)
 	    useradd -r -M -G lp -s /usr/sbin/nologin printapp
 	udevadm control --reload-rules && udevadm trigger
 	systemctl daemon-reload
+	systemctl restart avahi-daemon
 	systemctl start hl5170dn-printer-app

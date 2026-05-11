@@ -95,9 +95,13 @@ The `/` page shows printer status and job history. Per-printer log level is adju
 All output goes to the system journal:
 
 ```bash
-journalctl -u hl5170dn-printer-app -f          # follow live
-journalctl -u hl5170dn-printer-app --since today
+journalctl -u hl5170dn-printer-app -o cat -f             # follow live
+journalctl -u hl5170dn-printer-app -o cat --since today  # today's output
 ```
+
+`-o cat` shows only the app's own log lines (level + timestamp + message) without
+journalctl's metadata prefix. For interactive paging, set `SYSTEMD_LESS=FRXMK`
+to get a readable less experience.
 
 Log level defaults to DEBUG. The admin UI's printer page lets you change it per-printer without restarting the service.
 

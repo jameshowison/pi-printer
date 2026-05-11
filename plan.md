@@ -138,7 +138,7 @@ startup. Before every debugging session, confirm the expected hash is
 running:
 
 ```
-journalctl -u hl5170dn-printer-app -n 5   # shows version string at startup
+journalctl -u hl5170dn-printer-app -o cat -n 20   # shows version string at startup
 ```
 
 This makes stale-binary confusion immediately visible.
