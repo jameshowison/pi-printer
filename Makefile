@@ -6,6 +6,7 @@ CC      = cc
 PKG_CONFIG_PATH := /usr/local/lib/pkgconfig:$(PKG_CONFIG_PATH)
 export PKG_CONFIG_PATH
 GIT_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+GIT_HASH_FILE := .git-hash-$(GIT_HASH)
 CFLAGS  = -Wall -Wextra -g -DGIT_HASH=\"$(GIT_HASH)\" $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --cflags pappl)
 LIBS    = -Wl,-rpath,/usr/local/lib $(shell PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) pkg-config --libs pappl)
 TARGET  = hl5170dn-printer-app
@@ -20,8 +21,12 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)
 
-src/main.o: src/main.c
+src/main.o: src/main.c $(GIT_HASH_FILE)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(GIT_HASH_FILE):
+	rm -f .git-hash-*
+	touch $@
 
 src/driver.o: src/driver.c src/pjl.h src/packbits.h
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -33,7 +38,7 @@ src/packbits.o: src/packbits.c src/packbits.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) .git-hash-*
 
 install: $(TARGET)
 	systemctl stop hl5170dn-printer-app || true
