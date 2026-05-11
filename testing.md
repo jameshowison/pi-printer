@@ -4,9 +4,12 @@ Covers Phase 2 exit criteria (§2.3), Phase 3 exit criteria, Phase 4 observabili
 Phase 5 supply level, and Phase 6A APT tests T1–T4, T6–T7 (T5 passed offline
 2026-05-09).
 
-All `lp` commands use `-h localhost:8000` to talk directly to PAPPL's IPP server
-without requiring a CUPS daemon. Run them from the Pi. `journalctl` commands show
-the last 200 log lines; run them immediately after the job completes.
+Job submission uses `hl5170dn-printer-app submit` — PAPPL's own CLI — rather than
+`lp`. CUPS client tools construct job URIs as `/printers/name` (CUPS convention)
+but PAPPL's endpoint is `/ipp/print`, so `lp -h localhost:8000` fails with "not
+found" even though `lpstat -h localhost:8000` works. `hl5170dn-printer-app submit`
+knows the correct endpoint. Run all commands from the Pi. `journalctl` commands
+show the last 200 log lines; run them immediately after the job completes.
 
 Default throughout: **2-page input, duplex long-edge** (1 sheet, both sides).
 Exceptions are noted per test.
@@ -63,7 +66,7 @@ printer listed as idle.
 ### P2-T1a — Text at 300 dpi
 
 ```
-lp -h localhost:8000 -d hl5170dn -o printer-resolution=300dpi -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=300dpi -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -79,7 +82,7 @@ Physical pass: both sides of one sheet printed, text readable. Keep for comparis
 ### P2-T1b — Text at 600 dpi
 
 ```
-lp -h localhost:8000 -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -95,7 +98,7 @@ Physical pass: sharper than T1a. Keep for baseline comparison.
 ### P2-T1c — Image at 300 dpi
 
 ```
-lp -h localhost:8000 -d hl5170dn -o printer-resolution=300dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=300dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
 ```
 
 Log check:
@@ -111,7 +114,7 @@ Physical pass: image prints. Keep for comparison with T1d.
 ### P2-T1d — Image at 600 dpi
 
 ```
-lp -h localhost:8000 -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
 ```
 
 Log check:
@@ -146,7 +149,7 @@ Physical pass: photo prints, no stall, printer not left in a waiting state.
 ### P2-T3a — Duplex long-edge
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -162,7 +165,7 @@ Physical pass: both sides of one sheet printed, long-edge (book-style) orientati
 ### P2-T3b — Duplex short-edge
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-short-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-short-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -180,13 +183,13 @@ Physical pass: both sides of one sheet, short-edge (calendar-style flip) orienta
 Image at 600 dpi takes ~45 s on the Pi 3B+, giving time to cancel.
 
 ```
-lp -h localhost:8000 -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o printer-resolution=600dpi -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
 ```
 
 While the printer is actively printing (LED active, paper moving), cancel all jobs:
 
 ```
-cancel -h localhost:8000 -a
+hl5170dn-printer-app cancel -d hl5170dn
 ```
 
 Log check:
@@ -200,7 +203,7 @@ Expected log: `pdf_filter: FAILED` or `pdf_filter: gs exited with status` (non-z
 Physical pass: printer not stuck. Confirm with a clean follow-up job:
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Pass: follow-up job prints cleanly.
@@ -214,7 +217,7 @@ The printer has Letter loaded. Default `loaded-paper` is `na_letter_8.5x11in`.
 ### P3-T1 — A4 job substituted to Letter (substitute mode)
 
 ```
-lp -h localhost:8000 -d hl5170dn -o media=iso_a4_210x297mm -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o media=iso_a4_210x297mm -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -237,7 +240,7 @@ sides; this is correct.
 Envelopes must not be substituted. Use single-sided (no duplex on envelopes).
 
 ```
-lp -h localhost:8000 -d hl5170dn -o media=iso_dl_110x220mm -o sides=one-sided /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o media=iso_dl_110x220mm -o sides=one-sided /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -255,7 +258,7 @@ the envelope). Cancel from the web UI if the printer waits.
 ### P3-T3 — Reject mode
 
 ```
-lp -h localhost:8000 -d hl5170dn -o media=iso_a4_210x297mm -o media-mismatch-action=reject -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o media=iso_a4_210x297mm -o media-mismatch-action=reject -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -276,7 +279,7 @@ Physical pass: nothing prints.
 ### P4-T1 — Control characters in job name are sanitised
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-long-edge -t "$(printf 'test\007bell\nand\ttab')" /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge -o "job-name=$(printf 'test\007bell\nand\ttab')" /tmp/2page-test.pdf
 ```
 
 Log check — confirm no raw control characters in the start job line:
@@ -327,7 +330,7 @@ T5 passed offline 2026-05-09. These are the physical printer tests.
 ### P6A-T1 — APT path taken, image input
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
 ```
 
 Log check:
@@ -348,7 +351,7 @@ APT decision gate. Record which looks better.
 ### P6A-T2 — APT path taken, text input
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -366,7 +369,7 @@ should be restricted to photo-only jobs.
 ### P6A-T3 — APT NOT taken at normal quality
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=4 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o print-quality=4 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
 ```
 
 Log check — confirm APT was not used:
@@ -390,7 +393,7 @@ Physical pass: same output as T1d.
 ### P6A-T4 — APT multi-page
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -406,7 +409,7 @@ Physical pass: both pages print with printer-halftoned output.
 ### P6A-T6 — APT with duplex
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Log check:
@@ -424,13 +427,13 @@ Physical pass: both sides of one sheet printed with APT halftoning.
 APT at 150 dpi is fast. Use image-test.pdf to ensure enough rendering time to cancel.
 
 ```
-lp -h localhost:8000 -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o print-quality=5 -o sides=two-sided-long-edge /home/tuttle/pi-printer/image-test.pdf
 ```
 
 While the printer LED is active, cancel:
 
 ```
-cancel -h localhost:8000 -a
+hl5170dn-printer-app cancel -d hl5170dn
 ```
 
 Log check:
@@ -444,7 +447,7 @@ Expected log: `apt_render: FAILED` or `gs exited with status` (non-zero), then `
 Physical pass: printer not stuck. Confirm with a clean follow-up:
 
 ```
-lp -h localhost:8000 -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
+hl5170dn-printer-app submit -d hl5170dn -o sides=two-sided-long-edge /tmp/2page-test.pdf
 ```
 
 Pass: follow-up job prints cleanly.
