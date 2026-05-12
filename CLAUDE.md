@@ -1,5 +1,9 @@
 # pi-printer — Project Guide for Claude
 
+## Current Job
+
+Job state and plan: `/Users/jlh5498/jobs/how-jobs/working/pi-printer/`
+
 ## What this project is
 
 A PAPPL Printer Application for the Brother HL-5170DN, running as a systemd

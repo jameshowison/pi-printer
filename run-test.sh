@@ -24,17 +24,17 @@ STAMPED="/tmp/run-test-$$.pdf"
 
 trap 'rm -f "$STAMPED"' EXIT
 
-# Stamp LABEL at the top of every page.
+# Stamp LABEL at the top and bottom of every page.
 # The -c block installs a BeginPage hook before -f processes the PDF.
-# Coordinates assume Letter (612x792 pts); label sits ~17pt from the top edge.
+# Coordinates assume Letter (612x792 pts).
 # Note: does not adapt to A4/envelope page sizes.
 gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite \
    -sOutputFile="$STAMPED" \
    -c "<< /BeginPage {
          gsave
          /Helvetica findfont 9 scalefont setfont
-         28 775 moveto
-         ($LABEL) show
+         28 775 moveto ($LABEL) show
+         28 10 moveto ($LABEL) show
          grestore
        } bind >> setpagedevice" \
    -f "$PDF"
