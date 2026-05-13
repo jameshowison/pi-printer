@@ -4,6 +4,25 @@
 
 Job state and plan: `/Users/jlh5498/jobs/how-jobs/working/pi-printer/`
 
+## CRITICAL: All commands run via SSH
+
+All commands (ipptool, journalctl, etc.) must be run on the Pi via SSH:
+
+```
+ssh tuttle@tuttle-pi.local "COMMAND"
+```
+
+Never ask the user to run commands manually — Claude runs them via SSH.
+
+## Deploying changes to the Pi
+
+Use git, not rsync. Commit locally, push to remote, then pull on the Pi:
+
+```bash
+git push
+ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && git pull"
+```
+
 ## What this project is
 
 A PAPPL Printer Application for the Brother HL-5170DN, running as a systemd
