@@ -10,13 +10,12 @@
 
 set -euo pipefail
 
-PDF=/home/tuttle/pi-printer/chart-test.pdf
-TESTS=/home/tuttle/pi-printer/tests
+REPO=/home/tuttle/pi-printer
+TESTS=$REPO/tests
 URI=ipp://localhost:8000/ipp/print
 
-STAMPED=/tmp/apt-compare-stamped-$$.pdf
 JOB_STATE_TEST=/tmp/apt-compare-state-$$.test
-trap 'rm -f "$STAMPED" "$JOB_STATE_TEST"' EXIT
+trap 'rm -f "$JOB_STATE_TEST"' EXIT
 
 cat > "$JOB_STATE_TEST" << 'EOF'
 {
@@ -33,23 +32,11 @@ cat > "$JOB_STATE_TEST" << 'EOF'
 }
 EOF
 
-stamp_and_submit() {
-    local label="$1" testfile="$2"
-    # GS stamp — label must be free of PS special chars ( ) < > [ ] { } / %
-    gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite \
-       -sOutputFile="$STAMPED" \
-       -c "<< /BeginPage {
-             gsave
-             /Helvetica findfont 14 scalefont setfont
-             28 775 moveto ($label) show
-             28 10  moveto ($label) show
-             grestore
-           } bind >> setpagedevice" \
-       -f "$PDF" 2>/dev/null
-
+submit_pdf() {
+    local label="$1" pdf="$2" testfile="$3"
     # -tv so we get full attribute lines; extract job-id integer
     ipptool -tv \
-        -f "$STAMPED" \
+        -f "$pdf" \
         -d filetype=application/pdf \
         -d "jobname=$label" \
         "$URI" \
@@ -94,12 +81,12 @@ gs_time_for_job() {
 declare -a LABELS JOB_IDS TOTAL_TIMES
 
 run_condition() {
-    local label="$1" testfile="$2"
+    local label="$1" pdf="$2" testfile="$3"
     echo "=== $label ===" >&2
 
     local t0 t1 jobid total_s
     t0=$(date +%s%3N)
-    jobid=$(stamp_and_submit "$label" "$testfile")
+    jobid=$(submit_pdf "$label" "$pdf" "$testfile")
     echo "  job-id: $jobid" >&2
     wait_for_job "$jobid"
     t1=$(date +%s%3N)
@@ -115,9 +102,9 @@ run_condition() {
 echo "Starting comparison — chart-test.pdf x 3 conditions"
 echo ""
 
-run_condition "150dpi-direct"  "$TESTS/print-chart-simplex-150.test"
-run_condition "APT-Mode-1024"  "$TESTS/print-chart-simplex-apt.test"
-run_condition "600dpi-direct"  "$TESTS/print-chart-simplex-600.test"
+run_condition "150dpi-direct"  "$TESTS/pdfs/chart-150dpi.pdf"  "$TESTS/print-chart-simplex-150.test"
+run_condition "APT-Mode-1024"  "$TESTS/pdfs/chart-apt.pdf"     "$TESTS/print-chart-simplex-apt.test"
+run_condition "600dpi-direct"  "$TESTS/pdfs/chart-600dpi.pdf"  "$TESTS/print-chart-simplex-600.test"
 
 echo ""
 echo "=== Results ==="

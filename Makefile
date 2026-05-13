@@ -14,7 +14,35 @@ TARGET  = hl5170dn-printer-app
 SRCS = src/main.c src/driver.c src/pjl.c src/packbits.c
 OBJS = $(SRCS:.c=.o)
 
-.PHONY: all clean install
+PDF_SRC   = chart-test.pdf
+PDF_LABELS = 150dpi-direct APT-Mode-1024 600dpi-direct
+PDF_NAMES  = chart-150dpi   chart-apt     chart-600dpi
+STAMPED_PDFS = $(addprefix tests/pdfs/,$(addsuffix .pdf,$(PDF_NAMES)))
+
+tests/pdfs/chart-150dpi.pdf: $(PDF_SRC)
+	mkdir -p tests/pdfs
+	gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=$@ \
+	   -c "<< /BeginPage { gsave /Helvetica findfont 14 scalefont setfont 28 775 moveto (150dpi-direct) show 28 10 moveto (150dpi-direct) show grestore } bind >> setpagedevice" \
+	   -f $<
+	pdftotext $@ - | grep -q "150dpi-direct"
+
+tests/pdfs/chart-apt.pdf: $(PDF_SRC)
+	mkdir -p tests/pdfs
+	gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=$@ \
+	   -c "<< /BeginPage { gsave /Helvetica findfont 14 scalefont setfont 28 775 moveto (APT-Mode-1024) show 28 10 moveto (APT-Mode-1024) show grestore } bind >> setpagedevice" \
+	   -f $<
+	pdftotext $@ - | grep -q "APT-Mode-1024"
+
+tests/pdfs/chart-600dpi.pdf: $(PDF_SRC)
+	mkdir -p tests/pdfs
+	gs -q -dBATCH -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=$@ \
+	   -c "<< /BeginPage { gsave /Helvetica findfont 14 scalefont setfont 28 775 moveto (600dpi-direct) show 28 10 moveto (600dpi-direct) show grestore } bind >> setpagedevice" \
+	   -f $<
+	pdftotext $@ - | grep -q "600dpi-direct"
+
+pdfs: $(STAMPED_PDFS)
+
+.PHONY: all clean install pdfs
 
 all: $(TARGET)
 
