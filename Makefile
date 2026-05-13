@@ -14,10 +14,12 @@ TARGET  = hl5170dn-printer-app
 SRCS = src/main.c src/driver.c src/pjl.c src/packbits.c
 OBJS = $(SRCS:.c=.o)
 
-PDF_SRC   = chart-test.pdf
-PDF_LABELS = 150dpi-direct APT-Mode-1024 600dpi-direct
-PDF_NAMES  = chart-150dpi   chart-apt     chart-600dpi
-STAMPED_PDFS = $(addprefix tests/pdfs/,$(addsuffix .pdf,$(PDF_NAMES)))
+.PHONY: all clean install pdfs
+
+all: $(TARGET)
+
+PDF_SRC      = chart-test.pdf
+STAMPED_PDFS = tests/pdfs/chart-150dpi.pdf tests/pdfs/chart-apt.pdf tests/pdfs/chart-600dpi.pdf
 
 tests/pdfs/chart-150dpi.pdf: $(PDF_SRC) tools/stamp-pdf.py
 	mkdir -p tests/pdfs
@@ -35,10 +37,6 @@ tests/pdfs/chart-600dpi.pdf: $(PDF_SRC) tools/stamp-pdf.py
 	pdftotext $@ - | grep -q "600dpi-direct"
 
 pdfs: $(STAMPED_PDFS)
-
-.PHONY: all clean install pdfs
-
-all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LIBS)

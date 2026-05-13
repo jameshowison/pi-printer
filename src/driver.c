@@ -928,8 +928,7 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
             }
         }
 
-        papplDeviceWrite(device, "\x1b*rC\x0c", 5);   /* end raster, advance page */
-        papplDeviceFlush(device);
+        /* rendpage_cb sends ESC*rC + form feed and flushes — don't duplicate here */
 
         /* Keep PAPPL job accounting consistent */
         options->header.cupsWidth  = (unsigned)w;
@@ -1020,9 +1019,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
                 "%s: pdf_filter: using APT Mode 1024 (%d dpi input)",
                 ctx, APT_INPUT_DPI);
             ok = apt_render_pdf(job, options, device, &drv, filename, ctx);
-            /* rendjob_cb called inside apt_render_pdf via job_started flag */
-            job_started = false;  /* prevent double-call in cleanup below */
-            goto done;
+            goto done;  /* rendjob_cb called at done: via job_started */
         }
 
         int gs_w_pts, gs_h_pts;
