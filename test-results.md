@@ -59,3 +59,37 @@ Physical column is blank for tests not yet physically verified.
 | P4-T1 control chars sanitised | Not yet run |
 | P5-T1 supply level web UI | Not yet run |
 | P6A-T1–T7 APT tests | Not yet run |
+
+---
+
+## Run 2 — 2026-05-13
+
+**Version:** (git `5f6cbb1`)
+**Tester:** tuttle / jlh5498
+**Printer:** Brother HL-5170DN (USB, tuttle-pi)
+**Script:** `apt-compare.sh` — printed chart-test.pdf in three conditions (job IDs 1–3 after service reinstall)
+
+### Phase 6A — APT comparison (apt-compare.sh)
+
+| Test | IPP | Log verdict | Physical observation |
+|------|-----|-------------|----------------------|
+| P6A-T1 APT chart (chart-apt.pdf) | PASS | `using APT Mode 1024 (150 dpi input)` + `apt_render: ok — 1 page(s)` | Printed. Quality worse than 600dpi direct — see decision gate below. Label visible at top and bottom. |
+| P6A-T2 APT text quality | PASS | `apt_render: ok` | Text in APT output is thickened and blurry — not acceptable for text content. |
+| P6A-T3 APT not taken at quality=4 | PASS | `pdf_filter` path used for 150dpi-direct (quality=4); no `apt_render` in log | APT correctly bypassed at quality=4. |
+
+### Phase 6A — Decision gate
+
+| Comparison | Observation |
+|------------|-------------|
+| 600dpi-direct vs APT-Mode-1024 (chart) | 600dpi clearly better — sharper halftones and text |
+| 150dpi-direct vs APT-Mode-1024 (chart) | 150dpi better (note: 150dpi request was substituted to 600dpi by driver) |
+| Overall ranking | 600dpi-direct > 150dpi-direct > APT-Mode-1024 |
+| APT text quality | Poor — characters thickened and blurry |
+| Recommended action | Do not use APT (quality=5) for standard printing; 600dpi quality=4 preferred |
+
+### Bugs found and fixed this run
+
+| Bug | Fix | Commit |
+|-----|-----|--------|
+| APT jobs printed a blank page after each real page | `apt_render_pdf` was sending `ESC*rC\x0c` directly then calling `rendpage_cb` which sent them again — double form feed. Removed the duplicate write. | `5f6cbb1` |
+| `rendjob_cb` (PJL trailer) never called for APT jobs | `job_started` was incorrectly set to `false` before `goto done`. Removed that line. | `5f6cbb1` |
