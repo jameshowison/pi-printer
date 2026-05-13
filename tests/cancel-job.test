@@ -1,0 +1,12 @@
+# Cancel a job by job-id.
+# Usage: ipptool -tv -d jobid=N ipp://localhost:8000/ipp/print cancel-job.test
+{
+  NAME "Cancel-Job"
+  OPERATION Cancel-Job
+  GROUP operation-attributes-tag
+  ATTR charset  attributes-charset utf-8
+  ATTR language attributes-natural-language en
+  ATTR uri      printer-uri $uri
+  ATTR integer  job-id $jobid
+  STATUS successful-ok
+}
