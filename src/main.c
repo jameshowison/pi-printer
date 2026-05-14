@@ -42,7 +42,7 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
      *                                 not change settings).
      * Without these, papplSystemCreate registers no HTTP routes and `/` 404s. */
     system = papplSystemCreate(
-        PAPPL_SOPTIONS_WEB_INTERFACE | PAPPL_SOPTIONS_WEB_LOG | PAPPL_SOPTIONS_WEB_REMOTE,
+        PAPPL_SOPTIONS_WEB_INTERFACE | PAPPL_SOPTIONS_WEB_LOG | PAPPL_SOPTIONS_WEB_REMOTE | PAPPL_SOPTIONS_NO_TLS,
         "hl5170dn-printer-app",
         8000,
         "_print,_universal",
