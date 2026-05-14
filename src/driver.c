@@ -861,6 +861,10 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
         if (strncmp(line, "P5", 2) != 0)
             continue;
 
+        /* Stop at next page boundary if job was cancelled. */
+        if (papplJobIsCanceled(job))
+            goto done;
+
         /* Skip comment lines */
         do {
             if (!fgets(line, sizeof(line), gs))
@@ -917,7 +921,7 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
         papplDeviceWrite(device, tiff_hdr, APT_TIFF_HDR_SIZE);
 
         /* Stream pixel rows directly from GS stdout — no full-page buffer */
-        for (int y = 0; y < h && page_ok; y++) {
+        for (int y = 0; y < h && page_ok && !papplJobIsCanceled(job); y++) {
             if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
                     "%s: apt_render: short read y=%d page %u: %s",
@@ -931,12 +935,14 @@ static bool apt_render_pdf(pappl_job_t *job, pappl_pr_options_t *options,
         /* rendpage_cb sends ESC*rC + form feed and flushes — don't duplicate here */
 
         /* Keep PAPPL job accounting consistent */
-        options->header.cupsWidth  = (unsigned)w;
-        options->header.cupsHeight = (unsigned)h;
-        drv->rendpage_cb(job, options, device, pagenum);
+        if (!papplJobIsCanceled(job)) {
+            options->header.cupsWidth  = (unsigned)w;
+            options->header.cupsHeight = (unsigned)h;
+            drv->rendpage_cb(job, options, device, pagenum);
+        }
 
         pagenum++;
-        if (!page_ok)
+        if (!page_ok || papplJobIsCanceled(job))
             break;
     }
 
@@ -944,6 +950,9 @@ done:
     ok = (pagenum > 0);
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
         "%s: apt_render: %s — %u page(s)", ctx, ok ? "ok" : "FAILED", pagenum);
+    if (papplJobIsCanceled(job))
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: apt_render: cancelled after %u complete page(s)", ctx, pagenum);
 
     if (gs) {
         int gs_status = pclose(gs);
@@ -1057,6 +1066,10 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         if (strncmp(line, "P5", 2) != 0)
             continue;
 
+        /* Stop at next page boundary if job was cancelled. */
+        if (papplJobIsCanceled(job))
+            goto jobs_done;
+
         /* Skip optional comment lines after the P5 magic. */
         do {
             if (!fgets(line, sizeof(line), gs))
@@ -1097,7 +1110,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
 
         drv.rstartpage_cb(job, options, device, pagenum);
 
-        for (int y = 0; y < h && page_ok; y++) {
+        for (int y = 0; y < h && page_ok && !papplJobIsCanceled(job); y++) {
             if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
                     "%s: pdf_filter: short read y=%d page %u: %s",
@@ -1108,9 +1121,11 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             }
         }
 
-        drv.rendpage_cb(job, options, device, pagenum);
+        if (!papplJobIsCanceled(job))
+            drv.rendpage_cb(job, options, device, pagenum);
+
         pagenum++;
-        if (!page_ok)
+        if (!page_ok || papplJobIsCanceled(job))
             break;
     }
 
@@ -1118,6 +1133,9 @@ jobs_done:
     ok = (pagenum > 0);
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
         "%s: pdf_filter: %s — %u page(s)", ctx, ok ? "ok" : "FAILED", pagenum);
+    if (papplJobIsCanceled(job))
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: pdf_filter: cancelled after %u complete page(s)", ctx, pagenum);
 
 done:
     if (job_started)
