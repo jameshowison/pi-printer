@@ -137,18 +137,30 @@ Envelope sizes (DL, C5, Com10, Monarch, ISO-B5) are never coerced and always pas
 |--------|--------------|--------|---------|
 | Resolution | `printer-resolution` | `300dpi`, `600dpi` | `600dpi` |
 | Duplex | `sides` | `one-sided`, `two-sided-long-edge`, `two-sided-short-edge` | `one-sided` |
-| Print quality | `print-quality` | `3` (draft/econo), `4` (normal), `5` (high/APT) | `4` |
+| Print quality | `print-quality` | `3` (draft/econo), `4` (normal), `5` (high) | `4` |
 | Input tray | `media-source` | `tray-1`, `by-pass-tray`, `auto` | `auto` |
 | Media type | `media-type` | `stationery`, `stationery-lightweight`, `stationery-heavyweight`, `stationery-bond`, envelope variants | `stationery` |
 | Copies | `copies` | integer | `1` |
 
-`print-quality=5` (High) routes to the APT photo path (printer-side halftoning at 150 dpi input via TIFF/Mode-1024). `print-quality=4` uses driver-side ordered dither at 600 dpi. See [plan.md §Phase 6A](plan.md) for APT status.
+`print-quality=4` (Normal) uses driver-side GS halftoning at 600 dpi and is the recommended setting for all content. `print-quality=3` (Draft) drops to 300 dpi with economode. `print-quality=5` (High) is accepted but currently falls through to the 600 dpi path — see [APT note](#apt-mode-1024-disabled) below.
 
 Example:
 ```bash
 lp -d hl5170dn -o sides=two-sided-long-edge -o print-quality=4 document.pdf
-lp -d hl5170dn -o print-quality=5 photo.pdf   # APT path
 ```
+
+### APT Mode 1024 (disabled)
+
+The Brother HL-5170DN supports an "Automatic Photo Tuning" mode (PCL compression mode 1024, §6.3.8 of the PCL technical manual) where the printer performs its own halftoning from an 8-bit grayscale TIFF input at ≤150 dpi. The driver contains a complete implementation (`apt_render_pdf` / `apt_build_tiff_header` in `src/driver.c`).
+
+Testing on 2026-05-14 (job #13, photo content from iPhone; earlier job #5 Phase 6A, chart and text content) showed:
+
+| Content | APT quality | 600 dpi quality | APT time | 600 dpi time |
+|---------|-------------|-----------------|----------|--------------|
+| Photo | marginally worse | better | ~43 s | ~12 s |
+| Chart/text | worse | better | ~52 s | ~15 s |
+
+APT offers no quality advantage for any content type tested, and is 3–4× slower on Pi 3B+. The code is retained as reference but disabled. To re-enable, restore the two lines marked `APT_DISABLED` in `src/driver.c`.
 
 ## Comparison with the CUPS baseline
 

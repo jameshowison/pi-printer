@@ -325,9 +325,10 @@ static void pjl_params_from_options(const pappl_pr_options_t *opts,
     if (p->economode && p->resolution > 300)
         p->resolution = 300;
 
-    /* APT: printer-side halftoning for high print quality.
-     * Forces 600 dpi so the printer can upscale from the 150 dpi TIFF input. */
-    p->apt = (opts->print_quality == IPP_QUALITY_HIGH);
+    /* APT disabled — see reference code block above.
+     * APT_DISABLED: restore the original line to re-enable:
+     *   p->apt = (opts->print_quality == IPP_QUALITY_HIGH); */
+    p->apt = false;
     if (p->apt)
         p->resolution = 600;
 }
@@ -1055,7 +1056,7 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     return true;
 }
 
-/* ---- Phase 6A: APT photo path (Mode 1024) -------------------------------- *
+/* ---- APT photo path (Mode 1024) — REFERENCE CODE, DISABLED --------------- *
  *
  * APT (Automatic Photo Tuning) lets the printer halftone 8-bit grayscale
  * data at 600 dpi equivalent from a low-resolution (≤150 dpi) input.
@@ -1064,6 +1065,16 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
  * Manual reference: Tech_Manual_Ch2_PCL §6.3.8.
  * APT activates when: BitsPerSample=8, Compression=1 (no compression),
  * and the printer operates at 600 dpi.
+ *
+ * WHY DISABLED (tested 2026-05-14, job #13 pi-printer-apt-image):
+ *   Testing on photo and chart/text content showed APT offers no quality
+ *   advantage over the standard 600 dpi GS path, and is ~3.5× slower
+ *   (43 s vs 12 s for a 4032×3024 photo on Pi 3B+).  The printer-side
+ *   halftoning from a 150 dpi TIFF input is outperformed by GS halftoning
+ *   directly at 600 dpi.
+ *
+ *   To re-enable for further experimentation, restore the two lines marked
+ *   APT_DISABLED below (one in pjl_params_from_options, one in pdf_filter_cb).
  */
 
 #define APT_TIFF_HDR_SIZE 174u   /* fixed header size for our 12-tag layout */
@@ -1347,10 +1358,10 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     {
         hl5170dn_job_t *jd = papplJobGetData(job);
 
-        /* Phase 6A: APT path for high print quality.
-         * apt_render_pdf() handles the full page loop and calls rendjob_cb
-         * itself, so we skip the normal GS streaming path below. */
-        if (options->print_quality == IPP_QUALITY_HIGH) {
+        /* APT disabled — see reference code block above.
+         * APT_DISABLED: restore the original condition to re-enable:
+         *   if (options->print_quality == IPP_QUALITY_HIGH) { */
+        if (0) {
             papplLogJob(job, PAPPL_LOGLEVEL_INFO,
                 "%s: pdf_filter: using APT Mode 1024 (%d dpi input)",
                 ctx, APT_INPUT_DPI);
