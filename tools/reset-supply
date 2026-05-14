@@ -1,0 +1,139 @@
+#!/bin/sh
+# reset-supply — update supply baselines on the Pi after replacing a consumable.
+#
+# Usage:
+#   reset-supply toner       — set toner_baseline to current page count
+#   reset-supply drum        — set drum_baseline to current page count
+#   reset-supply --query     — print current page count and baselines; no changes
+#
+# The script SSHes to tuttle-pi, queries @PJL INFO PAGECOUNT via netcat on the
+# USB device node, reads the current baselines file, and writes the updated value.
+#
+# Requirements on the Pi:
+#   - stty, cat available (standard)
+#   - nc (netcat) available
+#   - The USB printer device at /dev/usb/lp0 (or override via PRINTER_DEV)
+
+set -e
+
+PI_HOST="${PI_HOST:-tuttle-pi}"
+PRINTER_DEV="${PRINTER_DEV:-/dev/usb/lp0}"
+CONF_DIR="/var/lib/hl5170dn-printer-app"
+CONF_FILE="$CONF_DIR/supply-baselines.conf"
+
+TONER_RATED=6700
+DRUM_RATED=25000
+
+usage() {
+    echo "Usage: $0 toner | drum | --query" >&2
+    exit 1
+}
+
+[ $# -eq 1 ] || usage
+
+ACTION="$1"
+case "$ACTION" in
+    toner|drum|--query) ;;
+    *) usage ;;
+esac
+
+# Run a command on the Pi over SSH.
+pi_run() {
+    ssh "$PI_HOST" "$@"
+}
+
+# Query the current page count from the printer.
+# Sends @PJL INFO PAGECOUNT to the raw USB device and reads the response.
+get_pagecount() {
+    pi_run sh -s <<'REMOTE'
+DEV="${PRINTER_DEV:-/dev/usb/lp0}"
+QUERY=$(printf '\033%%-12345X@PJL\r\n@PJL INFO PAGECOUNT\r\n\033%%-12345X')
+printf '%s' "$QUERY" > "$DEV"
+sleep 0.5
+RESP=$(dd if="$DEV" bs=256 count=1 2>/dev/null || true)
+echo "$RESP" | grep -o 'PAGECOUNT=[0-9]*' | cut -d= -f2
+REMOTE
+}
+
+# Read a baseline value from the conf file on the Pi.
+get_baseline() {
+    KEY="$1"
+    pi_run sh -c "
+CONF_FILE='$CONF_FILE'
+if [ -f \"\$CONF_FILE\" ]; then
+    grep '^${KEY}=' \"\$CONF_FILE\" | cut -d= -f2
+else
+    echo 0
+fi
+"
+}
+
+# Write an updated baseline to the conf file on the Pi (atomic replace).
+set_baseline() {
+    KEY="$1"
+    VAL="$2"
+    pi_run sh -c "
+CONF_DIR='$CONF_DIR'
+CONF_FILE='$CONF_FILE'
+mkdir -p \"\$CONF_DIR\"
+# Read existing values (defaults 0).
+TB=0; DB=0
+if [ -f \"\$CONF_FILE\" ]; then
+    v=\$(grep '^toner_baseline=' \"\$CONF_FILE\" | cut -d= -f2); [ -n \"\$v\" ] && TB=\$v
+    v=\$(grep '^drum_baseline='  \"\$CONF_FILE\" | cut -d= -f2); [ -n \"\$v\" ] && DB=\$v
+fi
+# Override the requested key.
+case '${KEY}' in
+    toner_baseline) TB='${VAL}' ;;
+    drum_baseline)  DB='${VAL}' ;;
+esac
+printf 'toner_baseline=%s\ndrum_baseline=%s\n' \"\$TB\" \"\$DB\" > \"\$CONF_FILE\"
+echo \"Written: toner_baseline=\$TB drum_baseline=\$DB\"
+"
+}
+
+echo "Querying page count from $PI_HOST:$PRINTER_DEV ..."
+PAGECOUNT=$(get_pagecount)
+
+if [ -z "$PAGECOUNT" ]; then
+    echo "ERROR: could not read PAGECOUNT from printer. Is it on and idle?" >&2
+    exit 1
+fi
+
+echo "Current PAGECOUNT: $PAGECOUNT"
+
+TONER_BASE=$(get_baseline toner_baseline)
+DRUM_BASE=$(get_baseline drum_baseline)
+TONER_USED=$(( PAGECOUNT - TONER_BASE ))
+DRUM_USED=$(( PAGECOUNT - DRUM_BASE ))
+[ "$TONER_USED" -lt 0 ] && TONER_USED=0
+[ "$DRUM_USED"  -lt 0 ] && DRUM_USED=0
+TONER_PCT=$(( 100 - TONER_USED * 100 / TONER_RATED ))
+DRUM_PCT=$(( 100 - DRUM_USED * 100 / DRUM_RATED ))
+[ "$TONER_PCT" -lt 0 ] && TONER_PCT=0
+[ "$DRUM_PCT"  -lt 0 ] && DRUM_PCT=0
+
+echo "Baselines:  toner=$TONER_BASE  drum=$DRUM_BASE"
+echo "Levels:     toner=${TONER_PCT}%  drum=${DRUM_PCT}%"
+
+if [ "$ACTION" = "--query" ]; then
+    exit 0
+fi
+
+case "$ACTION" in
+    toner)
+        echo "Setting toner_baseline=$PAGECOUNT ..."
+        set_baseline toner_baseline "$PAGECOUNT"
+        NEW_PCT=$(( 100 - 0 * 100 / TONER_RATED ))
+        echo "Toner level is now ~${NEW_PCT}% (0 pages since replacement)"
+        ;;
+    drum)
+        echo "Setting drum_baseline=$PAGECOUNT ..."
+        set_baseline drum_baseline "$PAGECOUNT"
+        NEW_PCT=$(( 100 - 0 * 100 / DRUM_RATED ))
+        echo "Drum level is now ~${NEW_PCT}% (0 pages since replacement)"
+        ;;
+esac
+
+echo "Restart the printer app to pick up new baselines:"
+echo "  ssh $PI_HOST sudo systemctl restart hl5170dn-printer-app"

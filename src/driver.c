@@ -525,19 +525,56 @@ static void hl5170dn_identify(pappl_printer_t *printer,
     /* HL-5170DN has no audible/visual identify mechanism. */
 }
 
+/* ---- Supply baseline helpers ------------------------------------------ */
+
+#define TONER_RATED_PAGES  6700
+#define DRUM_RATED_PAGES   25000
+#define SUPPLY_CONF_DIR    "/var/lib/hl5170dn-printer-app"
+#define SUPPLY_CONF_PATH   "/var/lib/hl5170dn-printer-app/supply-baselines.conf"
+
+typedef struct {
+    long toner_baseline;
+    long drum_baseline;
+} supply_baselines_t;
+
+static void read_baselines(supply_baselines_t *b)
+{
+    b->toner_baseline = 0;
+    b->drum_baseline  = 0;
+
+    FILE *f = fopen(SUPPLY_CONF_PATH, "r");
+    if (!f)
+        return;
+
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (!eq)
+            continue;
+        *eq = '\0';
+        char *key = line;
+        long  val = atol(eq + 1);
+        if (strcmp(key, "toner_baseline") == 0)
+            b->toner_baseline = val;
+        else if (strcmp(key, "drum_baseline") == 0)
+            b->drum_baseline = val;
+    }
+    fclose(f);
+}
+
+static int supply_level(long total_pages, long baseline, long rated)
+{
+    long used = total_pages - baseline;
+    if (used < 0)
+        used = 0;
+    long level = 100 - (used * 100 / rated);
+    if (level < 0)   level = 0;
+    if (level > 100) level = 100;
+    return (int)level;
+}
+
 static bool hl5170dn_status(pappl_printer_t *printer)
 {
-    /* Always set supply level first — exit criterion met even if device is busy. */
-    pappl_supply_t supply;
-    memset(&supply, 0, sizeof(supply));
-    supply.color       = PAPPL_SUPPLY_COLOR_BLACK;
-    supply.is_consumed = true;
-    supply.level       = -1;   /* unknown — INFO SUPPLIES returns "?" on HL-5170DN */
-    supply.type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
-    strncpy(supply.description, "Black Toner Cartridge",
-            sizeof(supply.description) - 1);
-    papplPrinterSetSupplies(printer, 1, &supply);
-
     /* Open USB device for PJL back-channel query.
      * Returns NULL if device is busy (job in progress) — that's fine. */
     pappl_device_t *device = papplPrinterOpenDevice(printer);
@@ -547,18 +584,18 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         return true;
     }
 
-    /* Send @PJL INFO STATUS query. */
+    /* Send @PJL INFO STATUS and @PJL INFO PAGECOUNT in one session. */
     static const char query[] =
         "\033%-12345X@PJL\r\n"
         "@PJL INFO STATUS\r\n"
+        "@PJL INFO PAGECOUNT\r\n"
         "\033%-12345X";
     papplDeviceWrite(device, query, sizeof(query) - 1);
     papplDeviceFlush(device);
 
-    /* Read FF-terminated response.  papplDeviceRead() has no timeout parameter;
-     * the USB backend (libusb) handles its own read timeout (~400 ms observed
-     * in Phase 0). */
-    char    buf[1024];
+    /* Read response.  May contain both INFO STATUS and INFO PAGECOUNT replies.
+     * Use a larger buffer to accommodate both FF-terminated responses. */
+    char    buf[2048];
     ssize_t bytes = papplDeviceRead(device, buf, sizeof(buf) - 1);
     papplPrinterCloseDevice(printer);
 
@@ -569,17 +606,21 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     }
     buf[bytes] = '\0';
 
-    /* Parse CODE= and ONLINE= from the response. */
-    int  code   = -1;
-    bool online = false;
+    /* Parse CODE=, ONLINE=, and PAGECOUNT= from the response. */
+    int  code       = -1;
+    bool online     = false;
+    long page_count = -1;
     char *p;
     if ((p = strstr(buf, "CODE=")) != NULL)
         code = atoi(p + 5);
     if ((p = strstr(buf, "ONLINE=")) != NULL)
         online = (strncmp(p + 7, "TRUE", 4) == 0);
+    if ((p = strstr(buf, "PAGECOUNT=")) != NULL)
+        page_count = atol(p + 10);
 
     papplLogPrinter(printer, PAPPL_LOGLEVEL_DEBUG,
-        "status: CODE=%d ONLINE=%s", code, online ? "TRUE" : "FALSE");
+        "status: CODE=%d ONLINE=%s PAGECOUNT=%ld",
+        code, online ? "TRUE" : "FALSE", page_count);
 
     /* Map status code range to printer reasons.
      * 40000–40999: operator-attention errors (paper empty, cover open, jam).
@@ -588,6 +629,39 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         papplPrinterSetReasons(printer, PAPPL_PREASON_OTHER, PAPPL_PREASON_NONE);
     else
         papplPrinterSetReasons(printer, PAPPL_PREASON_NONE, PAPPL_PREASON_OTHER);
+
+    /* Compute supply levels from page count and baselines. */
+    supply_baselines_t baselines;
+    read_baselines(&baselines);
+
+    pappl_supply_t supplies[2];
+    memset(supplies, 0, sizeof(supplies));
+
+    /* Toner cartridge (TN-570, 6700-page rated life). */
+    supplies[0].color       = PAPPL_SUPPLY_COLOR_BLACK;
+    supplies[0].is_consumed = true;
+    supplies[0].type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
+    strncpy(supplies[0].description, "Black Toner Cartridge",
+            sizeof(supplies[0].description) - 1);
+    if (page_count >= 0)
+        supplies[0].level = supply_level(page_count, baselines.toner_baseline,
+                                         TONER_RATED_PAGES);
+    else
+        supplies[0].level = -1;
+
+    /* Drum unit (DR-580, 25000-page rated life). */
+    supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
+    supplies[1].is_consumed = true;
+    supplies[1].type        = PAPPL_SUPPLY_TYPE_DRUM_IMAGING;
+    strncpy(supplies[1].description, "Drum Unit",
+            sizeof(supplies[1].description) - 1);
+    if (page_count >= 0)
+        supplies[1].level = supply_level(page_count, baselines.drum_baseline,
+                                         DRUM_RATED_PAGES);
+    else
+        supplies[1].level = -1;
+
+    papplPrinterSetSupplies(printer, 2, supplies);
 
     return true;
 }
