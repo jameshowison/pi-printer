@@ -719,7 +719,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
 
 /* ---- Supply reset web handler ----------------------------------------- */
 
-static void hl5170dn_web_reset_supply(pappl_client_t  *client,
+static bool hl5170dn_web_reset_supply(pappl_client_t  *client,
                                       pappl_printer_t *printer)
 {
     supply_baselines_t conf;
@@ -727,7 +727,7 @@ static void hl5170dn_web_reset_supply(pappl_client_t  *client,
 
     const char *status = NULL;
 
-    if (client->operation == HTTP_STATE_POST)
+    if (papplClientGetMethod(client) == HTTP_STATE_POST)
     {
         int            num_form = 0;
         cups_option_t *form     = NULL;
@@ -760,7 +760,7 @@ static void hl5170dn_web_reset_supply(pappl_client_t  *client,
             papplPrinterGetPath(printer, "supplies", path, sizeof(path));
             papplClientRespondRedirect(client, HTTP_STATUS_FOUND, path);
             cupsFreeOptions(num_form, form);
-            return;
+            return true;
         }
         cupsFreeOptions(num_form, form);
     }
@@ -839,6 +839,7 @@ static void hl5170dn_web_reset_supply(pappl_client_t  *client,
     }
 
     papplClientHTMLPrinterFooter(client);
+    return true;
 }
 
 void register_supply_reset_route(pappl_system_t  *system,
