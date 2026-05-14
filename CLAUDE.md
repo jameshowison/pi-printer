@@ -16,11 +16,21 @@ Never ask the user to run commands manually — Claude runs them via SSH.
 
 ## Deploying changes to the Pi
 
-Use git, not rsync. Commit locally, push to remote, then pull on the Pi:
+Use git, not rsync. Commit locally, push to remote, then pull and install on the Pi:
 
 ```bash
 git push
-ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && git pull"
+ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && git pull && make && sudo make install"
+```
+
+`sudo make install` builds and restarts the service. Always use this form — never
+`sudo systemctl restart` directly.
+
+If `sudo make install` fails with a password error, ask the user to run it once
+manually in their own terminal (this caches the sudo credential):
+
+```
+ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && sudo make install"
 ```
 
 ## What this project is
@@ -146,9 +156,11 @@ Makefile        — build; `make` produces hl5170dn-printer-app
 |---|---|
 | `start job: NNNdpi duplex=X paper=Y` | Job started, PJL sent |
 | `pdf_filter: ok — N page(s)` | GS completed normally |
+| `pdf_filter: cancelled after N complete page(s)` | Job cancelled mid-render |
 | `gs cmd: gs … -rNNN …` | GS invoked at NNN dpi |
 | `pdf_filter: using APT Mode 1024` | APT triggered (print-quality=5) |
 | `apt_render: ok` | APT rendering completed |
+| `apt_render: cancelled after N complete page(s)` | APT job cancelled mid-render |
 | `substituted LETTER for A4` | Media substitution fired |
 | `rejecting job: loaded paper is …` | Reject mode fired |
 | `status: CODE=10001 ONLINE=TRUE` | Printer ready |
