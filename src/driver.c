@@ -827,6 +827,9 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     data->vendor[0]  = "loaded-paper";
     data->vendor[1]  = "media-mismatch-action";
 
+    /* Register the /supplies web route and nav link. */
+    data->has_supplies = true;
+
     return true;
 }
 
