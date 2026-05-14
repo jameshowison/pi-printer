@@ -17,6 +17,8 @@ extern bool driver_cb(pappl_system_t *system, const char *driver_name,
     const char *device_uri, const char *device_id,
     pappl_pr_driver_data_t *data, ipp_t **attrs, void *cbdata);
 extern void register_pdf_filter(pappl_system_t *system);
+extern void register_supply_reset_route(pappl_system_t *system,
+    pappl_printer_t *printer);
 
 /* File-scope so system_cb can reference it when registering drivers. */
 static pappl_pr_driver_t drivers[] = {
@@ -74,6 +76,8 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
     if (!printer)
         papplLog(system, PAPPL_LOGLEVEL_WARN,
             "papplPrinterCreate failed — printer may already exist");
+    else
+        register_supply_reset_route(system, printer);
 
     return system;
 }
