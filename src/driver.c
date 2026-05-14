@@ -107,38 +107,51 @@ static void make_job_ctx(pappl_job_t *job, char *buf, size_t bufsz)
 
 /* ---- Halftoning ------------------------------------------------------- */
 
-/* 8×8 clustered-dot ordered dither, values 0–63.
- * Threshold = val*4+2 (range 2–254); pixel < threshold → black (bit=1). */
-static const unsigned char dither8[8][8] = {
-    { 24, 10, 12, 26, 35, 47, 49, 37 },
-    {  8,  0,  2, 14, 45, 59, 61, 51 },
-    { 22,  6,  4, 16, 43, 57, 63, 53 },
-    { 30, 20, 18, 28, 33, 41, 55, 39 },
-    { 34, 46, 48, 36, 25, 11, 13, 27 },
-    { 44, 58, 60, 50,  9,  1,  3, 15 },
-    { 42, 56, 62, 52, 23,  7,  5, 17 },
-    { 32, 40, 54, 38, 31, 21, 19, 29 },
+/* 16×16 blue noise dither matrix, gamma-corrected for laser dot gain.
+ *
+ * Base: void-and-cluster blue noise (from hp-printer-app / Michael Sweet).
+ * Correction formula: threshold = 255 - 255*(1 - raw/255)^0.4545
+ *   where 0.4545 ≈ 1/2.2 is the inverse sRGB gamma exponent.
+ *   This compensates for laser dot gain: a 50% gray input prints ~21% of
+ *   dots, which fuse/spread to give perceptually 50% coverage.
+ *
+ * Convention: pixel < threshold → print black dot  (0=black, 255=white)
+ * Applied at all resolutions (300 and 600 dpi).
+ *
+ * Coverage curve for reference:
+ *   V=  0 (black): ~99% dots    V=128 (50% gray): ~21% dots
+ *   V= 64 (dark):  ~53% dots    V=192 (light):     ~5% dots
+ *   V=255 (white):   0% dots
+ */
+static const unsigned char dither16[16][16] = {
+    {  58,  24,  79,  94,  60, 123,  35, 106, 129,  24,  85,  48,  32,  18,  43, 221 },
+    {  12,  51, 183, 154,  15, 212,  83,   9,  18,  55, 152, 100, 122,  76,   6,  98 },
+    {  67, 107,  40,   7,  32, 103,  66,  44, 143,  71, 202,  11,  61,  26, 165, 141 },
+    {  20, 130,  86,  72, 117,  54,  26, 177,  93,  30,   0, 110,  38, 187,  82,  34 },
+    {   1, 194,  27,  46, 166,   2, 132,  13, 115,  52,  80, 135,  16,  47, 118,  56 },
+    { 156,  95,  60,  17, 144,  89,  77,  35, 196,  42, 160,  23,  68,  91,   8,  74 },
+    {  42, 124,  10, 234,  38,  22, 108,  61,   6,  19,  99,  55, 227, 105, 140,  29 },
+    {  52, 109,  81,  65, 102,  50, 175,  70, 145,  84, 127,   4,  36,  12, 181,  21 },
+    { 170,  15,  34,   5, 133,  28,   8, 121,  45,  29,  59, 153,  77,  43,  64,  87 },
+    { 137,  71, 191,  92, 157,  58,  16, 205,  96,  11, 173, 112,  25, 126, 101,   3 },
+    {  56, 116,  25,  45,  75, 114,  88,  39,  23,  73,  50,  90,  17, 209,  49,  31 },
+    {   7,  37, 150,  19,   0,  33, 163,  65, 125, 185,   1,  37,  69,   9, 162,  80 },
+    { 199, 104,  63, 128, 216,  53,  82,   6, 138, 104,  57, 149, 120,  41, 131,  95 },
+    {  14,  48,  85,  10,  97, 111,  27,  14,  46,  31,  20,  78,  99,  28,  62,  22 },
+    { 146, 171,  30,  69,  41, 179, 148,  63,  91, 255, 113,  13, 189,  53,   2,  73 },
+    {  36, 119,   4, 139,  21,  49,   3,  75, 168,  40,   5,  67, 159, 136,  88, 111 },
 };
 
-/* 50% threshold: 8-bit grayscale (0=black, 255=white) → 1-bit packed (1=black). */
-static void threshold_row(const unsigned char *src, unsigned char *dst, unsigned w)
+/* Blue noise ordered dither: 8-bit grayscale → 1-bit packed (1=black).
+ * Used at all resolutions; the gamma correction baked into dither16 makes
+ * the 300 dpi path look as good as the old 600 dpi clustered-dot path. */
+static void dither_row_bn(const unsigned char *src, unsigned char *dst,
+                          unsigned w, unsigned y)
 {
+    unsigned row = y & 15u;
     memset(dst, 0, (w + 7u) / 8u);
     for (unsigned x = 0; x < w; x++) {
-        if (src[x] < 128u)
-            dst[x >> 3] |= (unsigned char)(0x80u >> (x & 7u));
-    }
-}
-
-/* Ordered dither with the 8×8 clustered-dot matrix. */
-static void dither_row(const unsigned char *src, unsigned char *dst,
-                       unsigned w, unsigned y)
-{
-    unsigned row = y & 7u;
-    memset(dst, 0, (w + 7u) / 8u);
-    for (unsigned x = 0; x < w; x++) {
-        unsigned thr = (unsigned)dither8[row][x & 7u] * 4u + 2u;
-        if ((unsigned)src[x] < thr)
+        if (src[x] < dither16[row][x & 15u])
             dst[x >> 3] |= (unsigned char)(0x80u >> (x & 7u));
     }
 }
@@ -468,11 +481,9 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
             "%s: rwriteline y=%u width=%u line[0]=0x%02x",
             jd->ctx, y, w, line[0]);
 
-    /* Halftone 8-bit grayscale → 1-bit packed row in halftone_buf. */
-    if (jd->resolution >= 600)
-        dither_row(line, jd->halftone_buf, w, y);
-    else
-        threshold_row(line, jd->halftone_buf, w);
+    /* Halftone 8-bit grayscale → 1-bit packed row in halftone_buf.
+     * Blue noise dither with gamma correction at all resolutions. */
+    dither_row_bn(line, jd->halftone_buf, w, y);
 
     encoded_len = packbits_encode(jd->halftone_buf, (w + 7u) / 8u, jd->line_buf);
 
