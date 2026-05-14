@@ -593,20 +593,49 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     papplDeviceWrite(device, query, sizeof(query) - 1);
     papplDeviceFlush(device);
 
-    /* Read response.  May contain both INFO STATUS and INFO PAGECOUNT replies.
-     * Use a larger buffer to accommodate both FF-terminated responses. */
+    /* Read response.  The printer may return INFO STATUS and INFO PAGECOUNT
+     * in one packet or split across two.  Do a second read if PAGECOUNT is
+     * missing from the first. */
     char    buf[2048];
     ssize_t bytes = papplDeviceRead(device, buf, sizeof(buf) - 1);
-    papplPrinterCloseDevice(printer);
 
     if (bytes <= 0) {
+        papplPrinterCloseDevice(printer);
         papplLogPrinter(printer, PAPPL_LOGLEVEL_WARN,
             "status: no response from printer (bytes=%ld)", (long)bytes);
         return true;
     }
     buf[bytes] = '\0';
 
-    /* Parse CODE=, ONLINE=, and PAGECOUNT= from the response. */
+    /* If PAGECOUNT not yet in buffer, try one more read for the second packet. */
+    if (!strstr(buf, "PAGECOUNT=")) {
+        char    buf2[1024];
+        ssize_t bytes2 = papplDeviceRead(device, buf2, sizeof(buf2) - 1);
+        if (bytes2 > 0) {
+            buf2[bytes2] = '\0';
+            /* Append to buf if space allows, otherwise just search buf2. */
+            if ((size_t)(bytes + bytes2) < sizeof(buf) - 1) {
+                memcpy(buf + bytes, buf2, (size_t)bytes2 + 1);
+                bytes += bytes2;
+            } else {
+                /* buf2 is separate; copy PAGECOUNT= value if found. */
+                char *pc = strstr(buf2, "PAGECOUNT=");
+                if (pc) {
+                    /* Append just the PAGECOUNT= token to buf. */
+                    size_t avail = sizeof(buf) - 1 - (size_t)bytes;
+                    size_t tlen  = strlen(pc);
+                    if (tlen < avail) {
+                        memcpy(buf + bytes, pc, tlen + 1);
+                        bytes += (ssize_t)tlen;
+                    }
+                }
+            }
+        }
+    }
+
+    papplPrinterCloseDevice(printer);
+
+    /* Parse CODE=, ONLINE=, and PAGECOUNT= from the (possibly combined) buffer. */
     int  code       = -1;
     bool online     = false;
     long page_count = -1;
@@ -630,38 +659,37 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     else
         papplPrinterSetReasons(printer, PAPPL_PREASON_NONE, PAPPL_PREASON_OTHER);
 
-    /* Compute supply levels from page count and baselines. */
-    supply_baselines_t baselines;
-    read_baselines(&baselines);
+    /* Compute and set supply levels only when we have a real page count.
+     * If page_count is still -1 (e.g. printer asleep and second read also
+     * returned nothing), leave PAPPL's existing supply values untouched so
+     * a previously-recorded good reading is not overwritten with unknowns. */
+    if (page_count >= 0) {
+        supply_baselines_t baselines;
+        read_baselines(&baselines);
 
-    pappl_supply_t supplies[2];
-    memset(supplies, 0, sizeof(supplies));
+        pappl_supply_t supplies[2];
+        memset(supplies, 0, sizeof(supplies));
 
-    /* Toner cartridge (TN-570, 6700-page rated life). */
-    supplies[0].color       = PAPPL_SUPPLY_COLOR_BLACK;
-    supplies[0].is_consumed = true;
-    supplies[0].type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
-    strncpy(supplies[0].description, "Black Toner Cartridge",
-            sizeof(supplies[0].description) - 1);
-    if (page_count >= 0)
+        /* Toner cartridge (TN-570, 6700-page rated life). */
+        supplies[0].color       = PAPPL_SUPPLY_COLOR_BLACK;
+        supplies[0].is_consumed = true;
+        supplies[0].type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
+        strncpy(supplies[0].description, "Black Toner Cartridge",
+                sizeof(supplies[0].description) - 1);
         supplies[0].level = supply_level(page_count, baselines.toner_baseline,
                                          TONER_RATED_PAGES);
-    else
-        supplies[0].level = -1;
 
-    /* Drum unit (DR-580, 25000-page rated life). */
-    supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
-    supplies[1].is_consumed = true;
-    supplies[1].type        = PAPPL_SUPPLY_TYPE_OPC;
-    strncpy(supplies[1].description, "Drum Unit",
-            sizeof(supplies[1].description) - 1);
-    if (page_count >= 0)
+        /* Drum unit (DR-580, 25000-page rated life). */
+        supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
+        supplies[1].is_consumed = true;
+        supplies[1].type        = PAPPL_SUPPLY_TYPE_OPC;
+        strncpy(supplies[1].description, "Drum Unit",
+                sizeof(supplies[1].description) - 1);
         supplies[1].level = supply_level(page_count, baselines.drum_baseline,
                                          DRUM_RATED_PAGES);
-    else
-        supplies[1].level = -1;
 
-    papplPrinterSetSupplies(printer, 2, supplies);
+        papplPrinterSetSupplies(printer, 2, supplies);
+    }
 
     return true;
 }
