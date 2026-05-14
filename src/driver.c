@@ -652,7 +652,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     /* Drum unit (DR-580, 25000-page rated life). */
     supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
     supplies[1].is_consumed = true;
-    supplies[1].type        = PAPPL_SUPPLY_TYPE_DRUM_IMAGING;
+    supplies[1].type        = PAPPL_SUPPLY_TYPE_OPC;
     strncpy(supplies[1].description, "Drum Unit",
             sizeof(supplies[1].description) - 1);
     if (page_count >= 0)
