@@ -22,7 +22,7 @@
  *   returns) reflect the loaded paper.  GS -dFitPage scales content to fit.
  *   Vendor options loaded-paper and media-mismatch-action control behaviour.
  *
- * PI-SIDE BUILD NOTES (PAPPL 1.3.1)
+ * PI-SIDE BUILD NOTES (PAPPL 1.4.x)
  * If the compiler complains about field names in pappl_pr_driver_data_t:
  *   - "force_raster_type" — field may not exist; this driver no longer
  *     uses it (removed in Phase 2).

@@ -16,22 +16,35 @@ Never ask the user to run commands manually — Claude runs them via SSH.
 
 ## Deploying changes to the Pi
 
-Use git, not rsync. Commit locally, push to remote, then pull and install on the Pi:
+Use git, not rsync. The full sequence is:
 
 ```bash
+# 1. Commit locally (on Mac)
+git add <files>
+git commit -m "message"
+
+# 2. Push to GitHub
 git push
+
+# 3. Pull, build, and install on the Pi
 ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && git pull && make && sudo make install"
 ```
 
-`sudo make install` builds and restarts the service. Always use this form — never
-`sudo systemctl restart` directly.
+`sudo make install` builds the binary and restarts the service. Always use this
+form — never `sudo systemctl restart` directly.
 
-If `sudo make install` fails with a password error, ask the user to run it once
-manually in their own terminal (this caches the sudo credential):
+`sudo make install` needs an interactive terminal for the password. If it fails
+with "a terminal is required to read the password", ask the user to run it once
+manually in their own terminal (this caches the sudo credential for ~15 min):
 
-```
+```bash
 ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && sudo make install"
 ```
+
+## Known PAPPL API gaps
+
+`PAPPL_SUPPLY_TYPE_DRUM_IMAGING` is not defined in PAPPL — use
+`PAPPL_SUPPLY_TYPE_OPC` (optical photoconductor) for drum units.
 
 ## What this project is
 
