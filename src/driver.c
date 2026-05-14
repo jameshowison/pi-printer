@@ -536,7 +536,9 @@ static void hl5170dn_identify(pappl_printer_t *printer,
 typedef struct {
     long toner_baseline;
     long drum_baseline;
-    long last_page_count;   /* -1 = never polled */
+    long last_page_count;    /* -1 = never polled */
+    long toner_reset_time;   /* unix timestamp, 0 = never recorded */
+    long drum_reset_time;    /* unix timestamp, 0 = never recorded */
 } supply_baselines_t;
 
 static void read_baselines(supply_baselines_t *b)
@@ -544,6 +546,8 @@ static void read_baselines(supply_baselines_t *b)
     b->toner_baseline  = 0;
     b->drum_baseline   = 0;
     b->last_page_count = -1;
+    b->toner_reset_time = 0;
+    b->drum_reset_time  = 0;
 
     FILE *f = fopen(SUPPLY_CONF_PATH, "r");
     if (!f)
@@ -563,6 +567,10 @@ static void read_baselines(supply_baselines_t *b)
             b->drum_baseline = val;
         else if (strcmp(key, "last_page_count") == 0)
             b->last_page_count = val;
+        else if (strcmp(key, "toner_reset_time") == 0)
+            b->toner_reset_time = val;
+        else if (strcmp(key, "drum_reset_time") == 0)
+            b->drum_reset_time = val;
     }
     fclose(f);
 }
@@ -577,8 +585,11 @@ static void write_conf(const supply_baselines_t *b)
     FILE *f = fopen(tmp, "w");
     if (!f)
         return;
-    fprintf(f, "toner_baseline=%ld\ndrum_baseline=%ld\nlast_page_count=%ld\n",
-            b->toner_baseline, b->drum_baseline, b->last_page_count);
+    fprintf(f,
+            "toner_baseline=%ld\ndrum_baseline=%ld\nlast_page_count=%ld\n"
+            "toner_reset_time=%ld\ndrum_reset_time=%ld\n",
+            b->toner_baseline, b->drum_baseline, b->last_page_count,
+            b->toner_reset_time, b->drum_reset_time);
     fclose(f);
     rename(tmp, SUPPLY_CONF_PATH);
 }
@@ -717,16 +728,104 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     return true;
 }
 
-/* ---- Supply reset web handler ----------------------------------------- */
+/* ---- Supplies web page (replaces PAPPL built-in) ----------------------- */
 
-static bool hl5170dn_web_reset_supply(pappl_client_t  *client,
-                                      pappl_printer_t *printer)
+/* Format a unix timestamp as "YYYY-MM-DD", or "unknown" if ts==0. */
+static void fmt_date(long ts, char *buf, size_t bufsz)
+{
+    if (ts == 0) {
+        snprintf(buf, bufsz, "unknown");
+        return;
+    }
+    time_t t = (time_t)ts;
+    struct tm *tm = localtime(&t);
+    strftime(buf, bufsz, "%Y-%m-%d", tm);
+}
+
+/* Render one supply block: bar meter, stats row, reset button. */
+static void render_supply(pappl_client_t *client,
+                          const char     *supplies_path,
+                          const char     *name,
+                          int             pct,
+                          long            baseline,
+                          long            reset_time,
+                          long            last_page,
+                          long            rated,
+                          const char     *reset_action)
+{
+    long pages_used      = (last_page >= baseline) ? last_page - baseline : 0;
+    long pages_remaining = rated - pages_used;
+    if (pages_remaining < 0) pages_remaining = 0;
+    long expected_end    = baseline + rated;
+
+    char reset_date[32];
+    fmt_date(reset_time, reset_date, sizeof(reset_date));
+
+    /* Bar meter (reuses PAPPL's .meter CSS). */
+    double filled = pct * 0.5;
+    double empty  = 50.0 - filled;
+    papplClientHTMLPrintf(client,
+        "          <h3>%s &mdash; %d%%</h3>\n"
+        "          <table class=\"meter\" summary=\"%s\">\n"
+        "            <thead><tr><th></th><td></td><td></td>"
+        "<td></td><td></td></tr></thead>\n"
+        "            <tbody><tr><th>%d%%</th>"
+        "<td colspan=\"4\">"
+        "<span class=\"bar\" style=\"background:#222;"
+        "padding:0px %.1f%%;\" title=\"%d%%\"></span>"
+        "<span class=\"bar\" style=\"background:transparent;"
+        "padding:0px %.1f%%;\" title=\"%d%%\"></span>"
+        "</td></tr></tbody>\n"
+        "            <tfoot><tr><th></th><td></td><td></td>"
+        "<td></td><td></td></tr></tfoot>\n"
+        "          </table>\n",
+        name, pct, name,
+        pct,
+        filled, pct,
+        empty,  pct);
+
+    /* Stats table. */
+    if (last_page < 0) {
+        papplClientHTMLPuts(client,
+            "          <p><em>Page count unavailable &mdash; "
+            "printer may be asleep.</em></p>\n");
+    } else {
+        const char *replaced_label =
+            (reset_time == 0 && baseline == 0) ? "Installed at" : "Replaced at";
+        papplClientHTMLPrintf(client,
+            "          <table>\n"
+            "            <tbody>\n"
+            "              <tr><th>%s</th>"
+            "<td>Page %ld &middot; %s</td></tr>\n"
+            "              <tr><th>Pages used</th>"
+            "<td>%ld of %ld rated (%d%%)</td></tr>\n"
+            "              <tr><th>Est. remaining</th>"
+            "<td>~%ld pages &middot; expected end at lifetime page ~%ld</td>"
+            "</tr>\n"
+            "            </tbody>\n"
+            "          </table>\n",
+            replaced_label,
+            baseline, reset_date,
+            pages_used, rated, pct,
+            pages_remaining, expected_end);
+    }
+
+    /* Reset button. */
+    papplClientHTMLStartForm(client, supplies_path, false);
+    papplClientHTMLPrintf(client,
+        "<input type=\"hidden\" name=\"action\" value=\"%s\">"
+        "<button class=\"btn\" type=\"submit\">Reset %s</button>"
+        "</form>\n",
+        reset_action, name);
+}
+
+static bool hl5170dn_web_supplies(pappl_client_t  *client,
+                                  pappl_printer_t *printer)
 {
     supply_baselines_t conf;
     read_baselines(&conf);
 
-    const char *status = NULL;
-
+    /* Handle POST (reset action). */
     if (papplClientGetMethod(client) == HTTP_STATE_POST)
     {
         int            num_form = 0;
@@ -734,109 +833,72 @@ static bool hl5170dn_web_reset_supply(pappl_client_t  *client,
         const char    *action;
 
         num_form = papplClientGetForm(client, &form);
-        if (num_form == 0 || !papplClientIsValidForm(client, num_form, form))
+        if (num_form > 0 && papplClientIsValidForm(client, num_form, form) &&
+            (action = cupsGetOption("action", num_form, form)) != NULL &&
+            conf.last_page_count >= 0)
         {
-            status = "Invalid form submission.";
-        }
-        else if ((action = cupsGetOption("action", num_form, form)) == NULL)
-        {
-            status = "Missing action.";
-        }
-        else if (conf.last_page_count < 0)
-        {
-            status = "Page count unknown &mdash; make sure the printer is on, "
-                     "then reload the <a href=\"supplies\">Supplies</a> page "
-                     "to trigger a status poll, then try again.";
-        }
-        else if (!strcmp(action, "reset-toner") || !strcmp(action, "reset-drum"))
-        {
-            if (!strcmp(action, "reset-toner"))
-                conf.toner_baseline = conf.last_page_count;
-            else
-                conf.drum_baseline = conf.last_page_count;
-            write_conf(&conf);
-
-            char path[256];
-            papplPrinterGetPath(printer, "supplies", path, sizeof(path));
-            papplClientRespondRedirect(client, HTTP_STATUS_FOUND, path);
-            cupsFreeOptions(num_form, form);
-            return true;
+            if (!strcmp(action, "reset-toner")) {
+                conf.toner_baseline   = conf.last_page_count;
+                conf.toner_reset_time = (long)time(NULL);
+                write_conf(&conf);
+            } else if (!strcmp(action, "reset-drum")) {
+                conf.drum_baseline   = conf.last_page_count;
+                conf.drum_reset_time = (long)time(NULL);
+                write_conf(&conf);
+            }
         }
         cupsFreeOptions(num_form, form);
+
+        /* Always redirect back to GET to avoid re-POST on refresh. */
+        char path[256];
+        papplPrinterGetPath(printer, "supplies", path, sizeof(path));
+        papplClientRespondRedirect(client, HTTP_STATUS_FOUND, path);
+        return true;
     }
 
-    /* Compute display levels (use last known page count). */
-    int toner_pct = -1, drum_pct = -1;
-    if (conf.last_page_count >= 0)
-    {
+    /* GET: render the supplies page. */
+    int toner_pct = 0, drum_pct = 0;
+    if (conf.last_page_count >= 0) {
         toner_pct = supply_level(conf.last_page_count, conf.toner_baseline,
                                  TONER_RATED_PAGES);
         drum_pct  = supply_level(conf.last_page_count, conf.drum_baseline,
                                  DRUM_RATED_PAGES);
     }
 
-    papplClientHTMLPrinterHeader(client, printer, "Reset Supply", 0, NULL, NULL);
+    papplClientHTMLPrinterHeader(client, printer, "Supplies", 0, NULL, NULL);
 
-    if (status)
+    papplClientHTMLPuts(client, "          <div class=\"section\">\n");
+
+    if (conf.last_page_count >= 0)
         papplClientHTMLPrintf(client,
-            "          <div class=\"banner\">%s</div>\n", status);
-
-    if (conf.last_page_count < 0)
-    {
-        papplClientHTMLPuts(client,
-            "          <div class=\"section\">\n"
-            "            <p>Page count unavailable &mdash; printer may be off "
-            "or asleep. Load the <a href=\"supplies\">Supplies</a> page first "
-            "to trigger a status poll, then return here.</p>\n"
-            "          </div>\n");
-    }
-    else
-    {
-        char reset_path[256];
-        papplPrinterGetPath(printer, "reset-supply", reset_path,
-                            sizeof(reset_path));
-
-        papplClientHTMLPrintf(client,
-            "          <div class=\"section\">\n"
-            "            <p>Printer page count at last poll: "
-            "<strong>%ld</strong></p>\n"
-            "            <p>After replacing a consumable, click Reset to "
-            "record the current page count as the new baseline "
-            "(level returns to 100%%).</p>\n"
-            "            <table class=\"list\">\n"
-            "              <thead><tr>"
-            "<th>Supply</th><th>Level</th><th>Baseline</th><th></th>"
-            "</tr></thead>\n"
-            "              <tbody>\n",
+            "          <p>Printer lifetime page count: "
+            "<strong>%ld</strong></p>\n",
             conf.last_page_count);
 
-        /* Toner row */
-        papplClientHTMLPrintf(client,
-            "                <tr><th>Black Toner Cartridge</th>"
-            "<td>%d%%</td><td>%ld</td><td>",
-            toner_pct, conf.toner_baseline);
-        papplClientHTMLStartForm(client, reset_path, false);
-        papplClientHTMLPuts(client,
-            "<input type=\"hidden\" name=\"action\" value=\"reset-toner\">"
-            "<button class=\"btn\" type=\"submit\">Reset</button>"
-            "</form></td></tr>\n");
+    char supplies_path[256];
+    papplPrinterGetPath(printer, "supplies", supplies_path,
+                        sizeof(supplies_path));
 
-        /* Drum row */
-        papplClientHTMLPrintf(client,
-            "                <tr><th>Drum Unit</th>"
-            "<td>%d%%</td><td>%ld</td><td>",
-            drum_pct, conf.drum_baseline);
-        papplClientHTMLStartForm(client, reset_path, false);
-        papplClientHTMLPuts(client,
-            "<input type=\"hidden\" name=\"action\" value=\"reset-drum\">"
-            "<button class=\"btn\" type=\"submit\">Reset</button>"
-            "</form></td></tr>\n");
+    render_supply(client, supplies_path,
+                  "Black Toner Cartridge",
+                  toner_pct,
+                  conf.toner_baseline, conf.toner_reset_time,
+                  conf.last_page_count,
+                  TONER_RATED_PAGES,
+                  "reset-toner");
 
-        papplClientHTMLPuts(client,
-            "              </tbody>\n"
-            "            </table>\n"
-            "          </div>\n");
-    }
+    render_supply(client, supplies_path,
+                  "Drum Unit",
+                  drum_pct,
+                  conf.drum_baseline, conf.drum_reset_time,
+                  conf.last_page_count,
+                  DRUM_RATED_PAGES,
+                  "reset-drum");
+
+    papplClientHTMLPuts(client,
+        "          <p><small>Click Reset after replacing a consumable to "
+        "record the current page count as the new baseline.</small></p>\n"
+        "          </div>\n");
 
     papplClientHTMLPrinterFooter(client);
     return true;
@@ -846,10 +908,10 @@ void register_supply_reset_route(pappl_system_t  *system,
                                  pappl_printer_t *printer)
 {
     char path[256];
-    papplPrinterGetPath(printer, "reset-supply", path, sizeof(path));
+    papplPrinterGetPath(printer, "supplies", path, sizeof(path));
     papplSystemAddResourceCallback(system, path, "text/html",
-        (pappl_resource_cb_t)hl5170dn_web_reset_supply, printer);
-    papplPrinterAddLink(printer, "Reset Supply", path,
+        (pappl_resource_cb_t)hl5170dn_web_supplies, printer);
+    papplPrinterAddLink(printer, "Supplies", path,
         PAPPL_LOPTIONS_NAVIGATION | PAPPL_LOPTIONS_STATUS);
 }
 
@@ -986,8 +1048,9 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     data->vendor[0]  = "loaded-paper";
     data->vendor[1]  = "media-mismatch-action";
 
-    /* Register the /supplies web route and nav link. */
-    data->has_supplies = true;
+    /* We register our own /supplies route in register_supply_reset_route()
+     * after papplPrinterCreate, so don't let PAPPL claim that path. */
+    data->has_supplies = false;
 
     return true;
 }
