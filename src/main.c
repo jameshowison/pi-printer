@@ -83,12 +83,12 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
  * the localised path by supplying our own footer HTML literal. */
 #define APP_FOOTER_HTML \
     "<a class=\"btn\" href=\"https://github.com/jameshowison/pi-printer\">" \
-    "hl5170dn-printer-app v" APP_VERSION "</a>"
+    "hl5170dn-printer-app v" DRIVER_VERSION "</a>"
 
 int main(int argc, char *argv[])
 {
     return papplMainloop(argc, argv,
-        APP_VERSION,
+        DRIVER_VERSION,
         APP_FOOTER_HTML,/* footer_html — non-NULL to bypass PAPPL's
                            localised default footer (crashes in 1.4 when
                            no localisation strings are registered). */

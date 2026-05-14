@@ -62,6 +62,7 @@ clean:
 
 install: $(TARGET)
 	systemctl stop hl5170dn-printer-app || true
+	killall hl5170dn-printer-app 2>/dev/null || true
 	rm -f /tmp/hl5170dn-printer-app*.state
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 hl5170dn-printer-app.service /etc/systemd/system/

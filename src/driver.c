@@ -601,7 +601,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
 
     if (bytes <= 0) {
         papplLogPrinter(printer, PAPPL_LOGLEVEL_WARN,
-            "status: no response from printer (bytes=%zd)", bytes);
+            "status: no response from printer (bytes=%ld)", (long)bytes);
         return true;
     }
     buf[bytes] = '\0';
