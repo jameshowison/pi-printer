@@ -9,6 +9,7 @@ Group=lp
 Restart=on-failure
 StandardOutput=journal
 StandardError=journal
+StateDirectory=hl5170dn-printer-app
 
 [Install]
 WantedBy=multi-user.target

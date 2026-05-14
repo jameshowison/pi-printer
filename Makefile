@@ -69,7 +69,6 @@ install: $(TARGET)
 	install -m 644 99-brother-hl5170dn.rules /etc/udev/rules.d/
 	id -u printapp 2>/dev/null || \
 	    useradd -r -M -G lp -s /usr/sbin/nologin printapp
-	install -d -m 755 -o printapp -g printapp /var/lib/hl5170dn-printer-app
 	udevadm control --reload-rules && udevadm trigger
 	systemctl daemon-reload
 	systemctl restart avahi-daemon
