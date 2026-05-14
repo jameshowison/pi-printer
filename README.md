@@ -135,14 +135,22 @@ Envelope sizes (DL, C5, Com10, Monarch, ISO-B5) are never coerced and always pas
 
 | Option | IPP attribute | Values | Default |
 |--------|--------------|--------|---------|
-| Resolution | `printer-resolution` | `300dpi`, `600dpi` | `600dpi` |
+| Resolution | `printer-resolution` | `300dpi`, `600dpi` | `300dpi` |
 | Duplex | `sides` | `one-sided`, `two-sided-long-edge`, `two-sided-short-edge` | `one-sided` |
-| Print quality | `print-quality` | `3` (draft/econo), `4` (normal), `5` (high) | `4` |
+| Print quality | `print-quality` | `3` (draft/econo), `4` (normal/300dpi), `5` (high/600dpi) | `4` |
 | Input tray | `media-source` | `tray-1`, `by-pass-tray`, `auto` | `auto` |
 | Media type | `media-type` | `stationery`, `stationery-lightweight`, `stationery-heavyweight`, `stationery-bond`, envelope variants | `stationery` |
 | Copies | `copies` | integer | `1` |
 
-`print-quality=4` (Normal) uses driver-side GS halftoning at 600 dpi and is the recommended setting for all content. `print-quality=3` (Draft) drops to 300 dpi with economode. `print-quality=5` (High) is accepted but currently falls through to the 600 dpi path — see [APT note](#apt-mode-1024-disabled) below.
+The three quality levels map to distinct printing modes, which is the only resolution control available from iOS (Draft / Normal / Best):
+
+| iOS label | `print-quality` | Resolution | Economode | Use for |
+|-----------|----------------|------------|-----------|---------|
+| Draft | `3` | 300 dpi | ON | Internal proofs, toner-saving |
+| Normal | `4` | 300 dpi | OFF | Everyday documents |
+| Best | `5` | 600 dpi | OFF | Photos, final output |
+
+Apps that expose `printer-resolution` directly can set it independently of quality.
 
 Example:
 ```bash

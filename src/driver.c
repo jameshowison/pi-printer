@@ -329,7 +329,14 @@ static void pjl_params_from_options(const pappl_pr_options_t *opts,
      * APT_DISABLED: restore the original line to re-enable:
      *   p->apt = (opts->print_quality == IPP_QUALITY_HIGH); */
     p->apt = false;
-    if (p->apt)
+
+    /* High quality (Best on iOS) forces 600 dpi even without APT.
+     * This gives iOS users a meaningful three-way choice:
+     *   Draft (3) = 300 dpi + economode   — fast, toner-saving
+     *   Normal(4) = 300 dpi, no economode — standard output
+     *   Best  (5) = 600 dpi, no economode — full quality for photos
+     * Apps that set printer-resolution directly can still override independently. */
+    if (opts->print_quality == IPP_QUALITY_HIGH)
         p->resolution = 600;
 }
 
