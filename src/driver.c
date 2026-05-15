@@ -472,9 +472,10 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
      *                    Sent first, before any other PCL, so it takes effect on
      *                    page 1. ESC E before this command defers it to page 2.
      *   ESC *t<N>R     — raster resolution N dpi
+     *   ESC &l0E       — top margin = 0 lines (clears PCL factory default 0.5" top margin)
      *   ESC *r0F       — presentation: portrait, no rotation
      *   ESC *b2M       — compression: TIFF packbits (mode 2)
-     *   ESC *r1A       — start raster at top-left of page */
+     *   ESC *r0A       — start raster at logical page left edge, cursor Y (= logical page top) */
     if (page == 0) {
         if (options->sides == PAPPL_SIDES_TWO_SIDED_SHORT_EDGE)
             papplDeviceWrite(device, "\x1b&l2S", 5);
@@ -484,11 +485,11 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
             papplDeviceWrite(device, "\x1b&l0S", 5);  /* explicit simplex */
     }
     n = snprintf(buf, sizeof(buf),
-        "\x1b&a0L"    /* reset left margin to col 0 (left of printable area) */
         "\x1b*t%dR"   /* raster resolution */
+        "\x1b&l0E"    /* top margin = 0 (clear PCL 0.5" default) */
         "\x1b*r0F"    /* presentation: portrait, no rotation */
         "\x1b*b2M"    /* compression: packbits */
-        "\x1b*r0A",   /* start raster at left margin (=0), top of raster area */
+        "\x1b*r0A",   /* start raster at logical page left, cursor Y = logical page top */
         jd->resolution);
     papplDeviceWrite(device, buf, (size_t)n);
     papplDeviceFlush(device);
@@ -1420,23 +1421,51 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         int gs_w_pts, gs_h_pts;
         paper_size_pts(options->media.size_name, &gs_w_pts, &gs_h_pts);
         int res = jd->resolution;
+        bool use_fitpage = (options->print_scaling == PAPPL_SCALING_FIT ||
+                            options->print_scaling == PAPPL_SCALING_AUTO_FIT);
 
-        /* GS renders the PDF as 8-bit grayscale PGM to stdout.
-         * Render at full page dimensions (not the imageable area) so that GS
-         * maps PS/PDF coordinates 1:1 to raster rows with no scaling.
-         * -dFIXEDMEDIA enforces the correct page size regardless of what the
-         * PDF specifies.  -dFitPage is intentionally omitted: it would scale
-         * the content down ~6% and introduce ~8 mm of blank space at the top
-         * of the raster due to the imageable-area aspect-ratio mismatch.
-         * ESC*r0A in rstartpage_cb positions the raster at the top of the
-         * printer's physical printable area; hardware clips the unprintable
-         * margins naturally. */
-        snprintf(gs_cmd, sizeof(gs_cmd),
-            "gs -dBATCH -dNOPAUSE -dSAFE "
-            "-sDEVICE=pgmraw -r%d "
-            "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
-            "-sOutputFile=- '%s'",
-            res, gs_w_pts, gs_h_pts, filename);
+        if (use_fitpage) {
+            /* print-scaling=fit: scale content to fit within declared margins.
+             * Compute the imageable canvas from full-page dimensions minus the
+             * declared margins (in 1/100 mm; convert to pts at 72pt/in).
+             * DO NOT use paper_imageable_pts(): those are legacy PPD values
+             * with a different aspect ratio that cause incorrect scaling. */
+            int left_pts   = (int)(options->media.left_margin   * 72.0 / 2540.0 + 0.5);
+            int right_pts  = (int)(options->media.right_margin  * 72.0 / 2540.0 + 0.5);
+            int top_pts    = (int)(options->media.top_margin    * 72.0 / 2540.0 + 0.5);
+            int bottom_pts = (int)(options->media.bottom_margin * 72.0 / 2540.0 + 0.5);
+            int img_w = gs_w_pts - left_pts - right_pts;
+            int img_h = gs_h_pts - top_pts - bottom_pts;
+
+            papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                "%s: pdf_filter: print-scaling=fit — imageable canvas %dx%d pts "
+                "(margins l=%d r=%d t=%d b=%d pts)",
+                ctx, img_w, img_h, left_pts, right_pts, top_pts, bottom_pts);
+
+            snprintf(gs_cmd, sizeof(gs_cmd),
+                "gs -dBATCH -dNOPAUSE -dSAFE "
+                "-sDEVICE=pgmraw -r%d "
+                "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
+                "-dFitPage "
+                "-sOutputFile=- '%s'",
+                res, img_w, img_h, filename);
+        } else {
+            /* Default (auto/none/fill): render at full page dimensions (not the
+             * imageable area) so GS maps PS/PDF coordinates 1:1 with no scaling.
+             * -dFIXEDMEDIA enforces the correct page size regardless of what the
+             * PDF specifies.  -dFitPage is intentionally omitted: it would scale
+             * content down ~6% and introduce ~8 mm of blank space at the top
+             * due to the imageable-area aspect-ratio mismatch.
+             * ESC*r0A in rstartpage_cb positions the raster at the top of the
+             * printer's physical printable area; hardware clips the unprintable
+             * margins naturally. */
+            snprintf(gs_cmd, sizeof(gs_cmd),
+                "gs -dBATCH -dNOPAUSE -dSAFE "
+                "-sDEVICE=pgmraw -r%d "
+                "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
+                "-sOutputFile=- '%s'",
+                res, gs_w_pts, gs_h_pts, filename);
+        }
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
             "%s: pdf_filter: gs cmd: %s", ctx, gs_cmd);
