@@ -1,0 +1,15 @@
+{
+    NAME "Standard test: text-test.pdf pages 1-2, duplex long-edge"
+    OPERATION Print-Job
+    GROUP operation-attributes-tag
+    ATTR charset attributes-charset utf-8
+    ATTR naturalLanguage attributes-natural-language en-us
+    ATTR uri printer-uri ipp://localhost:8000/ipp/print
+    ATTR name requesting-user-name tuttle
+    ATTR name job-name "text-test-p12-duplex"
+    ATTR mimeMediaType document-format image/pwg-raster
+    GROUP job-attributes-tag
+    ATTR keyword sides two-sided-long-edge
+    FILE /tmp/text-test-p12.pwg
+    STATUS successful-ok
+}
