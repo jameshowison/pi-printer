@@ -1385,6 +1385,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     unsigned            pagenum   = 0;
     bool                ok        = false;
     bool                job_started = false;
+    int                 skip_left = 0;  /* set in inner block, used in raster loop */
     char                ctx[64];
 
     (void)cbdata;
@@ -1445,7 +1446,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
          *
          * Fit path: GS renders to the imageable canvas (img_w), which starts at
          * the hardware boundary; no stripping needed. */
-        int skip_left = use_fitpage ? 0
+        skip_left = use_fitpage ? 0
             : (int)(options->media.left_margin * (double)res / 2540.0 + 0.5);
 
         if (use_fitpage) {
