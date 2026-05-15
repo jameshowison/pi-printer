@@ -53,6 +53,18 @@
  * at paper y=5mm, not y=3.7mm.  Units: 1/100 mm (matching pappl margin units). */
 #define HW_TOP_ORIGIN_100MM  370
 
+/* Canonical driver margins.  Single source of truth used by fill_media() and
+ * by the rstartjob_cb override of options->media (Strategy C in
+ * plan-mac-margins.md).  Symmetric on each axis, taking the tighter
+ * hardware side so the visible margins land symmetrically:
+ *   horizontal 7mm (vs 3mm hardware right) — sacrifice ~4mm of reachable right
+ *   vertical   5mm (vs 3.7mm hardware top) — sacrifice ~1.3mm of reachable top
+ * The vertical compensation is handled in PCL via pad_top blank rows. */
+#define DRIVER_LEFT_MARGIN_100MM    700   /* 7mm */
+#define DRIVER_RIGHT_MARGIN_100MM   700   /* 7mm */
+#define DRIVER_TOP_MARGIN_100MM     500   /* 5mm */
+#define DRIVER_BOTTOM_MARGIN_100MM  500   /* 5mm */
+
 /* ---- Per-job state ---------------------------------------------------- */
 
 typedef struct {
@@ -420,6 +432,68 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
     /* Phase 4: build rich log context before the first log call. */
     make_job_ctx(job, jd->ctx, sizeof(jd->ctx));
 
+    /* Diagnostic: dump the raw client-submitted media-col attribute as it
+     * arrived, before any PAPPL/driver mutation, so we can see what macOS
+     * (or other clients) actually negotiated.  PAPPL accepts whatever the
+     * client puts in media-col without validating against
+     * media-{left,right,...}-margin-supported, so the values landing in
+     * options->media may differ from what fill_media() declares. */
+    {
+        ipp_attribute_t *mc = papplJobGetAttribute(job, "media-col");
+        if (mc) {
+            ipp_t *col = ippGetCollection(mc, 0);
+            if (col) {
+                ipp_attribute_t *a;
+                for (a = ippFirstAttribute(col); a; a = ippNextAttribute(col)) {
+                    const char *aname = ippGetName(a);
+                    ipp_tag_t   atag  = ippGetValueTag(a);
+                    if (atag == IPP_TAG_INTEGER) {
+                        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                            "%s: ipp: media-col.%s = %d",
+                            jd->ctx, aname ? aname : "?", ippGetInteger(a, 0));
+                    } else if (atag == IPP_TAG_KEYWORD ||
+                               atag == IPP_TAG_NAME ||
+                               atag == IPP_TAG_NAMELANG) {
+                        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                            "%s: ipp: media-col.%s = '%s'",
+                            jd->ctx, aname ? aname : "?",
+                            ippGetString(a, 0, NULL));
+                    } else if (atag == IPP_TAG_BEGIN_COLLECTION) {
+                        /* Nested collection (e.g. media-size containing
+                         * x-dimension / y-dimension integers). */
+                        ipp_t *sub = ippGetCollection(a, 0);
+                        if (sub) {
+                            ipp_attribute_t *sa;
+                            for (sa = ippFirstAttribute(sub); sa;
+                                 sa = ippNextAttribute(sub)) {
+                                const char *sname = ippGetName(sa);
+                                if (ippGetValueTag(sa) == IPP_TAG_INTEGER)
+                                    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                                        "%s: ipp: media-col.%s.%s = %d",
+                                        jd->ctx,
+                                        aname  ? aname  : "?",
+                                        sname  ? sname  : "?",
+                                        ippGetInteger(sa, 0));
+                            }
+                        }
+                    } else {
+                        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                            "%s: ipp: media-col.%s = (tag=%d)",
+                            jd->ctx, aname ? aname : "?", (int)atag);
+                    }
+                }
+            }
+        } else {
+            papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                "%s: ipp: no media-col attr", jd->ctx);
+        }
+        ipp_attribute_t *m = papplJobGetAttribute(job, "media");
+        if (m)
+            papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                "%s: ipp: media = '%s'", jd->ctx,
+                ippGetString(m, 0, NULL));
+    }
+
     /* Phase 3: rewrite options->media before pjl_params_from_options so that
      * both PJL PAPER= and the GS -sPAPERSIZE= (read after this callback in
      * pdf_filter_cb) see the loaded paper, not the client-requested size. */
@@ -427,6 +501,22 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
         free(jd);
         return false;
     }
+
+    /* Strategy C (plan-mac-margins.md): enforce the driver's canonical
+     * margins on every job.  Clients (notably macOS) sometimes submit
+     * media-col with margins (e.g. 500/500/500/500) that PAPPL accepts
+     * without validating against media-{left,right,...}-margin-supported.
+     * The downstream alignment math, fit-page canvas, and PJL all depend on
+     * options->media reflecting the printer's actual hardware geometry, so
+     * we overwrite the resolved per-side margins here regardless of input.
+     *
+     * Done AFTER apply_media_substitution (so size_name/width/length are
+     * settled) and BEFORE pjl_params_from_options and the geom: log
+     * (so both observe the post-override values). */
+    options->media.left_margin   = DRIVER_LEFT_MARGIN_100MM;
+    options->media.right_margin  = DRIVER_RIGHT_MARGIN_100MM;
+    options->media.top_margin    = DRIVER_TOP_MARGIN_100MM;
+    options->media.bottom_margin = DRIVER_BOTTOM_MARGIN_100MM;
 
     pjl_job_params_t pjl;
     pjl_params_from_options(options, &pjl);
@@ -1120,15 +1210,12 @@ static void fill_media(pappl_media_col_t *m, const char *size_name,
     strncpy(m->size_name, size_name, sizeof(m->size_name) - 1);
     m->size_width    = width_100mm;
     m->size_length   = length_100mm;
-    /* Symmetric declared margins (Session 2, plan.md Phase 2): take the worse
-     * (tighter) hardware side on each axis so visible margins are symmetric.
-     *   Horizontal: 7mm (vs 3mm right) — sacrifices ~4mm of reachable right edge.
-     *   Vertical:   5mm (vs 3.7mm top) — sacrifices ~1.3mm of reachable top.
-     * This is the standard conservative trade-off PPD-based drivers make. */
-    m->left_margin   = 700;  /* 7mm */
-    m->right_margin  = 700;  /* 7mm */
-    m->top_margin    = 500;  /* 5mm */
-    m->bottom_margin = 500;  /* 5mm */
+    /* Canonical symmetric margins — see DRIVER_*_MARGIN_100MM macros for the
+     * single source of truth and the rationale (Session 2, plan.md Phase 2). */
+    m->left_margin   = DRIVER_LEFT_MARGIN_100MM;
+    m->right_margin  = DRIVER_RIGHT_MARGIN_100MM;
+    m->top_margin    = DRIVER_TOP_MARGIN_100MM;
+    m->bottom_margin = DRIVER_BOTTOM_MARGIN_100MM;
     strncpy(m->source, source, sizeof(m->source) - 1);
     strncpy(m->type, "stationery", sizeof(m->type) - 1);
 }
@@ -1228,11 +1315,10 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
      * media-*-margin-supported so macOS knows the imageable area and applies
      * client-side scaling for "Scale to Fit: Print Entire Image".
      * Without these, PAPPL advertises 0 (borderless) and macOS never scales.
-     * PAPPL uses one symmetric value per axis; use the larger (tighter) margin
-     * so the declared printable area fits within both hardware sides.
-     * Actual per-side values live in fill_media() above. */
-    data->left_right = 700;   /* 7mm — left hardware margin (larger than 3mm right) */
-    data->bottom_top = 500;   /* 5mm — bottom hardware margin (larger than 3mm top) */
+     * PAPPL uses one symmetric value per axis; the canonical pair lives in
+     * the DRIVER_*_MARGIN_100MM macros. */
+    data->left_right = DRIVER_LEFT_MARGIN_100MM;
+    data->bottom_top = DRIVER_BOTTOM_MARGIN_100MM;
 
     /* Media types (IPP names).  PJL names in type_to_pjl(). */
     data->num_type = 8;
