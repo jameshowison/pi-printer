@@ -975,10 +975,10 @@ static void fill_media(pappl_media_col_t *m, const char *size_name,
     strncpy(m->size_name, size_name, sizeof(m->size_name) - 1);
     m->size_width    = width_100mm;
     m->size_length   = length_100mm;
-    m->left_margin   = 500;
-    m->right_margin  = 500;
-    m->top_margin    = 500;
-    m->bottom_margin = 500;
+    m->left_margin   = 700;  /* 7mm — measured (job #18) */
+    m->right_margin  = 300;  /* 3mm — measured (job #16) */
+    m->top_margin    = 300;  /* 3mm — measured (job #16) */
+    m->bottom_margin = 500;  /* 5mm — measured (job #18, conservative) */
     strncpy(m->source, source, sizeof(m->source) - 1);
     strncpy(m->type, "stationery", sizeof(m->type) - 1);
 }
@@ -1074,13 +1074,15 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
     fill_media(&data->media_ready[1], "na_letter_8.5x11in", 21590, 27940, "by-pass-tray");
     fill_media(&data->media_ready[2], "na_letter_8.5x11in", 21590, 27940, "auto");
 
-    /* Declared printable margins: 5 mm all sides (1/100 mm units).
-     * These populate media-col-database and media-*-margin-supported so that
-     * macOS knows the imageable area and applies client-side scaling for
-     * "Scale to Fit: Print Entire Image". Without these, PAPPL advertises 0
-     * (borderless) and macOS never scales. */
-    data->left_right = 500;   /* left + right margins: 5 mm each */
-    data->bottom_top = 500;   /* bottom + top margins: 5 mm each */
+    /* Declared printable margins (1/100 mm units).  These populate
+     * media-*-margin-supported so macOS knows the imageable area and applies
+     * client-side scaling for "Scale to Fit: Print Entire Image".
+     * Without these, PAPPL advertises 0 (borderless) and macOS never scales.
+     * PAPPL uses one symmetric value per axis; use the larger (tighter) margin
+     * so the declared printable area fits within both hardware sides.
+     * Actual per-side values live in fill_media() above. */
+    data->left_right = 700;   /* 7mm — left hardware margin (larger than 3mm right) */
+    data->bottom_top = 500;   /* 5mm — bottom hardware margin (larger than 3mm top) */
 
     /* Media types (IPP names).  PJL names in type_to_pjl(). */
     data->num_type = 8;
@@ -1432,6 +1434,20 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         bool use_fitpage = (options->print_scaling == PAPPL_SCALING_FIT ||
                             options->print_scaling == PAPPL_SCALING_AUTO_FIT);
 
+        /* Default path: ESC*r0A places the raster origin at the hardware left
+         * boundary, so pixel 0 prints at left_margin mm from the paper edge.
+         * GS renders a full-page canvas (0 to page_width_pts), so the first
+         * left_margin_px pixels of each row correspond to the hardware-unprintable
+         * left zone — they would land left of the printable area and shift all
+         * content right by left_margin.  Strip those pixels so printer pixel 0
+         * corresponds to PDF x = left_margin (the hardware left boundary), giving
+         * correctly centred output.
+         *
+         * Fit path: GS renders to the imageable canvas (img_w), which starts at
+         * the hardware boundary; no stripping needed. */
+        int skip_left = use_fitpage ? 0
+            : (int)(options->media.left_margin * (double)res / 2540.0 + 0.5);
+
         if (use_fitpage) {
             /* print-scaling=fit: scale content to fit within declared margins.
              * Compute the imageable canvas from full-page dimensions minus the
@@ -1458,15 +1474,12 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
                 "-sOutputFile=- '%s'",
                 res, img_w, img_h, filename);
         } else {
-            /* Default (auto/none/fill): render at full page dimensions (not the
-             * imageable area) so GS maps PS/PDF coordinates 1:1 with no scaling.
-             * -dFIXEDMEDIA enforces the correct page size regardless of what the
-             * PDF specifies.  -dFitPage is intentionally omitted: it would scale
-             * content down ~6% and introduce ~8 mm of blank space at the top
-             * due to the imageable-area aspect-ratio mismatch.
-             * ESC*r0A in rstartpage_cb positions the raster at the top of the
-             * printer's physical printable area; hardware clips the unprintable
-             * margins naturally. */
+            /* Default (auto/none/fill): render at full page dimensions so GS maps
+             * PS/PDF coordinates 1:1 with no scaling.  -dFIXEDMEDIA enforces the
+             * correct page size.  -dFitPage intentionally omitted (causes ~6%
+             * downscale and ~8mm blank at top due to aspect-ratio mismatch).
+             * The left skip_left pixels are stripped in the raster loop below to
+             * compensate for the ESC*r0A hardware-boundary shift (job #18). */
             snprintf(gs_cmd, sizeof(gs_cmd),
                 "gs -dBATCH -dNOPAUSE -dSAFE "
                 "-sDEVICE=pgmraw -r%d "
@@ -1516,15 +1529,20 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             goto jobs_done;
 
         /* Update options for this page's geometry.
-         * cupsBytesPerLine = w: one byte per pixel for SGRAY_8. */
-        options->header.cupsWidth        = (unsigned)w;
+         * For the default path, strip skip_left pixels from the left of each row
+         * so the raster sent to the printer starts at the hardware left boundary.
+         * cupsBytesPerLine = print_w: one byte per pixel for SGRAY_8. */
+        int print_w = w - skip_left;
+        options->header.cupsWidth        = (unsigned)print_w;
         options->header.cupsHeight       = (unsigned)h;
-        options->header.cupsBytesPerLine = (unsigned)w;
+        options->header.cupsBytesPerLine = (unsigned)print_w;
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "%s: pdf_filter: page %u: %dx%d px", ctx, pagenum, w, h);
+            "%s: pdf_filter: page %u: %dx%d px (gs %dx%d, skip_left=%d)",
+            ctx, pagenum, print_w, h, w, h, skip_left);
 
-        /* Grow row buffer if this page is wider than previous pages. */
+        /* Grow row buffer if this page is wider than previous pages.
+         * Allocate for the full GS width w (we read the whole row before skipping). */
         if ((unsigned)w > prev_w) {
             free(rowbuf);
             rowbuf = malloc((size_t)w);
@@ -1545,7 +1563,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
                     ctx, y, pagenum, strerror(errno));
                 page_ok = false;
             } else {
-                drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf);
+                drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf + skip_left);
             }
         }
 
