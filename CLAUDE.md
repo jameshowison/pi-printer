@@ -46,6 +46,24 @@ ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && sudo make install"
 `PAPPL_SUPPLY_TYPE_DRUM_IMAGING` is not defined in PAPPL — use
 `PAPPL_SUPPLY_TYPE_OPC` (optical photoconductor) for drum units.
 
+## Troubleshooting: CUPS conflict on Pi
+
+**Symptom:** macOS reports "printer is in use"; `dns-sd -B _ipp._tcp local` shows two entries
+(e.g. `HL5170DN @ tuttle-pi` and `hl5170dn`).
+
+**Cause:** CUPS is running on the Pi and advertising the same printer via its own IPP queue.
+CUPS and PAPPL fight over the USB device — whichever acquired it first blocks the other.
+
+**Fix:** Remove the CUPS queue (PAPPL replaces it entirely):
+```bash
+ssh tuttle@tuttle-pi.local "sudo lpadmin -x 'HL5170DN'"
+```
+Then on the Mac: delete any existing `HL5170DN` entry in Printers & Scanners and re-add —
+macOS will pick up the PAPPL `hl5170dn` entry cleanly.
+
+**Check during setup:** After first install, always run `dns-sd -B _ipp._tcp local` and confirm
+only one entry (`hl5170dn`) appears.
+
 ## What this project is
 
 A PAPPL Printer Application for the Brother HL-5170DN, running as a systemd
@@ -74,14 +92,32 @@ Reasons this will fail or give wrong results:
 
 **The only correct tool for test job submission is `ipptool`.**
 
-### ipptool invocation pattern
+### Printing a test PDF (standard workflow)
 
+Always use `run-test.sh` on the Pi — it stamps a label on every page and submits via ipptool:
+
+```bash
+ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && ./run-test.sh LABEL tests/TESTFILE.test /path/to/file.pdf"
 ```
-ipptool -tv \
+
+Example — print a centering calibration PDF simplex:
+```bash
+ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && ./run-test.sh 'J18-center' tests/print-simplex.test /home/tuttle/center-test.pdf"
+```
+
+**Never invoke ipptool directly with a heredoc on the Mac side** — it tries port 631 (CUPS)
+instead of port 8000 (PAPPL) and the service name is wrong.
+
+### ipptool invocation pattern (reference only)
+
+If `run-test.sh` cannot be used, invoke ipptool via SSH on the Pi:
+
+```bash
+ssh tuttle@tuttle-pi.local "ipptool -tv \
   -f /path/to/input.pdf \
   -d filetype=application/pdf \
   ipp://localhost:8000/ipp/print \
-  /home/tuttle/pi-printer/tests/TESTFILE.test
+  /home/tuttle/pi-printer/tests/TESTFILE.test"
 ```
 
 Variables:
