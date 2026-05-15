@@ -1,0 +1,26 @@
+# One-sided with print-scaling=fit
+# Usage: ipptool -tv -f FILE -d filetype=application/pdf ipp://localhost:PORT/ipp/print print-fit.test
+{
+	NAME "Print-Job one-sided fit"
+	OPERATION Print-Job
+
+	GROUP operation-attributes-tag
+	ATTR charset attributes-charset utf-8
+	ATTR language attributes-natural-language en
+	ATTR uri printer-uri $uri
+	ATTR name requesting-user-name $user
+	ATTR mimeMediaType document-format $filetype
+
+	GROUP job-attributes-tag
+	ATTR integer copies 1
+	ATTR keyword sides one-sided
+	ATTR keyword print-scaling fit
+
+	FILE $filename
+
+	STATUS successful-ok
+	STATUS successful-ok-ignored-or-substituted-attributes
+
+	EXPECT job-id
+	EXPECT job-uri
+}
