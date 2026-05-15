@@ -179,8 +179,7 @@ static const char *size_name_to_pjl(const char *name)
 /* Imageable area in PostScript points (72 dpi basis) for each supported
  * media size.  Values from legacy/Brother-HL5170DN-PCL.ppd ImageableArea
  * entries: all sizes have 18pt side margins and 12pt top/bottom margins.
- * GS is given these dimensions via -dFIXEDMEDIA so it renders exactly the
- * printable area — no overflow at the bottom edge. */
+ * Used only by the disabled APT path (apt_render_pdf). */
 static void paper_imageable_pts(const char *name, int *w_pts, int *h_pts)
 {
     static const struct { const char *n; int w, h; } t[] = {
@@ -200,6 +199,34 @@ static void paper_imageable_pts(const char *name, int *w_pts, int *h_pts)
         if (!strcmp(name, t[i].n)) { *w_pts = t[i].w; *h_pts = t[i].h; return; }
     }
     *w_pts = 576; *h_pts = 768;  /* fallback: letter */
+}
+
+/* Full media dimensions in PostScript points for the GS raster pipeline.
+ * GS renders the PDF 1:1 at these dimensions (no scaling); the printer's
+ * hardware clips the physical unprintable margins naturally.  Using the
+ * full page size (not the imageable area) avoids the aspect-ratio mismatch
+ * that -dFitPage would introduce: with imageable area dimensions, -dFitPage
+ * scales content down ~6% and pads ~8 mm of blank space at the top of the
+ * raster, shifting all content downward. */
+static void paper_size_pts(const char *name, int *w_pts, int *h_pts)
+{
+    static const struct { const char *n; int w, h; } t[] = {
+        { "na_letter_8.5x11in",           612, 792 },
+        { "na_legal_8.5x14in",            612, 1008 },
+        { "na_executive_7.25x10.5in",     522, 756 },
+        { "iso_a4_210x297mm",             595, 842 },
+        { "iso_a5_148x210mm",             420, 595 },
+        { "iso_a6_105x148mm",             297, 420 },
+        { "na_number-10_4.125x9.5in",     297, 684 },
+        { "na_monarch_3.875x7.5in",       279, 540 },
+        { "iso_dl_110x220mm",             312, 624 },
+        { "iso_c5_162x229mm",             459, 649 },
+        { "iso_b5_176x250mm",             499, 709 },
+    };
+    for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
+        if (!strcmp(name, t[i].n)) { *w_pts = t[i].w; *h_pts = t[i].h; return; }
+    }
+    *w_pts = 612; *h_pts = 792;  /* fallback: letter */
 }
 
 /* ---- Phase 3: media substitution helpers ------------------------------ */
@@ -457,10 +484,11 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
             papplDeviceWrite(device, "\x1b&l0S", 5);  /* explicit simplex */
     }
     n = snprintf(buf, sizeof(buf),
-        "\x1b*t%dR"
-        "\x1b*r0F"
-        "\x1b*b2M"
-        "\x1b*r1A",
+        "\x1b&a0L"    /* reset left margin to col 0 (left of printable area) */
+        "\x1b*t%dR"   /* raster resolution */
+        "\x1b*r0F"    /* presentation: portrait, no rotation */
+        "\x1b*b2M"    /* compression: packbits */
+        "\x1b*r0A",   /* start raster at left margin (=0), top of raster area */
         jd->resolution);
     papplDeviceWrite(device, buf, (size_t)n);
     papplDeviceFlush(device);
@@ -1390,17 +1418,22 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         }
 
         int gs_w_pts, gs_h_pts;
-        paper_imageable_pts(options->media.size_name, &gs_w_pts, &gs_h_pts);
+        paper_size_pts(options->media.size_name, &gs_w_pts, &gs_h_pts);
         int res = jd->resolution;
 
         /* GS renders the PDF as 8-bit grayscale PGM to stdout.
-         * Render to the imageable area dimensions (not the full page) so the
-         * PCL raster fills the printable area exactly with no bottom overflow.
-         * -dFIXEDMEDIA + DEVICEWIDTHPOINTS/HEIGHTPOINTS set the canvas size.
-         * -dFitPage scales the PDF content to fill that canvas. */
+         * Render at full page dimensions (not the imageable area) so that GS
+         * maps PS/PDF coordinates 1:1 to raster rows with no scaling.
+         * -dFIXEDMEDIA enforces the correct page size regardless of what the
+         * PDF specifies.  -dFitPage is intentionally omitted: it would scale
+         * the content down ~6% and introduce ~8 mm of blank space at the top
+         * of the raster due to the imageable-area aspect-ratio mismatch.
+         * ESC*r0A in rstartpage_cb positions the raster at the top of the
+         * printer's physical printable area; hardware clips the unprintable
+         * margins naturally. */
         snprintf(gs_cmd, sizeof(gs_cmd),
             "gs -dBATCH -dNOPAUSE -dSAFE "
-            "-sDEVICE=pgmraw -r%d -dFitPage "
+            "-sDEVICE=pgmraw -r%d "
             "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
             "-sOutputFile=- '%s'",
             res, gs_w_pts, gs_h_pts, filename);
