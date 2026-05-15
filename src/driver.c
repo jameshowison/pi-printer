@@ -44,16 +44,40 @@
 #include "pjl.h"
 #include "packbits.h"
 
+/* ---- Hardware geometry constants -------------------------------------- *
+ *
+ * Hardware top origin: the printer places PCL raster row 0 at this distance
+ * from the paper's top edge.  Measured in Session 1 Test 4: anchor rule at
+ * 18.5mm = expected 14.8mm + 3.7mm hardware origin.  Used to compute pad_top:
+ * extra blank rows inserted before content so a declared top_margin=5mm lands
+ * at paper y=5mm, not y=3.7mm.  Units: 1/100 mm (matching pappl margin units). */
+#define HW_TOP_ORIGIN_100MM  370
+
 /* ---- Per-job state ---------------------------------------------------- */
 
 typedef struct {
     time_t         start_time;
     int            resolution;      /* effective dpi, cached in rstartjob */
-    unsigned       page_width;      /* pixels; allocated on first rstartpage */
+    unsigned       page_width;      /* pixels actually emitted; allocated on
+                                     * first rstartpage (== print_w below) */
     unsigned char *halftone_buf;    /* 1-bit packed row, (page_width+7)/8 bytes */
     unsigned char *line_buf;        /* packbits output buffer */
     size_t         line_buf_size;
     char           ctx[64];         /* rich log prefix: "<name> from <host>" */
+
+    /* Phase 3/4 alignment geometry (set per page in rstartpage_cb). */
+    bool           is_pdf_path;     /* true if pdf_filter_cb is driving the
+                                     * pipeline; raster path (PWG/URF) when false */
+    int            skip_left;       /* px to strip from left of each input row */
+    int            skip_right;      /* px to strip from right of each input row */
+    int            skip_top;        /* rows to drop at top of page */
+    int            skip_bottom;     /* rows to drop at bottom of page */
+    int            pad_top;         /* blank rows to emit between PCL framing
+                                     * and first content row (hardware top-origin
+                                     * correction; ~31 rows at 600 dpi) */
+    unsigned       orig_cups_width; /* options->header.cupsWidth as PAPPL sees it */
+    unsigned       orig_cups_height;/* options->header.cupsHeight as PAPPL sees it */
+    unsigned       print_w;         /* pixels actually halftoned & emitted */
 } hl5170dn_job_t;
 
 /* ---- Phase 4: rich job-context prefix --------------------------------- */
@@ -424,6 +448,16 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
         pjl.economode? "ON" : "OFF",
         pjl.copies);
 
+    /* Phase 1 geometry log: source of truth for margin/scaling debugging. */
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "%s: geom: rstartjob format=%s media=%s size=%dx%d "
+        "margins L=%d R=%d T=%d B=%d scaling=%d",
+        jd->ctx, papplJobGetFormat(job), options->media.size_name,
+        options->media.size_width, options->media.size_length,
+        options->media.left_margin, options->media.right_margin,
+        options->media.top_margin, options->media.bottom_margin,
+        (int)options->print_scaling);
+
     pjl_write_job_header(device, &pjl);
     return true;
 }
@@ -432,19 +466,89 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
                                  pappl_device_t *device, unsigned page)
 {
     hl5170dn_job_t *jd  = papplJobGetData(job);
-    unsigned        w   = options->header.cupsWidth;
+    unsigned        cw  = options->header.cupsWidth;
     char            buf[64];
     int             n;
 
-    if (w == 0) {
+    if (cw == 0) {
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
             "rstartpage page=%u: cupsWidth=0", page);
         return false;
     }
 
-    /* Allocate/resize per-line buffers when page width changes. */
-    if (w != jd->page_width) {
-        size_t row1bit    = (w + 7u) / 8u;
+    /* ---- Phase 3/4: compute per-page alignment geometry --------------- *
+     *
+     * Two cases:
+     *
+     * (A) PDF path (jd->is_pdf_path == true): pdf_filter_cb has already done
+     *     all horizontal & vertical stripping.  cupsWidth here is print_w
+     *     (post-strip width); cupsHeight is content_h (rows that will be
+     *     delivered via rwriteline_cb).  rwriteline_cb halftones the full
+     *     buffer it receives.  This callback only needs to allocate buffers
+     *     and emit pad_top blank rows after PCL framing.
+     *
+     * (B) Raster path (PWG/URF from PAPPL): PAPPL delivers full-source rows
+     *     via rwriteline_cb.  We detect whether the source is a full-page
+     *     raster (apply horizontal & vertical strip) or an imageable-area
+     *     raster matching the declared margins (no horizontal strip needed).
+     *     pad_top is emitted in both sub-cases. */
+    int res = (int)options->header.HWResolution[0];
+    if (res <= 0)
+        res = jd->resolution;
+
+    int      skip_left   = 0;
+    int      skip_right  = 0;
+    int      skip_top    = 0;
+    int      skip_bottom = 0;
+    unsigned print_w     = cw;
+
+    if (!jd->is_pdf_path) {
+        /* Raster path: decide between full-page raster and imageable-area raster.
+         * full_w_px is the paper width in pixels at this resolution.
+         * img_w_px is paper width minus declared L+R margins.
+         * If cw is closer to full_w_px (or > img_w_px + tolerance), we're in
+         * Case A and must strip the unprintable left/right & top/bottom zones. */
+        int full_w_px = (int)((double)options->media.size_width  * res / 2540.0 + 0.5);
+        int img_w_px  = full_w_px
+            - (int)((double)options->media.left_margin  * res / 2540.0 + 0.5)
+            - (int)((double)options->media.right_margin * res / 2540.0 + 0.5);
+
+        bool full_page = ((int)cw - img_w_px) > 50;  /* >~2mm margin of error */
+
+        if (full_page) {
+            skip_left   = (int)((double)options->media.left_margin   * res / 2540.0 + 0.5);
+            skip_right  = (int)((double)options->media.right_margin  * res / 2540.0 + 0.5);
+            skip_top    = (int)((double)options->media.top_margin    * res / 2540.0 + 0.5);
+            skip_bottom = (int)((double)options->media.bottom_margin * res / 2540.0 + 0.5);
+            if ((int)cw > skip_left + skip_right)
+                print_w = cw - (unsigned)(skip_left + skip_right);
+            else
+                print_w = cw;
+        }
+        /* else: imageable-area raster — print_w == cw, no horizontal/vertical strip. */
+    }
+
+    /* Hardware top-origin correction: regardless of path or raster shape,
+     * the printer puts emitted row 0 at paper y=HW_TOP_ORIGIN_100MM (3.7mm).
+     * If declared top_margin > HW_TOP_ORIGIN_100MM, pad blank rows so the
+     * first real content row lands at the declared top_margin. */
+    int pad_top = ((int)options->media.top_margin - HW_TOP_ORIGIN_100MM) * res / 2540;
+    if (pad_top < 0)
+        pad_top = 0;
+
+    jd->skip_left        = skip_left;
+    jd->skip_right       = skip_right;
+    jd->skip_top         = skip_top;
+    jd->skip_bottom      = skip_bottom;
+    jd->pad_top          = pad_top;
+    jd->orig_cups_width  = cw;
+    jd->orig_cups_height = options->header.cupsHeight;
+    jd->print_w          = print_w;
+
+    /* Allocate/resize per-line buffers when print width changes.  Sized to
+     * print_w (post-strip), since that's what we halftone & emit. */
+    if (print_w != jd->page_width) {
+        size_t row1bit    = (print_w + 7u) / 8u;
         size_t packed_max = packbits_max(row1bit);
         unsigned char *hbuf = malloc(row1bit);
         unsigned char *lbuf = malloc(packed_max);
@@ -460,12 +564,21 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
         jd->halftone_buf  = hbuf;
         jd->line_buf      = lbuf;
         jd->line_buf_size = packed_max;
-        jd->page_width    = w;
+        jd->page_width    = print_w;
     }
 
-    papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-        "%s: start page %u: %ux%u px at %ddpi",
-        jd->ctx, page, w, options->header.cupsHeight, jd->resolution);
+    /* Phase 1 geometry log — one line per page, includes everything needed
+     * to debug visible margins from runtime data alone. */
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "%s: geom: rstartpage page=%u format=%s cw=%u ch=%u res=%d "
+        "media L=%d R=%d T=%d B=%d "
+        "skip L=%d R=%d T=%d B=%d pad_top=%d print_w=%u is_pdf=%d",
+        jd->ctx, page, papplJobGetFormat(job),
+        cw, options->header.cupsHeight, res,
+        options->media.left_margin, options->media.right_margin,
+        options->media.top_margin, options->media.bottom_margin,
+        skip_left, skip_right, skip_top, skip_bottom, pad_top, print_w,
+        jd->is_pdf_path ? 1 : 0);
 
     /* PCL raster setup (page 0 only: duplex mode):
      *   ESC &l<N>S     — PCL duplex mode: 0=simplex, 1=long-edge, 2=short-edge
@@ -492,6 +605,22 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
         "\x1b*r0A",   /* start raster at logical page left, cursor Y = logical page top */
         jd->resolution);
     papplDeviceWrite(device, buf, (size_t)n);
+
+    /* Emit pad_top blank rows (all-white halftone) between PCL framing and the
+     * first content row.  A blank row is halftone_buf zeroed (no dots) and
+     * packbits-encoded once; we send it pad_top times. */
+    if (pad_top > 0) {
+        size_t row_bytes = (print_w + 7u) / 8u;
+        memset(jd->halftone_buf, 0, row_bytes);
+        size_t enc = packbits_encode(jd->halftone_buf, row_bytes, jd->line_buf);
+        char   hdr[32];
+        int    hdr_len = snprintf(hdr, sizeof(hdr), "\x1b*b%uW", (unsigned)enc);
+        for (int i = 0; i < pad_top; i++) {
+            papplDeviceWrite(device, hdr, (size_t)hdr_len);
+            papplDeviceWrite(device, jd->line_buf, enc);
+        }
+    }
+
     papplDeviceFlush(device);
     return true;
 }
@@ -501,16 +630,32 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
                                  const unsigned char *line)
 {
     hl5170dn_job_t *jd  = papplJobGetData(job);
-    unsigned        w   = options->header.cupsWidth;
     char            hdr[32];
     int             hdr_len;
     size_t          encoded_len;
 
+    (void)options;
+
+    /* Phase 4: drop rows that fall outside the imageable area for the raster
+     * path.  pdf_filter_cb has already handled vertical stripping for the PDF
+     * path by discarding GS rows, so is_pdf_path => skip_top/bottom are 0. */
+    if (!jd->is_pdf_path) {
+        if (jd->skip_top > 0 && (int)y < jd->skip_top)
+            return true;
+        if (jd->skip_bottom > 0 &&
+            (int)y >= (int)jd->orig_cups_height - jd->skip_bottom)
+            return true;
+        /* Horizontal strip: halftone only the middle [skip_left, skip_left+print_w). */
+        line += jd->skip_left;
+    }
+
+    unsigned w = jd->print_w;
+
     /* Periodic trace: y=0 and every 256 lines thereafter. */
     if ((y % 256) == 0)
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "%s: rwriteline y=%u width=%u line[0]=0x%02x",
-            jd->ctx, y, w, line[0]);
+            "%s: rwriteline y=%u width=%u line[0]=0x%02x is_pdf=%d",
+            jd->ctx, y, w, line[0], jd->is_pdf_path ? 1 : 0);
 
     /* Halftone 8-bit grayscale → 1-bit packed row in halftone_buf.
      * Blue noise dither with gamma correction at all resolutions. */
@@ -975,10 +1120,15 @@ static void fill_media(pappl_media_col_t *m, const char *size_name,
     strncpy(m->size_name, size_name, sizeof(m->size_name) - 1);
     m->size_width    = width_100mm;
     m->size_length   = length_100mm;
-    m->left_margin   = 700;  /* 7mm — measured (job #18) */
-    m->right_margin  = 300;  /* 3mm — measured (job #16) */
-    m->top_margin    = 300;  /* 3mm — measured (job #16) */
-    m->bottom_margin = 500;  /* 5mm — measured (job #18, conservative) */
+    /* Symmetric declared margins (Session 2, plan.md Phase 2): take the worse
+     * (tighter) hardware side on each axis so visible margins are symmetric.
+     *   Horizontal: 7mm (vs 3mm right) — sacrifices ~4mm of reachable right edge.
+     *   Vertical:   5mm (vs 3.7mm top) — sacrifices ~1.3mm of reachable top.
+     * This is the standard conservative trade-off PPD-based drivers make. */
+    m->left_margin   = 700;  /* 7mm */
+    m->right_margin  = 700;  /* 7mm */
+    m->top_margin    = 500;  /* 5mm */
+    m->bottom_margin = 500;  /* 5mm */
     strncpy(m->source, source, sizeof(m->source) - 1);
     strncpy(m->type, "stationery", sizeof(m->type) - 1);
 }
@@ -1383,9 +1533,13 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     unsigned char      *rowbuf    = NULL;
     unsigned            prev_w    = 0;
     unsigned            pagenum   = 0;
-    bool                ok        = false;
+    bool                ok          = false;
     bool                job_started = false;
-    int                 skip_left = 0;  /* set in inner block, used in raster loop */
+    /* All four set in inner block (Phase 3 alignment), used in raster loop. */
+    int                 skip_left   = 0;
+    int                 skip_right  = 0;
+    int                 skip_top    = 0;
+    int                 skip_bottom = 0;
     char                ctx[64];
 
     (void)cbdata;
@@ -1415,6 +1569,15 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     }
     job_started = true;
 
+    /* Mark this job as PDF-path so rstartpage_cb / rwriteline_cb know that
+     * horizontal & vertical stripping is already handled here, and they
+     * should not strip again.  Done immediately after rstartjob_cb creates jd. */
+    {
+        hl5170dn_job_t *jd_mark = papplJobGetData(job);
+        if (jd_mark)
+            jd_mark->is_pdf_path = true;
+    }
+
     {
         hl5170dn_job_t *jd = papplJobGetData(job);
 
@@ -1437,17 +1600,33 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
 
         /* Default path: ESC*r0A places the raster origin at the hardware left
          * boundary, so pixel 0 prints at left_margin mm from the paper edge.
-         * GS renders a full-page canvas (0 to page_width_pts), so the first
-         * left_margin_px pixels of each row correspond to the hardware-unprintable
-         * left zone — they would land left of the printable area and shift all
-         * content right by left_margin.  Strip those pixels so printer pixel 0
-         * corresponds to PDF x = left_margin (the hardware left boundary), giving
-         * correctly centred output.
+         * GS renders a full-page canvas (0 to page_width_pts).  Symmetric
+         * stripping (Phase 3):
+         *   - skip_left  pixels at the start of each row land left of the
+         *     printable area; strip so printer pixel 0 = PDF x = left_margin.
+         *   - skip_right pixels at the end of each row would print past the
+         *     hardware right boundary (3mm from paper right); strip so the
+         *     emitted row ends at PDF x = paper_width - right_margin.
+         *   - skip_top / skip_bottom rows at top/bottom are similarly stripped
+         *     so emitted rows correspond to PDF y in [top_margin, page-bottom_margin].
          *
-         * Fit path: GS renders to the imageable canvas (img_w), which starts at
-         * the hardware boundary; no stripping needed. */
+         * Fit path: GS renders to the imageable canvas (img_w x img_h), which
+         * already represents the printable area; no stripping needed. */
         skip_left = use_fitpage ? 0
             : (int)(options->media.left_margin * (double)res / 2540.0 + 0.5);
+        skip_right = use_fitpage ? 0
+            : (int)(options->media.right_margin * (double)res / 2540.0 + 0.5);
+        skip_top = use_fitpage ? 0
+            : (int)(options->media.top_margin * (double)res / 2540.0 + 0.5);
+        skip_bottom = use_fitpage ? 0
+            : (int)(options->media.bottom_margin * (double)res / 2540.0 + 0.5);
+
+        /* Phase 1 geometry log for PDF path. */
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: geom: pdf_filter gs %dx%d pts res=%d use_fitpage=%d "
+            "skip L=%d R=%d T=%d B=%d",
+            ctx, gs_w_pts, gs_h_pts, res, use_fitpage ? 1 : 0,
+            skip_left, skip_right, skip_top, skip_bottom);
 
         if (use_fitpage) {
             /* print-scaling=fit: scale content to fit within declared margins.
@@ -1530,20 +1709,29 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             goto jobs_done;
 
         /* Update options for this page's geometry.
-         * For the default path, strip skip_left pixels from the left of each row
-         * so the raster sent to the printer starts at the hardware left boundary.
-         * cupsBytesPerLine = print_w: one byte per pixel for SGRAY_8. */
-        int print_w = w - skip_left;
+         * Symmetric stripping (Phase 3): strip skip_left/skip_right horizontally
+         * and skip_top/skip_bottom vertically so the raster sent to the printer
+         * represents exactly the imageable area [left_margin, paper-right_margin] x
+         * [top_margin, paper-bottom_margin].
+         * cupsBytesPerLine = print_w: one byte per pixel for SGRAY_8.
+         * cupsHeight = content_h (post-strip), used by rstartpage_cb for logging
+         * and to decide pad_top regardless of input height. */
+        int print_w  = w - skip_left - skip_right;
+        int content_h = h - skip_top - skip_bottom;
+        if (print_w  <= 0) print_w  = w;
+        if (content_h <= 0) content_h = h;
         options->header.cupsWidth        = (unsigned)print_w;
-        options->header.cupsHeight       = (unsigned)h;
+        options->header.cupsHeight       = (unsigned)content_h;
         options->header.cupsBytesPerLine = (unsigned)print_w;
 
         papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
-            "%s: pdf_filter: page %u: %dx%d px (gs %dx%d, skip_left=%d)",
-            ctx, pagenum, print_w, h, w, h, skip_left);
+            "%s: pdf_filter: page %u: emit %dx%d px (gs %dx%d, "
+            "skip L=%d R=%d T=%d B=%d)",
+            ctx, pagenum, print_w, content_h, w, h,
+            skip_left, skip_right, skip_top, skip_bottom);
 
         /* Grow row buffer if this page is wider than previous pages.
-         * Allocate for the full GS width w (we read the whole row before skipping). */
+         * Allocate for the full GS width w (we read the whole row before slicing). */
         if ((unsigned)w > prev_w) {
             free(rowbuf);
             rowbuf = malloc((size_t)w);
@@ -1555,9 +1743,28 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             prev_w = (unsigned)w;
         }
 
-        drv.rstartpage_cb(job, options, device, pagenum);
+        /* Discard skip_top rows from GS stream before any rwriteline_cb calls.
+         * The PCL framing (incl. pad_top blank rows) is emitted by rstartpage_cb;
+         * GS rows in [0, skip_top) lie above the printable top boundary. */
+        bool page_started = false;
+        for (int y = 0; y < skip_top && page_ok; y++) {
+            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
+                papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                    "%s: pdf_filter: short read on top discard y=%d page %u: %s",
+                    ctx, y, pagenum, strerror(errno));
+                page_ok = false;
+            }
+        }
 
-        for (int y = 0; y < h && page_ok && !papplJobIsCanceled(job); y++) {
+        if (page_ok) {
+            drv.rstartpage_cb(job, options, device, pagenum);
+            page_started = true;
+        }
+
+        /* Emit content rows.  y in [0, content_h) maps to GS rows
+         * [skip_top, h - skip_bottom).  rwriteline_cb halftones cupsWidth=print_w
+         * bytes starting at rowbuf + skip_left. */
+        for (int y = 0; y < content_h && page_ok && !papplJobIsCanceled(job); y++) {
             if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
                     "%s: pdf_filter: short read y=%d page %u: %s",
@@ -1568,10 +1775,25 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             }
         }
 
-        if (!papplJobIsCanceled(job))
+        /* Drain the remaining skip_bottom GS rows so the stream stays in sync
+         * for the next page's P5 magic.  Skipped if the job was cancelled —
+         * the GS pipe will be closed by pclose() shortly after. */
+        for (int y = 0; y < skip_bottom && page_ok && !papplJobIsCanceled(job); y++) {
+            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
+                papplLogJob(job, PAPPL_LOGLEVEL_WARN,
+                    "%s: pdf_filter: short read on bottom discard y=%d page %u",
+                    ctx, y, pagenum);
+                page_ok = false;
+            }
+        }
+
+        /* Only call rendpage_cb if rstartpage_cb was called (otherwise the
+         * PCL state is inconsistent — no page started, nothing to end). */
+        if (page_started && !papplJobIsCanceled(job))
             drv.rendpage_cb(job, options, device, pagenum);
 
-        pagenum++;
+        if (page_started)
+            pagenum++;
         if (!page_ok || papplJobIsCanceled(job))
             break;
     }

@@ -27,19 +27,18 @@ git commit -m "message"
 git push
 
 # 3. Pull, build, and install on the Pi
-ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && git pull && make && sudo make install"
+ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && git pull && make"
 ```
 
-`sudo make install` builds the binary and restarts the service. Always use this
-form — never `sudo systemctl restart` directly.
-
-`sudo make install` needs an interactive terminal for the password. If it fails
-with "a terminal is required to read the password", ask the user to run it once
-manually in their own terminal (this caches the sudo credential for ~15 min):
+Agents deploy using the NOPASSWD script installed at `/usr/local/sbin/pi-printer-deploy`:
 
 ```bash
-ssh tuttle@tuttle-pi.local "cd /home/tuttle/pi-printer && sudo make install"
+# After git pull && make on the Pi:
+ssh tuttle@tuttle-pi.local "sudo /usr/local/sbin/pi-printer-deploy"
 ```
+
+This stops the service, installs the new binary, and restarts it — no password required.
+Use `sudo make install` only when the service file or udev rules change (requires interactive sudo).
 
 ## Known PAPPL API gaps
 

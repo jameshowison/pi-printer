@@ -14,7 +14,7 @@ TARGET  = hl5170dn-printer-app
 SRCS = src/main.c src/driver.c src/pjl.c src/packbits.c
 OBJS = $(SRCS:.c=.o)
 
-.PHONY: all clean install pdfs
+.PHONY: all clean install redeploy pdfs
 
 all: $(TARGET)
 
@@ -59,6 +59,9 @@ src/packbits.o: src/packbits.c src/packbits.h
 
 clean:
 	rm -f $(OBJS) $(TARGET) .git-hash-*
+
+redeploy: $(TARGET)
+	sudo /usr/local/sbin/pi-printer-deploy
 
 install: $(TARGET)
 	systemctl stop hl5170dn-printer-app || true
