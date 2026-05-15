@@ -1079,10 +1079,8 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
      * macOS knows the imageable area and applies client-side scaling for
      * "Scale to Fit: Print Entire Image". Without these, PAPPL advertises 0
      * (borderless) and macOS never scales. */
-    data->left_margin   = 500;
-    data->right_margin  = 500;
-    data->top_margin    = 500;
-    data->bottom_margin = 500;
+    data->left_right = 500;   /* left + right margins: 5 mm each */
+    data->bottom_top = 500;   /* bottom + top margins: 5 mm each */
 
     /* Media types (IPP names).  PJL names in type_to_pjl(). */
     data->num_type = 8;
