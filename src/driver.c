@@ -90,6 +90,11 @@ typedef struct {
     unsigned       orig_cups_width; /* options->header.cupsWidth as PAPPL sees it */
     unsigned       orig_cups_height;/* options->header.cupsHeight as PAPPL sees it */
     unsigned       print_w;         /* pixels actually halftoned & emitted */
+
+    /* Raster-path GS halftone: temp PGM accumulator for the current page. */
+    char           pgm_path[64];   /* /tmp/hl5170dn-raster-<jobid>-<page>.pgm */
+    FILE          *pgm_fp;         /* open for write during rwriteline_cb */
+    unsigned       pgm_content_h;  /* rows written into the PGM */
 } hl5170dn_job_t;
 
 /* ---- Phase 4: rich job-context prefix --------------------------------- */
@@ -139,59 +144,6 @@ static void make_job_ctx(pappl_job_t *job, char *buf, size_t bufsz)
 
     strncpy(buf, tmp, bufsz - 1);
     buf[bufsz - 1] = '\0';
-}
-
-/* ---- Halftoning ------------------------------------------------------- */
-
-/* 16×16 blue noise dither matrix, gamma-corrected for laser dot gain.
- *
- * Base: void-and-cluster blue noise (from hp-printer-app / Michael Sweet).
- * Correction formula: threshold = 255 - 255*(1 - raw/255)^0.55
- *   Exponent 0.55 is tuned for this printer: slightly above the pure sRGB
- *   inverse gamma (0.4545) to account for the HL-5170DN's dot gain on
- *   standard copy paper.  A 50% gray input prints ~28% of dots, which
- *   fuse/spread to give perceptually 50% coverage.
- *   (To adjust: increase exponent → darker; decrease → lighter.)
- *
- * Convention: pixel < threshold → print black dot  (0=black, 255=white)
- * Applied at all resolutions (300 and 600 dpi).
- *
- * Coverage curve for reference:
- *   V=  0 (black): ~100% dots   V=128 (50% gray): ~28% dots
- *   V= 64 (dark):  ~59% dots    V=192 (light):     ~8% dots
- *   V=255 (white):   0% dots
- */
-static const unsigned char dither16[16][16] = {
-    {  69,  28,  92, 109,  70, 140,  42, 122, 146,  29,  99,  57,  39,  21,  51, 233 },
-    {  14,  60, 199, 172,  18, 226,  97,  11,  22,  65, 169, 116, 139,  89,   7, 113 },
-    {  79, 123,  47,   8,  38, 118,  77,  52, 160,  83, 217,  13,  72,  31, 182, 159 },
-    {  23, 148, 100,  84, 134,  64,  31, 194, 108,  36,   1, 126,  46, 203,  96,  40 },
-    {   1, 210,  33,  55, 184,   3, 150,  16, 132,  62,  94, 152,  19,  56, 135,  66 },
-    { 174, 110,  71,  20, 162, 103,  90,  41, 212,  50, 178,  28,  80, 105,   9,  87 },
-    {  50, 141,  12, 243,  45,  26, 124,  72,   7,  23, 115,  65, 237, 121, 158,  34 },
-    {  61, 125,  94,  77, 117,  59, 192,  82, 163,  98, 144,   4,  43,  15, 197,  25 },
-    { 187,  18,  41,   6, 151,  34,  10, 138,  53,  35,  69, 171,  90,  52,  75, 101 },
-    { 154,  83, 208, 107, 175,  68,  19, 220, 111,  13, 190, 129,  30, 143, 117,   3 },
-    {  67, 133,  29,  54,  88, 131, 102,  46,  27,  86,  60, 104,  20, 223,  58,  37 },
-    {   9,  44, 168,  22,   0,  39, 181,  76, 142, 201,   2,  44,  80,  11, 179,  93 },
-    { 214, 120,  75, 145, 229,  63,  95,   8, 156, 119,  67, 167, 137,  49, 149, 109 },
-    {  16,  56,  98,  12, 112, 127,  32,  17,  54,  37,  24,  91, 114,  33,  73,  26 },
-    { 164, 189,  36,  81,  48, 196, 165,  74, 106, 255, 130,  15, 205,  62,   2,  85 },
-    {  43, 136,   5, 157,  25,  58,   4,  87, 185,  48,   6,  78, 176, 153, 103, 128 },
-};
-
-/* Blue noise ordered dither: 8-bit grayscale → 1-bit packed (1=black).
- * Used at all resolutions; the gamma correction baked into dither16 makes
- * the 300 dpi path look as good as the old 600 dpi clustered-dot path. */
-static void dither_row_bn(const unsigned char *src, unsigned char *dst,
-                          unsigned w, unsigned y)
-{
-    unsigned row = y & 15u;
-    memset(dst, 0, (w + 7u) / 8u);
-    for (unsigned x = 0; x < w; x++) {
-        if (src[x] < dither16[row][x & 15u])
-            dst[x >> 3] |= (unsigned char)(0x80u >> (x & 7u));
-    }
 }
 
 /* Extract count bits from a PBM P4 packed row starting at bit start_bit.
@@ -682,6 +634,31 @@ static bool hl5170dn_rstartpage(pappl_job_t *job, pappl_pr_options_t *options,
         jd->page_width    = print_w;
     }
 
+    /* Raster path: open a temp PGM to accumulate 8-bit rows for GS halftoning
+     * in rendpage_cb.  The PGM content height is the stripped row count. */
+    if (!jd->is_pdf_path) {
+        if (jd->pgm_fp) { fclose(jd->pgm_fp); jd->pgm_fp = NULL; }
+
+        unsigned content_h = jd->orig_cups_height
+                             - (unsigned)(jd->skip_top + jd->skip_bottom);
+        if (content_h == 0 || content_h > jd->orig_cups_height)
+            content_h = jd->orig_cups_height;
+        jd->pgm_content_h = content_h;
+
+        snprintf(jd->pgm_path, sizeof(jd->pgm_path),
+                 "/tmp/hl5170dn-raster-%d-%u.pgm",
+                 papplJobGetID(job), page);
+
+        jd->pgm_fp = fopen(jd->pgm_path, "wb");
+        if (!jd->pgm_fp) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: rstartpage: cannot open PGM %s: %s",
+                jd->ctx, jd->pgm_path, strerror(errno));
+            return false;
+        }
+        fprintf(jd->pgm_fp, "P5\n%u %u\n255\n", print_w, content_h);
+    }
+
     /* Phase 1 geometry log — one line per page, includes everything needed
      * to debug visible margins from runtime data alone. */
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
@@ -744,23 +721,18 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
                                  pappl_device_t *device, unsigned y,
                                  const unsigned char *line)
 {
-    hl5170dn_job_t *jd  = papplJobGetData(job);
-    char            hdr[32];
-    int             hdr_len;
-    size_t          encoded_len;
+    hl5170dn_job_t *jd = papplJobGetData(job);
 
     (void)options;
+    (void)device;
 
-    /* Phase 4: drop rows that fall outside the imageable area for the raster
-     * path.  pdf_filter_cb has already handled vertical stripping for the PDF
-     * path by discarding GS rows, so is_pdf_path => skip_top/bottom are 0. */
+    /* Drop rows outside the imageable area (pdf path already strips these). */
     if (!jd->is_pdf_path) {
         if (jd->skip_top > 0 && (int)y < jd->skip_top)
             return true;
         if (jd->skip_bottom > 0 &&
             (int)y >= (int)jd->orig_cups_height - jd->skip_bottom)
             return true;
-        /* Horizontal strip: halftone only the middle [skip_left, skip_left+print_w). */
         line += jd->skip_left;
     }
 
@@ -772,16 +744,9 @@ static bool hl5170dn_rwriteline(pappl_job_t *job, pappl_pr_options_t *options,
             "%s: rwriteline y=%u width=%u line[0]=0x%02x is_pdf=%d",
             jd->ctx, y, w, line[0], jd->is_pdf_path ? 1 : 0);
 
-    /* Halftone 8-bit grayscale → 1-bit packed row in halftone_buf.
-     * Blue noise dither with gamma correction at all resolutions. */
-    dither_row_bn(line, jd->halftone_buf, w, y);
-
-    encoded_len = packbits_encode(jd->halftone_buf, (w + 7u) / 8u, jd->line_buf);
-
-    /* PCL transfer raster data: ESC *b <count> W <data> */
-    hdr_len = snprintf(hdr, sizeof(hdr), "\x1b*b%uW", (unsigned)encoded_len);
-    papplDeviceWrite(device, hdr, (size_t)hdr_len);
-    papplDeviceWrite(device, jd->line_buf, encoded_len);
+    /* Buffer 8-bit row to PGM; GS halftones the full page in rendpage_cb. */
+    if (jd->pgm_fp)
+        fwrite(line, 1, (size_t)w, jd->pgm_fp);
 
     return true;
 }
@@ -793,11 +758,132 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
         "\x1b*rC"   /* ESC *r C — end raster transfer */
         "\x0c";     /* form feed — advance page (duplex: hold and flip) */
 
-    (void)options;
-
-    hl5170dn_job_t *jd2 = papplJobGetData(job);
+    hl5170dn_job_t *jd = papplJobGetData(job);
     papplLogJob(job, PAPPL_LOGLEVEL_DEBUG, "%s: end page %u",
-        jd2 ? jd2->ctx : "?", page);
+        jd ? jd->ctx : "?", page);
+
+    if (jd && !jd->is_pdf_path && jd->pgm_path[0]) {
+        /* Close the PGM accumulator. */
+        if (jd->pgm_fp) { fclose(jd->pgm_fp); jd->pgm_fp = NULL; }
+
+        int res = jd->resolution;
+        double w_pts = jd->print_w       * 72.0 / res;
+        double h_pts = jd->pgm_content_h * 72.0 / res;
+
+        /* GS cannot interpret PGM directly (it treats all inputs as PS/PDF).
+         * Write a PS wrapper that opens the PGM and feeds pixels via `image`. */
+        char pgm_hdr[64];
+        int  pgm_hdr_size = snprintf(pgm_hdr, sizeof(pgm_hdr),
+                                     "P5\n%u %u\n255\n",
+                                     jd->print_w, jd->pgm_content_h);
+
+        char ps_path[72];
+        snprintf(ps_path, sizeof(ps_path),
+                 "/tmp/hl5170dn-raster-%d-%u.ps",
+                 papplJobGetID(job), page);
+        FILE *ps_fp = fopen(ps_path, "w");
+        if (!ps_fp) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: rendpage: cannot create PS wrapper %s: %s",
+                jd->ctx, ps_path, strerror(errno));
+        } else {
+            fprintf(ps_fp,
+                "%%!PS\n/W %u def\n/H %u def\n"
+                "/f (%s) (r) file def\n"
+                "%d { f read pop } repeat\n"
+                "W H 8 [W 0 0 H neg 0 H] { f W string readstring pop } image\n"
+                "showpage\n",
+                jd->print_w, jd->pgm_content_h,
+                jd->pgm_path, pgm_hdr_size);
+            fclose(ps_fp);
+            papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
+                "%s: rendpage: PS wrapper %s: W=%u H=%u hdr=%d",
+                jd->ctx, ps_path, jd->print_w, jd->pgm_content_h, pgm_hdr_size);
+        }
+
+        char gs_cmd[512];
+        snprintf(gs_cmd, sizeof(gs_cmd),
+            "gs -q -dBATCH -dNOPAUSE -dNOSAFER -sDEVICE=pbmraw -r%d"
+            " -dFIXEDMEDIA"
+            " -dDEVICEWIDTHPOINTS=%.4f"
+            " -dDEVICEHEIGHTPOINTS=%.4f"
+            " -sOutputFile=- '%s'"
+            " 2>/tmp/hl5170dn-gs-raster.log",
+            res, w_pts, h_pts, ps_path);
+
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: raster gs cmd: %s", jd->ctx, gs_cmd);
+
+        FILE *gs = popen(gs_cmd, "r");
+        if (!gs) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: rendpage: popen gs failed: %s", jd->ctx, strerror(errno));
+            unlink(jd->pgm_path);  unlink(ps_path);
+            jd->pgm_path[0] = '\0';
+            papplDeviceWrite(device, end_page, sizeof(end_page) - 1);
+            papplDeviceFlush(device);
+            return false;
+        }
+
+        /* Parse P4 PBM header: magic, optional # comments, width height. */
+        char magic[8] = {0};
+        int  nread = fscanf(gs, "%7s", magic);
+        if (nread != 1 || strcmp(magic, "P4") != 0) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: rendpage: GS output is not P4 PBM (nread=%d magic='%s')",
+                jd->ctx, nread, magic);
+            pclose(gs);
+            unlink(jd->pgm_path);  unlink(ps_path);
+            jd->pgm_path[0] = '\0';
+            papplDeviceWrite(device, end_page, sizeof(end_page) - 1);
+            papplDeviceFlush(device);
+            return false;
+        }
+        /* Skip whitespace and any # comment lines. */
+        int c;
+        while ((c = fgetc(gs)) != EOF && (c == ' ' || c == '\t' || c == '\r' || c == '\n'))
+            ;
+        while (c == '#') {
+            while ((c = fgetc(gs)) != EOF && c != '\n')
+                ;
+            while ((c = fgetc(gs)) != EOF && (c == ' ' || c == '\t' || c == '\r' || c == '\n'))
+                ;
+        }
+        ungetc(c, gs);
+
+        unsigned pbm_w = 0, pbm_h = 0;
+        if (fscanf(gs, "%u %u", &pbm_w, &pbm_h) != 2 || pbm_w == 0 || pbm_h == 0) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: rendpage: bad PBM dimensions %u×%u", jd->ctx, pbm_w, pbm_h);
+            pclose(gs);
+            unlink(jd->pgm_path);  unlink(ps_path);
+            jd->pgm_path[0] = '\0';
+            papplDeviceWrite(device, end_page, sizeof(end_page) - 1);
+            papplDeviceFlush(device);
+            return false;
+        }
+        /* Consume exactly one whitespace byte after the header. */
+        fgetc(gs);
+
+        size_t row_bytes = (pbm_w + 7u) / 8u;
+        char   hdr[32];
+
+        for (unsigned y = 0; y < pbm_h && !papplJobIsCanceled(job); y++) {
+            if (fread(jd->halftone_buf, 1, row_bytes, gs) != row_bytes)
+                break;
+            size_t enc = packbits_encode(jd->halftone_buf, row_bytes, jd->line_buf);
+            int    hdr_len = snprintf(hdr, sizeof(hdr), "\x1b*b%uW", (unsigned)enc);
+            papplDeviceWrite(device, hdr, (size_t)hdr_len);
+            papplDeviceWrite(device, jd->line_buf, enc);
+        }
+
+        pclose(gs);
+        unlink(jd->pgm_path);
+        unlink(ps_path);
+        jd->pgm_path[0] = '\0';
+    }
+
+    (void)options;
     papplDeviceWrite(device, end_page, sizeof(end_page) - 1);
     papplDeviceFlush(device);
     return true;
@@ -816,6 +902,9 @@ static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
         jd->ctx, (long)(time(NULL) - jd->start_time));
 
     pjl_write_job_trailer(device, /*restore_powersave=*/true);
+
+    if (jd->pgm_fp)      { fclose(jd->pgm_fp); jd->pgm_fp = NULL; }
+    if (jd->pgm_path[0]) { unlink(jd->pgm_path); jd->pgm_path[0] = '\0'; }
 
     free(jd->halftone_buf);
     free(jd->line_buf);
