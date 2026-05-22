@@ -194,6 +194,31 @@ static void dither_row_bn(const unsigned char *src, unsigned char *dst,
     }
 }
 
+/* Extract count bits from a PBM P4 packed row starting at bit start_bit.
+ * PBM uses MSB-first packing. dst must be at least (count+7)/8 + 1 bytes
+ * (the +1 allows the shift path to safely read one byte past the last full
+ * source byte without a bounds check in the inner loop). */
+static void extract_pbm_row(const unsigned char *src, unsigned char *dst,
+                             int start_bit, int count)
+{
+    int sb    = start_bit >> 3;
+    int shift = start_bit & 7;
+    int db    = (count + 7) / 8;
+
+    if (shift == 0) {
+        memcpy(dst, src + sb, (size_t)db);
+    } else {
+        for (int i = 0; i < db; i++) {
+            dst[i] = (unsigned char)(
+                (src[sb + i] << shift) | (src[sb + i + 1] >> (8 - shift))
+            );
+        }
+    }
+    int tail = count & 7;
+    if (tail)
+        dst[db - 1] &= (unsigned char)(0xFF << (8 - tail));
+}
+
 /* ---- IPP → PJL mapping helpers --------------------------------------- */
 
 static const char *size_name_to_pjl(const char *name)
@@ -1635,7 +1660,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
     make_job_ctx(job, ctx, sizeof(ctx));
 
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
-        "%s: pdf_filter: '%s' via gs pgmraw (streaming)", ctx, filename);
+        "%s: pdf_filter: '%s' via gs pbmraw (GS halftone, streaming)", ctx, filename);
 
     options = papplJobCreatePrintOptions(job, (unsigned)INT_MAX, false);
     if (!options) {
@@ -1734,7 +1759,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
 
             snprintf(gs_cmd, sizeof(gs_cmd),
                 "gs -dBATCH -dNOPAUSE -dSAFE "
-                "-sDEVICE=pgmraw -r%d "
+                "-sDEVICE=pbmraw -r%d "
                 "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
                 "-dFitPage "
                 "-sOutputFile=- '%s'",
@@ -1748,7 +1773,7 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
              * compensate for the ESC*r0A hardware-boundary shift (job #18). */
             snprintf(gs_cmd, sizeof(gs_cmd),
                 "gs -dBATCH -dNOPAUSE -dSAFE "
-                "-sDEVICE=pgmraw -r%d "
+                "-sDEVICE=pbmraw -r%d "
                 "-dFIXEDMEDIA -dDEVICEWIDTHPOINTS=%d -dDEVICEHEIGHTPOINTS=%d "
                 "-sOutputFile=- '%s'",
                 res, gs_w_pts, gs_h_pts, filename);
@@ -1765,19 +1790,20 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         goto done;
     }
 
-    /* Each P5 block in the stream is one page of the PDF. */
+    /* Each P4 block in the stream is one page of the PDF.
+     * PBM P4 header: "P4\n[#comment\n...]<w> <h>\n" — no maxval line. */
     while (fgets(line, sizeof(line), gs)) {
         int    w, h;
         bool   page_ok = true;
 
-        if (strncmp(line, "P5", 2) != 0)
+        if (strncmp(line, "P4", 2) != 0)
             continue;
 
         /* Stop at next page boundary if job was cancelled. */
         if (papplJobIsCanceled(job))
             goto jobs_done;
 
-        /* Skip optional comment lines after the P5 magic. */
+        /* Skip optional comment lines after the P4 magic. */
         do {
             if (!fgets(line, sizeof(line), gs))
                 goto jobs_done;
@@ -1786,20 +1812,18 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         /* "width height" line */
         if (sscanf(line, "%d %d", &w, &h) != 2 || w <= 0 || h <= 0) {
             papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                "%s: pdf_filter: bad PGM dimensions on page %u", ctx, pagenum);
+                "%s: pdf_filter: bad PBM dimensions on page %u", ctx, pagenum);
             break;
         }
-
-        /* maxval line (always "255\n" from GS pgmraw) — consume and discard */
-        if (!fgets(line, sizeof(line), gs))
-            goto jobs_done;
+        /* No maxval line in PBM P4 — binary data begins immediately. */
 
         /* Update options for this page's geometry.
          * Symmetric stripping (Phase 3): strip skip_left/skip_right horizontally
          * and skip_top/skip_bottom vertically so the raster sent to the printer
          * represents exactly the imageable area [left_margin, paper-right_margin] x
          * [top_margin, paper-bottom_margin].
-         * cupsBytesPerLine = print_w: one byte per pixel for SGRAY_8.
+         * cupsBytesPerLine = print_w: used by rstartpage_cb to size halftone_buf
+         * and line_buf (both sized for print_w pixels of 1-bit packed data).
          * cupsHeight = content_h (post-strip), used by rstartpage_cb for logging
          * and to decide pad_top regardless of input height. */
         int print_w  = w - skip_left - skip_right;
@@ -1817,10 +1841,12 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             skip_left, skip_right, skip_top, skip_bottom);
 
         /* Grow row buffer if this page is wider than previous pages.
-         * Allocate for the full GS width w (we read the whole row before slicing). */
+         * Allocate for the full GS width w in PBM packed format: (w+7)/8 bytes.
+         * +1 extra byte so extract_pbm_row's shift path can read one byte past
+         * the last full source byte without a bounds check. */
         if ((unsigned)w > prev_w) {
             free(rowbuf);
-            rowbuf = malloc((size_t)w);
+            rowbuf = malloc((size_t)((w + 7) / 8) + 1);
             if (!rowbuf) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
                     "%s: pdf_filter: OOM for row buffer on page %u", ctx, pagenum);
@@ -1829,12 +1855,14 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             prev_w = (unsigned)w;
         }
 
-        /* Discard skip_top rows from GS stream before any rwriteline_cb calls.
+        /* Discard skip_top rows from GS stream before any row emission.
          * The PCL framing (incl. pad_top blank rows) is emitted by rstartpage_cb;
-         * GS rows in [0, skip_top) lie above the printable top boundary. */
+         * GS rows in [0, skip_top) lie above the printable top boundary.
+         * PBM row size is (w+7)/8 packed bytes. */
+        size_t pbm_row_bytes = (size_t)((w + 7) / 8);
         bool page_started = false;
         for (int y = 0; y < skip_top && page_ok; y++) {
-            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
+            if (fread(rowbuf, 1, pbm_row_bytes, gs) != pbm_row_bytes) {
                 papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
                     "%s: pdf_filter: short read on top discard y=%d page %u: %s",
                     ctx, y, pagenum, strerror(errno));
@@ -1848,24 +1876,37 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         }
 
         /* Emit content rows.  y in [0, content_h) maps to GS rows
-         * [skip_top, h - skip_bottom).  rwriteline_cb halftones cupsWidth=print_w
-         * bytes starting at rowbuf + skip_left. */
-        for (int y = 0; y < content_h && page_ok && !papplJobIsCanceled(job); y++) {
-            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
-                papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
-                    "%s: pdf_filter: short read y=%d page %u: %s",
-                    ctx, y, pagenum, strerror(errno));
-                page_ok = false;
-            } else {
-                drv.rwriteline_cb(job, options, device, (unsigned)y, rowbuf + skip_left);
+         * [skip_top, h - skip_bottom).  GS has already halftoned to 1-bit;
+         * extract_pbm_row pulls print_w bits starting at skip_left from the
+         * packed row (handles the non-byte-aligned skip_left case), then we
+         * packbits-encode and write directly — bypassing rwriteline_cb. */
+        {
+            hl5170dn_job_t *jd = papplJobGetData(job);
+            for (int y = 0; y < content_h && page_ok && !papplJobIsCanceled(job); y++) {
+                if (fread(rowbuf, 1, pbm_row_bytes, gs) != pbm_row_bytes) {
+                    papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                        "%s: pdf_filter: short read y=%d page %u: %s",
+                        ctx, y, pagenum, strerror(errno));
+                    page_ok = false;
+                } else {
+                    extract_pbm_row(rowbuf, jd->halftone_buf, skip_left, print_w);
+                    size_t enc = packbits_encode(jd->halftone_buf,
+                                                 (size_t)(print_w + 7) / 8u,
+                                                 jd->line_buf);
+                    char   pcl_hdr[32];
+                    int    pcl_hdr_len = snprintf(pcl_hdr, sizeof(pcl_hdr),
+                                                  "\x1b*b%uW", (unsigned)enc);
+                    papplDeviceWrite(device, pcl_hdr, (size_t)pcl_hdr_len);
+                    papplDeviceWrite(device, jd->line_buf, enc);
+                }
             }
         }
 
         /* Drain the remaining skip_bottom GS rows so the stream stays in sync
-         * for the next page's P5 magic.  Skipped if the job was cancelled —
+         * for the next page's P4 magic.  Skipped if the job was cancelled —
          * the GS pipe will be closed by pclose() shortly after. */
         for (int y = 0; y < skip_bottom && page_ok && !papplJobIsCanceled(job); y++) {
-            if (fread(rowbuf, 1, (size_t)w, gs) != (size_t)w) {
+            if (fread(rowbuf, 1, pbm_row_bytes, gs) != pbm_row_bytes) {
                 papplLogJob(job, PAPPL_LOGLEVEL_WARN,
                     "%s: pdf_filter: short read on bottom discard y=%d page %u",
                     ctx, y, pagenum);
