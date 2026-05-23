@@ -947,8 +947,9 @@ static void hl5170dn_identify(pappl_printer_t *printer,
 
 /* ---- Supply baseline helpers ------------------------------------------ */
 
-#define TONER_RATED_PAGES  6700
 #define DRUM_RATED_PAGES   25000
+#define TONER_RATED_TN570  6700   /* TN-570 high yield  */
+#define TONER_RATED_TN540  3300   /* TN-540 standard    */
 #define SUPPLY_CONF_DIR    "/var/lib/hl5170dn-printer-app"
 #define SUPPLY_CONF_PATH   "/var/lib/hl5170dn-printer-app/supply-baselines.conf"
 
@@ -958,38 +959,61 @@ typedef struct {
     long last_page_count;    /* -1 = never polled */
     long toner_reset_time;   /* unix timestamp, 0 = never recorded */
     long drum_reset_time;    /* unix timestamp, 0 = never recorded */
+    long toner_rated_pages;  /* 6700 (TN-570) or 3300 (TN-540); default TN-570 */
+    int  pjl_code;           /* last polled PJL code, 0 = never */
+    char pjl_display[64];    /* last DISPLAY= string */
+    int  pjl_online;         /* last ONLINE= value */
+    long pjl_poll_time;      /* unix timestamp of last successful poll */
 } supply_baselines_t;
 
 static void read_baselines(supply_baselines_t *b)
 {
-    b->toner_baseline  = 0;
-    b->drum_baseline   = 0;
-    b->last_page_count = -1;
+    b->toner_baseline   = 0;
+    b->drum_baseline    = 0;
+    b->last_page_count  = -1;
     b->toner_reset_time = 0;
     b->drum_reset_time  = 0;
+    b->toner_rated_pages = TONER_RATED_TN570;
+    b->pjl_code         = 0;
+    b->pjl_display[0]   = '\0';
+    b->pjl_online       = 0;
+    b->pjl_poll_time    = 0;
 
     FILE *f = fopen(SUPPLY_CONF_PATH, "r");
     if (!f)
         return;
 
-    char line[128];
+    char line[256];
     while (fgets(line, sizeof(line), f)) {
         char *eq = strchr(line, '=');
         if (!eq)
             continue;
         *eq = '\0';
         char *key = line;
-        long  val = atol(eq + 1);
+        char *val = eq + 1;
+        /* Strip trailing newline from val. */
+        val[strcspn(val, "\r\n")] = '\0';
+        long lval = atol(val);
         if (strcmp(key, "toner_baseline") == 0)
-            b->toner_baseline = val;
+            b->toner_baseline = lval;
         else if (strcmp(key, "drum_baseline") == 0)
-            b->drum_baseline = val;
+            b->drum_baseline = lval;
         else if (strcmp(key, "last_page_count") == 0)
-            b->last_page_count = val;
+            b->last_page_count = lval;
         else if (strcmp(key, "toner_reset_time") == 0)
-            b->toner_reset_time = val;
+            b->toner_reset_time = lval;
         else if (strcmp(key, "drum_reset_time") == 0)
-            b->drum_reset_time = val;
+            b->drum_reset_time = lval;
+        else if (strcmp(key, "toner_rated_pages") == 0)
+            b->toner_rated_pages = lval > 0 ? lval : TONER_RATED_TN570;
+        else if (strcmp(key, "pjl_code") == 0)
+            b->pjl_code = (int)lval;
+        else if (strcmp(key, "pjl_display") == 0)
+            snprintf(b->pjl_display, sizeof(b->pjl_display), "%s", val);
+        else if (strcmp(key, "pjl_online") == 0)
+            b->pjl_online = (int)lval;
+        else if (strcmp(key, "pjl_poll_time") == 0)
+            b->pjl_poll_time = lval;
     }
     fclose(f);
 }
@@ -1006,9 +1030,13 @@ static void write_conf(const supply_baselines_t *b)
         return;
     fprintf(f,
             "toner_baseline=%ld\ndrum_baseline=%ld\nlast_page_count=%ld\n"
-            "toner_reset_time=%ld\ndrum_reset_time=%ld\n",
+            "toner_reset_time=%ld\ndrum_reset_time=%ld\n"
+            "toner_rated_pages=%ld\n"
+            "pjl_code=%d\npjl_display=%s\npjl_online=%d\npjl_poll_time=%ld\n",
             b->toner_baseline, b->drum_baseline, b->last_page_count,
-            b->toner_reset_time, b->drum_reset_time);
+            b->toner_reset_time, b->drum_reset_time,
+            b->toner_rated_pages,
+            b->pjl_code, b->pjl_display, b->pjl_online, b->pjl_poll_time);
     fclose(f);
     rename(tmp, SUPPLY_CONF_PATH);
 }
@@ -1022,6 +1050,40 @@ static int supply_level(long total_pages, long baseline, long rated)
     if (level < 0)   level = 0;
     if (level > 100) level = 100;
     return (int)level;
+}
+
+/* PJL status code descriptions and corresponding LED states for HL-5170DN.
+ * led_status: "green" | "red" | "red-blink" | "off"
+ * led_toner/drum/paper: "green" | "off" */
+typedef struct {
+    int         code;
+    const char *description;
+    const char *action;
+    const char *led_status;
+    const char *led_toner;
+    const char *led_drum;
+    const char *led_paper;
+} pjl_code_info_t;
+
+static const pjl_code_info_t pjl_code_table[] = {
+    { 10001, "Ready",             "",                                          "green",     "off",   "off",   "off"   },
+    { 10005, "Power save (sleep)","",                                          "green",     "off",   "off",   "off"   },
+    { 40000, "Power save (sleep)","",                                          "green",     "off",   "off",   "off"   },
+    { 40021, "No paper",          "Load paper in the tray",                    "red-blink", "off",   "off",   "green" },
+    { 40022, "Paper jam",         "Clear the paper jam",                       "red-blink", "off",   "off",   "green" },
+    { 40023, "Cover open",        "Close the front cover",                     "red-blink", "off",   "off",   "off"   },
+    { 40038, "Toner very low",    "Replace or shake the toner cartridge",      "red",       "green", "off",   "off"   },
+    { 40039, "Toner low",         "Prepare a replacement toner cartridge",     "green",     "green", "off",   "off"   },
+    { 40050, "Drum end",          "Replace drum unit (DR-580)",                "red",       "off",   "green", "off"   },
+    {     0, NULL, NULL, NULL, NULL, NULL, NULL }
+};
+
+static const pjl_code_info_t *pjl_code_lookup(int code)
+{
+    for (int i = 0; pjl_code_table[i].description; i++)
+        if (pjl_code_table[i].code == code)
+            return &pjl_code_table[i];
+    return NULL;
 }
 
 static bool hl5170dn_status(pappl_printer_t *printer)
@@ -1086,10 +1148,11 @@ static bool hl5170dn_status(pappl_printer_t *printer)
 
     papplPrinterCloseDevice(printer);
 
-    /* Parse CODE=, ONLINE=, and PAGECOUNT= from the (possibly combined) buffer. */
+    /* Parse CODE=, DISPLAY=, ONLINE=, and PAGECOUNT= from the combined buffer. */
     int  code       = -1;
     bool online     = false;
     long page_count = -1;
+    char display[64] = "";
     char *p;
     if ((p = strstr(buf, "CODE=")) != NULL)
         code = atoi(p + 5);
@@ -1097,18 +1160,65 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         online = (strncmp(p + 7, "TRUE", 4) == 0);
     if ((p = strstr(buf, "PAGECOUNT=")) != NULL)
         page_count = atol(p + 10);
+    if ((p = strstr(buf, "DISPLAY=")) != NULL) {
+        p += 8;
+        if (*p == '"') p++;
+        char *end = p;
+        while (*end && *end != '"' && *end != '\r' && *end != '\n') end++;
+        size_t len = (size_t)(end - p);
+        if (len >= sizeof(display)) len = sizeof(display) - 1;
+        memcpy(display, p, len);
+        display[len] = '\0';
+    }
 
-    papplLogPrinter(printer, PAPPL_LOGLEVEL_DEBUG,
-        "status: CODE=%d ONLINE=%s PAGECOUNT=%ld",
-        code, online ? "TRUE" : "FALSE", page_count);
+    papplLogPrinter(printer, PAPPL_LOGLEVEL_INFO,
+        "status: CODE=%d DISPLAY=\"%s\" ONLINE=%s PAGECOUNT=%ld",
+        code, display, online ? "TRUE" : "FALSE", page_count);
 
-    /* Map status code range to printer reasons.
-     * 40000–40999: operator-attention errors (paper empty, cover open, jam).
-     * All other codes (10xxx ready, 40000=sleep per Phase 0) are non-error. */
-    if (code >= 40001 && code <= 40999)
-        papplPrinterSetReasons(printer, PAPPL_PREASON_OTHER, PAPPL_PREASON_NONE);
-    else
-        papplPrinterSetReasons(printer, PAPPL_PREASON_NONE, PAPPL_PREASON_OTHER);
+    /* Persist the status fields immediately so the web UI has fresh data
+     * even when the printer returns no page count (e.g. error state). */
+    {
+        supply_baselines_t sc;
+        read_baselines(&sc);
+        if (code >= 0)
+            sc.pjl_code = code;
+        if (display[0])
+            snprintf(sc.pjl_display, sizeof(sc.pjl_display), "%s", display);
+        sc.pjl_online    = online ? 1 : 0;
+        sc.pjl_poll_time = (long)time(NULL);
+        if (page_count >= 0)
+            sc.last_page_count = page_count;
+        write_conf(&sc);
+    }
+
+    /* Map PJL status codes to specific printer-state-reasons. */
+    pappl_preason_t add    = PAPPL_PREASON_NONE;
+    pappl_preason_t remove = PAPPL_PREASON_COVER_OPEN |
+                             PAPPL_PREASON_MEDIA_EMPTY |
+                             PAPPL_PREASON_MEDIA_JAM |
+                             PAPPL_PREASON_TONER_LOW |
+                             PAPPL_PREASON_TONER_EMPTY |
+                             PAPPL_PREASON_MARKER_SUPPLY_EMPTY |
+                             PAPPL_PREASON_OFFLINE |
+                             PAPPL_PREASON_OTHER;
+    switch (code) {
+        case 40021: add = PAPPL_PREASON_MEDIA_EMPTY;         break;
+        case 40022: add = PAPPL_PREASON_MEDIA_JAM;           break;
+        case 40023: add = PAPPL_PREASON_COVER_OPEN;          break;
+        case 40038: add = PAPPL_PREASON_TONER_EMPTY;         break;
+        case 40039: add = PAPPL_PREASON_TONER_LOW;           break;
+        case 40050: add = PAPPL_PREASON_MARKER_SUPPLY_EMPTY; break;
+        default:
+            if (code >= 40001 && code <= 40999)
+                add = PAPPL_PREASON_OTHER;
+            break;
+    }
+    /* When the printer is offline due to an error, tell clients it won't
+     * accept jobs. Normal sleep/power-save (ONLINE=FALSE, code < 40001)
+     * is not considered an error so we don't set OFFLINE there. */
+    if (!online && code >= 40001 && code <= 40999)
+        add |= PAPPL_PREASON_OFFLINE;
+    papplPrinterSetReasons(printer, add, remove);
 
     /* Compute and set supply levels only when we have a real page count.
      * If page_count is still -1 (e.g. printer asleep and second read also
@@ -1117,20 +1227,25 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     if (page_count >= 0) {
         supply_baselines_t baselines;
         read_baselines(&baselines);
-        baselines.last_page_count = page_count;
-        write_conf(&baselines);
 
         pappl_supply_t supplies[2];
         memset(supplies, 0, sizeof(supplies));
 
-        /* Toner cartridge (TN-570, 6700-page rated life). */
+        /* Toner cartridge (TN-540 or TN-570 depending on user setting). */
         supplies[0].color       = PAPPL_SUPPLY_COLOR_BLACK;
         supplies[0].is_consumed = true;
         supplies[0].type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
         strncpy(supplies[0].description, "Black Toner Cartridge",
                 sizeof(supplies[0].description) - 1);
         supplies[0].level = supply_level(page_count, baselines.toner_baseline,
-                                         TONER_RATED_PAGES);
+                                         baselines.toner_rated_pages);
+
+        /* Clamp toner level when printer signals low/very-low.  Use 3% for
+         * toner-empty (not 0) because shaking may temporarily recover it. */
+        if (code == 40038 && supplies[0].level > 3)
+            supplies[0].level = 3;
+        else if (code == 40039 && supplies[0].level > 10)
+            supplies[0].level = 10;
 
         /* Drum unit (DR-580, 25000-page rated life). */
         supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
@@ -1140,6 +1255,8 @@ static bool hl5170dn_status(pappl_printer_t *printer)
                 sizeof(supplies[1].description) - 1);
         supplies[1].level = supply_level(page_count, baselines.drum_baseline,
                                          DRUM_RATED_PAGES);
+        if (code == 40050 && supplies[1].level > 0)
+            supplies[1].level = 0;
 
         papplPrinterSetSupplies(printer, 2, supplies);
     }
@@ -1184,7 +1301,8 @@ static void render_supply(pappl_client_t *client,
     double filled = pct * 0.5;
     double empty  = 50.0 - filled;
     papplClientHTMLPrintf(client,
-        "          <h3>%s &mdash; %d%%</h3>\n"
+        "          <h3>%s &mdash; ~%d%% <small style=\"font-weight:normal;"
+        "color:#666\">(estimate)</small></h3>\n"
         "          <table class=\"meter\" summary=\"%s\">\n"
         "            <thead><tr><th></th><td></td><td></td>"
         "<td></td><td></td></tr></thead>\n"
@@ -1217,15 +1335,18 @@ static void render_supply(pappl_client_t *client,
             "              <tr><th>%s</th>"
             "<td>Page %ld &middot; %s</td></tr>\n"
             "              <tr><th>Pages used</th>"
-            "<td>%ld of %ld rated (%d%%)</td></tr>\n"
+            "<td>~%ld of %ld rated</td></tr>\n"
             "              <tr><th>Est. remaining</th>"
-            "<td>~%ld pages &middot; expected end at lifetime page ~%ld</td>"
+            "<td>~%ld pages &middot; expected end ~page %ld</td>"
             "</tr>\n"
             "            </tbody>\n"
-            "          </table>\n",
+            "          </table>\n"
+            "          <p><small style=\"color:#666\">Percentages are estimates "
+            "based on page count and rated cartridge life, not actual toner "
+            "measurement.</small></p>\n",
             replaced_label,
             baseline, reset_date,
-            pages_used, rated, pct,
+            pages_used, rated,
             pages_remaining, expected_end);
     }
 
@@ -1236,6 +1357,127 @@ static void render_supply(pappl_client_t *client,
         "<button class=\"btn\" type=\"submit\">Reset %s</button>"
         "</form>\n",
         reset_action, name);
+}
+
+/* Render an LED indicator dot with a label.
+ * Uses papplClientHTMLPuts to avoid %s-escaping of HTML entities. */
+static void render_led(pappl_client_t *client,
+                       const char *label, const char *state)
+{
+    const char *color   = "#aaa";
+    const char *dot     = "&#9675;";   /* ○ off */
+    const char *suffix  = "";
+    if (strcmp(state, "green") == 0) {
+        color = "#2a2"; dot = "&#9679;";
+    } else if (strcmp(state, "red") == 0) {
+        color = "#c22"; dot = "&#9679;";
+    } else if (strcmp(state, "red-blink") == 0) {
+        color = "#c22"; dot = "&#9679;"; suffix = " (blinking)";
+    }
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "<span style=\"margin-right:1em\">"
+        "<span style=\"color:%s;font-size:1.2em\">%s</span>&nbsp;%s%s</span>",
+        color, dot, label, suffix);
+    papplClientHTMLPuts(client, buf);
+}
+
+/* Render the printer status panel at the top of the supplies page. */
+static void render_status_panel(pappl_client_t *client,
+                                const supply_baselines_t *conf)
+{
+    const pjl_code_info_t *info = pjl_code_lookup(conf->pjl_code);
+
+    /* Panel header colour: grey=never polled, red=error, green=ok/low. */
+    const char *hdr_color;
+    if (conf->pjl_poll_time == 0)
+        hdr_color = "#888";
+    else if (conf->pjl_code >= 40001 && conf->pjl_code <= 40999 &&
+             conf->pjl_code != 40039)
+        hdr_color = "#c22";
+    else
+        hdr_color = "#2a2";
+
+    papplClientHTMLPrintf(client,
+        "          <div style=\"border:1px solid #ccc;border-radius:4px;"
+        "margin-bottom:1.5em;overflow:hidden\">\n"
+        "            <div style=\"background:%s;color:white;padding:0.5em 1em;"
+        "display:flex;justify-content:space-between;align-items:center\">\n"
+        "              <strong>Printer Status</strong>\n",
+        hdr_color);
+
+    /* Overall indicator dot in header. */
+    if (conf->pjl_poll_time == 0)
+        papplClientHTMLPuts(client, "<span>&#9675; Unknown</span>\n");
+    else if (hdr_color[1] == 'c')
+        papplClientHTMLPuts(client, "<span>&#9679; Error</span>\n");
+    else
+        papplClientHTMLPuts(client, "<span>&#9679; OK</span>\n");
+
+    papplClientHTMLPuts(client, "            </div>\n"); /* end header */
+
+    if (conf->pjl_poll_time == 0) {
+        papplClientHTMLPuts(client,
+            "            <p style=\"padding:1em\">"
+            "<em>Status not yet available &mdash; "
+            "waiting for first printer poll.</em></p>\n");
+    } else {
+        /* Body table. */
+        papplClientHTMLPuts(client,
+            "            <div style=\"padding:1em\">\n"
+            "            <table>\n<tbody>\n");
+
+        if (conf->pjl_display[0])
+            papplClientHTMLPrintf(client,
+                "<tr><th style=\"text-align:right;padding-right:1em\">"
+                "LCD display</th><td><strong>%s</strong></td></tr>\n",
+                conf->pjl_display);
+
+        if (info) {
+            papplClientHTMLPrintf(client,
+                "<tr><th style=\"text-align:right;padding-right:1em\">"
+                "Code</th><td>%d &mdash; %s</td></tr>\n",
+                conf->pjl_code, info->description);
+            if (info->action[0])
+                papplClientHTMLPrintf(client,
+                    "<tr><th style=\"text-align:right;padding-right:1em\">"
+                    "Action</th><td>%s</td></tr>\n",
+                    info->action);
+        } else if (conf->pjl_code > 0) {
+            papplClientHTMLPrintf(client,
+                "<tr><th style=\"text-align:right;padding-right:1em\">"
+                "Code</th><td>%d &mdash; (unknown status)</td></tr>\n",
+                conf->pjl_code);
+        }
+
+        /* Last polled time. */
+        {
+            char tbuf[32];
+            time_t t = (time_t)conf->pjl_poll_time;
+            struct tm *tm = localtime(&t);
+            strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", tm);
+            papplClientHTMLPrintf(client,
+                "<tr><th style=\"text-align:right;padding-right:1em\">"
+                "Last polled</th><td>%s</td></tr>\n", tbuf);
+        }
+
+        papplClientHTMLPuts(client, "</tbody>\n</table>\n");
+
+        /* LED diagram. */
+        if (info) {
+            papplClientHTMLPuts(client,
+                "<p style=\"margin-top:0.8em\"><strong>LEDs:</strong>&nbsp;");
+            render_led(client, "Status", info->led_status);
+            render_led(client, "Toner",  info->led_toner);
+            render_led(client, "Drum",   info->led_drum);
+            render_led(client, "Paper",  info->led_paper);
+            papplClientHTMLPuts(client, "</p>\n");
+        }
+
+        papplClientHTMLPuts(client, "            </div>\n"); /* end body */
+    }
+
+    papplClientHTMLPuts(client, "          </div>\n"); /* end panel */
 }
 
 static bool hl5170dn_web_supplies(pappl_client_t  *client,
@@ -1253,17 +1495,38 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
 
         num_form = papplClientGetForm(client, &form);
         if (num_form > 0 && papplClientIsValidForm(client, num_form, form) &&
-            (action = cupsGetOption("action", num_form, form)) != NULL &&
-            conf.last_page_count >= 0)
+            (action = cupsGetOption("action", num_form, form)) != NULL)
         {
-            if (!strcmp(action, "reset-toner")) {
+            if (!strcmp(action, "reset-toner") && conf.last_page_count >= 0) {
                 conf.toner_baseline   = conf.last_page_count;
                 conf.toner_reset_time = (long)time(NULL);
                 write_conf(&conf);
-            } else if (!strcmp(action, "reset-drum")) {
+            } else if (!strcmp(action, "reset-drum") && conf.last_page_count >= 0) {
                 conf.drum_baseline   = conf.last_page_count;
                 conf.drum_reset_time = (long)time(NULL);
                 write_conf(&conf);
+            } else if (!strcmp(action, "set-toner-remaining") &&
+                       conf.last_page_count >= 0) {
+                const char *rem_s = cupsGetOption("remaining", num_form, form);
+                if (rem_s) {
+                    long rem = atol(rem_s);
+                    if (rem >= 0 && rem <= conf.toner_rated_pages) {
+                        conf.toner_baseline = conf.last_page_count
+                                             - conf.toner_rated_pages + rem;
+                        if (conf.toner_baseline < 0)
+                            conf.toner_baseline = 0;
+                        write_conf(&conf);
+                    }
+                }
+            } else if (!strcmp(action, "set-cartridge")) {
+                const char *model = cupsGetOption("cartridge", num_form, form);
+                if (model) {
+                    if (!strcmp(model, "TN-540"))
+                        conf.toner_rated_pages = TONER_RATED_TN540;
+                    else
+                        conf.toner_rated_pages = TONER_RATED_TN570;
+                    write_conf(&conf);
+                }
             }
         }
         cupsFreeOptions(num_form, form);
@@ -1279,14 +1542,20 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
     int toner_pct = 0, drum_pct = 0;
     if (conf.last_page_count >= 0) {
         toner_pct = supply_level(conf.last_page_count, conf.toner_baseline,
-                                 TONER_RATED_PAGES);
+                                 conf.toner_rated_pages);
         drum_pct  = supply_level(conf.last_page_count, conf.drum_baseline,
                                  DRUM_RATED_PAGES);
+        /* Mirror the same clamping applied in hl5170dn_status(). */
+        if (conf.pjl_code == 40038 && toner_pct > 3)  toner_pct = 3;
+        if (conf.pjl_code == 40039 && toner_pct > 10) toner_pct = 10;
+        if (conf.pjl_code == 40050 && drum_pct  > 0)  drum_pct  = 0;
     }
 
     papplClientHTMLPrinterHeader(client, printer, "Supplies", 0, NULL, NULL);
 
     papplClientHTMLPuts(client, "          <div class=\"section\">\n");
+
+    render_status_panel(client, &conf);
 
     if (conf.last_page_count >= 0)
         papplClientHTMLPrintf(client,
@@ -1324,8 +1593,24 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
                   toner_pct,
                   conf.toner_baseline, conf.toner_reset_time,
                   conf.last_page_count,
-                  TONER_RATED_PAGES,
+                  conf.toner_rated_pages,
                   "reset-toner");
+
+    /* Manual override: set estimated pages remaining for toner. */
+    if (conf.last_page_count >= 0) {
+        long cur_remaining = conf.toner_rated_pages
+                             - (conf.last_page_count - conf.toner_baseline);
+        if (cur_remaining < 0) cur_remaining = 0;
+        papplClientHTMLStartForm(client, supplies_path, false);
+        papplClientHTMLPrintf(client,
+            "<input type=\"hidden\" name=\"action\" value=\"set-toner-remaining\">"
+            "<label style=\"font-size:0.9em\">Override toner estimate:&nbsp;"
+            "<input type=\"number\" name=\"remaining\" min=\"0\" max=\"%ld\""
+            " value=\"%ld\" style=\"width:5em\"> pages remaining</label>&nbsp;"
+            "<button class=\"btn\" type=\"submit\">Apply</button>"
+            "</form>\n",
+            conf.toner_rated_pages, cur_remaining);
+    }
 
     render_supply(client, supplies_path,
                   "Drum Unit",
@@ -1334,6 +1619,26 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
                   conf.last_page_count,
                   DRUM_RATED_PAGES,
                   "reset-drum");
+
+    /* Toner cartridge model selector. */
+    {
+        const char *sel540 = (conf.toner_rated_pages == TONER_RATED_TN540)
+                             ? " selected" : "";
+        const char *sel570 = (conf.toner_rated_pages != TONER_RATED_TN540)
+                             ? " selected" : "";
+        papplClientHTMLStartForm(client, supplies_path, false);
+        papplClientHTMLPrintf(client,
+            "<input type=\"hidden\" name=\"action\" value=\"set-cartridge\">"
+            "<label>Toner cartridge model:&nbsp;"
+            "<select name=\"cartridge\">"
+            "<option value=\"TN-570\"%s>TN-570 High Yield (%d pages)</option>"
+            "<option value=\"TN-540\"%s>TN-540 Standard (%d pages)</option>"
+            "</select></label>&nbsp;"
+            "<button class=\"btn\" type=\"submit\">Apply</button>"
+            "</form>\n",
+            sel570, TONER_RATED_TN570,
+            sel540, TONER_RATED_TN540);
+    }
 
     papplClientHTMLPuts(client,
         "          <p><small>Click Reset after replacing a consumable to "
@@ -1752,6 +2057,28 @@ done:
     return ok;
 }
 
+/* Returns true if the first page of the PDF at 'path' is wider than tall.
+ * Returns false on any error (conservative: assume portrait). */
+static bool pdf_page_is_landscape(const char *path)
+{
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "pdfinfo '%s' 2>/dev/null", path);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return false;
+
+    bool result = false;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        float w = 0, h = 0;
+        if (sscanf(line, "Page size: %f x %f", &w, &h) == 2) {
+            result = (w > h);
+            break;
+        }
+    }
+    pclose(fp);
+    return result;
+}
+
 /* ---- PDF → PCL filter (streaming via Ghostscript) ---------------------- *
  *
  * Registered via papplSystemAddMIMEFilter() (requires PAPPL 1.4+).
@@ -1797,6 +2124,22 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
         papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
             "%s: pdf_filter: papplJobCreatePrintOptions failed", ctx);
         return false;
+    }
+
+    /* Auto-select binding axis from PDF page geometry when the client did not
+     * explicitly set sides (papplJobGetAttribute returns NULL for defaults). */
+    if (papplJobGetAttribute(job, "sides") == NULL &&
+        options->sides != PAPPL_SIDES_ONE_SIDED) {
+        bool landscape = pdf_page_is_landscape(filename);
+        pappl_sides_t auto_sides = landscape
+            ? PAPPL_SIDES_TWO_SIDED_SHORT_EDGE
+            : PAPPL_SIDES_TWO_SIDED_LONG_EDGE;
+        if (auto_sides != options->sides) {
+            papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                "%s: pdf_filter: auto-sides %s (landscape=%d)",
+                ctx, landscape ? "short-edge" : "long-edge", landscape);
+            options->sides = auto_sides;
+        }
     }
 
     papplPrinterGetDriverData(printer, &drv);
