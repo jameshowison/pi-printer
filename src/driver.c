@@ -791,10 +791,12 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
                 "%%!PS\n/W %u def\n/H %u def\n"
                 "/f (%s) (r) file def\n"
                 "%d { f read pop } repeat\n"
+                "%.4f %.4f scale\n"
                 "W H 8 [W 0 0 H neg 0 H] { f W string readstring pop } image\n"
                 "showpage\n",
                 jd->print_w, jd->pgm_content_h,
-                jd->pgm_path, pgm_hdr_size);
+                jd->pgm_path, pgm_hdr_size,
+                w_pts, h_pts);
             fclose(ps_fp);
             papplLogJob(job, PAPPL_LOGLEVEL_DEBUG,
                 "%s: rendpage: PS wrapper %s: W=%u H=%u hdr=%d",
@@ -865,12 +867,28 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
         /* Consume exactly one whitespace byte after the header. */
         fgetc(gs);
 
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: rendpage: GS PBM dims %u×%u (expected %u×%u)",
+            jd->ctx, pbm_w, pbm_h, jd->print_w, jd->pgm_content_h);
+
         size_t row_bytes = (pbm_w + 7u) / 8u;
+        if (row_bytes > (jd->page_width + 7u) / 8u) {
+            papplLogJob(job, PAPPL_LOGLEVEL_ERROR,
+                "%s: rendpage: PBM row %zu bytes > halftone_buf %u bytes, clamping",
+                jd->ctx, row_bytes, (jd->page_width + 7u) / 8u);
+            row_bytes = (jd->page_width + 7u) / 8u;
+        }
         char   hdr[32];
+        unsigned rows_sent = 0;
 
         for (unsigned y = 0; y < pbm_h && !papplJobIsCanceled(job); y++) {
-            if (fread(jd->halftone_buf, 1, row_bytes, gs) != row_bytes)
+            if (fread(jd->halftone_buf, 1, row_bytes, gs) != row_bytes) {
+                papplLogJob(job, PAPPL_LOGLEVEL_WARN,
+                    "%s: rendpage: fread short at row %u/%u (ferror=%d feof=%d)",
+                    jd->ctx, y, pbm_h, ferror(gs), feof(gs));
                 break;
+            }
+            rows_sent++;
             size_t enc = packbits_encode(jd->halftone_buf, row_bytes, jd->line_buf);
             int    hdr_len = snprintf(hdr, sizeof(hdr), "\x1b*b%uW", (unsigned)enc);
             papplDeviceWrite(device, hdr, (size_t)hdr_len);
@@ -878,6 +896,8 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
         }
 
         pclose(gs);
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: rendpage: sent %u/%u rows", jd->ctx, rows_sent, pbm_h);
         unlink(jd->pgm_path);
         unlink(ps_path);
         jd->pgm_path[0] = '\0';
@@ -1273,6 +1293,27 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
             "          <p>Printer lifetime page count: "
             "<strong>%ld</strong></p>\n",
             conf.last_page_count);
+
+    /* Process memory — read VmRSS and VmHWM from /proc/self/status. */
+    {
+        long vm_rss = -1, vm_hwm = -1;
+        FILE *ps = fopen("/proc/self/status", "r");
+        if (ps) {
+            char line[128];
+            while (fgets(line, sizeof(line), ps)) {
+                if (strncmp(line, "VmRSS:", 6) == 0)
+                    vm_rss = strtol(line + 6, NULL, 10);
+                else if (strncmp(line, "VmHWM:", 6) == 0)
+                    vm_hwm = strtol(line + 6, NULL, 10);
+            }
+            fclose(ps);
+        }
+        if (vm_rss >= 0 && vm_hwm >= 0)
+            papplClientHTMLPrintf(client,
+                "          <p>Process memory: current RSS <strong>%ld MB</strong>"
+                " &middot; peak RSS <strong>%ld MB</strong></p>\n",
+                vm_rss / 1024, vm_hwm / 1024);
+    }
 
     char supplies_path[256];
     papplPrinterGetPath(printer, "supplies", supplies_path,
