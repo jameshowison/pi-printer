@@ -79,6 +79,13 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
     else
         register_supply_reset_route(system, printer);
 
+    /* Override the PAPPL-default navicon (used in every page's top-left nav
+     * button) with our 48×48 printer image.  Must be called after
+     * papplPrinterCreate because that's where PAPPL first registers
+     * /navicon.png from its built-in default. */
+    papplSystemAddResourceFile(system, "/navicon.png", "image/png",
+                               "/usr/local/share/hl5170dn/icon-48.png");
+
     return system;
 }
 
