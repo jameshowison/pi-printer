@@ -1702,6 +1702,13 @@ bool driver_cb(pappl_system_t *system, const char *driver_name,
             sizeof(data->make_and_model) - 1);
     data->ppm = 21;
 
+    strncpy(data->icons[0].filename, "/usr/local/share/hl5170dn/icon-48.png",
+            sizeof(data->icons[0].filename) - 1);
+    strncpy(data->icons[1].filename, "/usr/local/share/hl5170dn/icon-128.png",
+            sizeof(data->icons[1].filename) - 1);
+    strncpy(data->icons[2].filename, "/usr/local/share/hl5170dn/icon-512.png",
+            sizeof(data->icons[2].filename) - 1);
+
     /* Callbacks */
     data->identify_cb   = hl5170dn_identify;
     data->status_cb     = hl5170dn_status;

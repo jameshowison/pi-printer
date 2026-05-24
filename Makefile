@@ -70,6 +70,8 @@ install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 hl5170dn-printer-app.service /etc/systemd/system/
 	install -m 644 99-brother-hl5170dn.rules /etc/udev/rules.d/
+	install -d /usr/local/share/hl5170dn
+	install -m 644 icons/icon-48.png icons/icon-128.png icons/icon-512.png /usr/local/share/hl5170dn/
 	id -u printapp 2>/dev/null || \
 	    useradd -r -M -G lp -s /usr/sbin/nologin printapp
 	udevadm control --reload-rules && udevadm trigger
