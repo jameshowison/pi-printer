@@ -1,4 +1,5 @@
 #include <pappl/pappl.h>
+#include <unistd.h>
 
 #define APP_VERSION  "0.1.0"
 #ifdef GIT_HASH
@@ -25,11 +26,28 @@ static pappl_pr_driver_t drivers[] = {
     { DRIVER_NAME, "Brother HL-5170DN", NULL, NULL }
 };
 
+/* Called by PAPPL inside papplPrinterCreate — for both first-boot creation
+ * and state-file restore.  Registers the supplies web route and overrides
+ * the PAPPL-default navicon with our custom 48×48 printer image. */
+static void printer_create_cb(pappl_printer_t *printer, void *data)
+{
+    pappl_system_t *system = papplPrinterGetSystem(printer);
+
+    (void)data;
+
+    register_supply_reset_route(system, printer);
+
+    papplSystemAddResourceFile(system, "/navicon.png", "image/png",
+                               "/usr/local/share/hl5170dn/icon-48.png");
+}
+
 static pappl_system_t *system_cb(int num_options, cups_option_t *options,
                                   void *data)
 {
     pappl_system_t  *system;
-    pappl_printer_t *printer;
+    const char      *xdg;
+    char             statepath[512];
+    bool             has_state;
 
     (void)num_options;
     (void)options;
@@ -61,8 +79,12 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
 
     /* papplMainloop registers driver_cb AFTER system_cb returns, so
      * papplPrinterCreate would fail with "no driver callback set".
-     * Register it here first; papplMainloop's redundant registration is harmless. */
-    papplSystemSetPrinterDrivers(system, 1, drivers, NULL, NULL, driver_cb, NULL);
+     * Register it here first; papplMainloop's redundant registration is harmless.
+     * printer_create_cb is wired in so PAPPL calls it for every papplPrinterCreate,
+     * including the one inside _papplSystemLoadState when restoring from the
+     * state file. */
+    papplSystemSetPrinterDrivers(system, 1, drivers, NULL, printer_create_cb,
+                                 driver_cb, NULL);
 
     /* Phase 2: wire PDF -> PWG raster via Ghostscript.  Must be called
      * BEFORE papplPrinterCreate so that document-format-supported is built
@@ -71,20 +93,27 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
      * on the already-frozen attribute).  Requires PAPPL 1.4+. */
     register_pdf_filter(system);
 
-    printer = papplPrinterCreate(system, 0, PRINTER_NAME, DRIVER_NAME,
-                                 NULL, DEVICE_URI);
-    if (!printer)
-        papplLog(system, PAPPL_LOGLEVEL_WARN,
-            "papplPrinterCreate failed — printer may already exist");
-    else
-        register_supply_reset_route(system, printer);
+    /* Only create the printer on first-boot (no persistent state yet).
+     * When state exists, PAPPL's mainloop restores the printer from the state
+     * file — applying saved Location, DNSSDName, media defaults, etc. — by
+     * calling papplPrinterCreate inside _papplSystemLoadState, which triggers
+     * printer_create_cb above.  Creating the printer here when state already
+     * exists causes a duplicate-printer error and silently discards all saved
+     * settings. */
+    xdg       = getenv("XDG_CONFIG_HOME");
+    has_state = false;
+    if (xdg) {
+        snprintf(statepath, sizeof(statepath), "%s/hl5170dn-printer-app.state", xdg);
+        has_state = (access(statepath, F_OK) == 0);
+    }
 
-    /* Override the PAPPL-default navicon (used in every page's top-left nav
-     * button) with our 48×48 printer image.  Must be called after
-     * papplPrinterCreate because that's where PAPPL first registers
-     * /navicon.png from its built-in default. */
-    papplSystemAddResourceFile(system, "/navicon.png", "image/png",
-                               "/usr/local/share/hl5170dn/icon-48.png");
+    if (!has_state) {
+        pappl_printer_t *printer = papplPrinterCreate(system, 0, PRINTER_NAME,
+                                       DRIVER_NAME, NULL, DEVICE_URI);
+        if (!printer)
+            papplLog(system, PAPPL_LOGLEVEL_WARN,
+                "papplPrinterCreate failed — printer may already exist");
+    }
 
     return system;
 }
