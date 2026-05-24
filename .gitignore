@@ -4,3 +4,4 @@ hl5170dn-printer-app
 *.log
 *.heic
 jobs/
+tests/print-image-simplex-*.test
