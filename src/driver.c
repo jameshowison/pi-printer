@@ -41,7 +41,10 @@
 #include <unistd.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include "pjl.h"
+
+static void update_gs_peak_rss(pappl_job_t *job, const char *ctx);
 #include "packbits.h"
 
 /* ---- Hardware geometry constants -------------------------------------- *
@@ -896,6 +899,7 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
         }
 
         pclose(gs);
+        update_gs_peak_rss(job, jd->ctx);
         papplLogJob(job, PAPPL_LOGLEVEL_INFO,
             "%s: rendpage: sent %u/%u rows", jd->ctx, rows_sent, pbm_h);
         unlink(jd->pgm_path);
@@ -964,6 +968,7 @@ typedef struct {
     char pjl_display[64];    /* last DISPLAY= string */
     int  pjl_online;         /* last ONLINE= value */
     long pjl_poll_time;      /* unix timestamp of last successful poll */
+    long peak_rss_kb;        /* lifetime peak RSS in kB, 0 = never recorded */
 } supply_baselines_t;
 
 static void read_baselines(supply_baselines_t *b)
@@ -978,6 +983,7 @@ static void read_baselines(supply_baselines_t *b)
     b->pjl_display[0]   = '\0';
     b->pjl_online       = 0;
     b->pjl_poll_time    = 0;
+    b->peak_rss_kb      = 0;
 
     FILE *f = fopen(SUPPLY_CONF_PATH, "r");
     if (!f)
@@ -1014,6 +1020,8 @@ static void read_baselines(supply_baselines_t *b)
             b->pjl_online = (int)lval;
         else if (strcmp(key, "pjl_poll_time") == 0)
             b->pjl_poll_time = lval;
+        else if (strcmp(key, "peak_rss_kb") == 0)
+            b->peak_rss_kb = lval;
     }
     fclose(f);
 }
@@ -1032,13 +1040,37 @@ static void write_conf(const supply_baselines_t *b)
             "toner_baseline=%ld\ndrum_baseline=%ld\nlast_page_count=%ld\n"
             "toner_reset_time=%ld\ndrum_reset_time=%ld\n"
             "toner_rated_pages=%ld\n"
-            "pjl_code=%d\npjl_display=%s\npjl_online=%d\npjl_poll_time=%ld\n",
+            "pjl_code=%d\npjl_display=%s\npjl_online=%d\npjl_poll_time=%ld\n"
+            "peak_rss_kb=%ld\n",
             b->toner_baseline, b->drum_baseline, b->last_page_count,
             b->toner_reset_time, b->drum_reset_time,
             b->toner_rated_pages,
-            b->pjl_code, b->pjl_display, b->pjl_online, b->pjl_poll_time);
+            b->pjl_code, b->pjl_display, b->pjl_online, b->pjl_poll_time,
+            b->peak_rss_kb);
     fclose(f);
     rename(tmp, SUPPLY_CONF_PATH);
+}
+
+/* Call immediately after pclose(gs). Reads peak child RSS via getrusage,
+ * updates the persisted peak if it's a new high, and logs the result. */
+static void update_gs_peak_rss(pappl_job_t *job, const char *ctx)
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) != 0)
+        return;
+    long child_peak_kb = ru.ru_maxrss;  /* kB on Linux */
+    if (child_peak_kb <= 0)
+        return;
+
+    supply_baselines_t conf;
+    read_baselines(&conf);
+    if (child_peak_kb > conf.peak_rss_kb) {
+        conf.peak_rss_kb = child_peak_kb;
+        write_conf(&conf);
+    }
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "%s: gs child peak RSS %ld MB (lifetime peak %ld MB)",
+        ctx, child_peak_kb / 1024, conf.peak_rss_kb / 1024);
 }
 
 static int supply_level(long total_pages, long baseline, long rated)
@@ -1563,7 +1595,8 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
             "<strong>%ld</strong></p>\n",
             conf.last_page_count);
 
-    /* Process memory — read VmRSS and VmHWM from /proc/self/status. */
+    /* Process memory — read VmRSS and VmHWM from /proc/self/status,
+     * then update the persisted lifetime peak. */
     {
         long vm_rss = -1, vm_hwm = -1;
         FILE *ps = fopen("/proc/self/status", "r");
@@ -1577,11 +1610,16 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
             }
             fclose(ps);
         }
-        if (vm_rss >= 0 && vm_hwm >= 0)
+        if (vm_hwm > conf.peak_rss_kb) {
+            conf.peak_rss_kb = vm_hwm;
+            write_conf(&conf);
+        }
+        if (vm_rss >= 0)
             papplClientHTMLPrintf(client,
                 "          <p>Process memory: current RSS <strong>%ld MB</strong>"
-                " &middot; peak RSS <strong>%ld MB</strong></p>\n",
-                vm_rss / 1024, vm_hwm / 1024);
+                " &middot; session peak <strong>%ld MB</strong>"
+                " &middot; lifetime peak <strong>%ld MB</strong></p>\n",
+                vm_rss / 1024, vm_hwm / 1024, conf.peak_rss_kb / 1024);
     }
 
     char supplies_path[256];
@@ -2056,6 +2094,7 @@ done:
 
     if (gs) {
         int gs_status = pclose(gs);
+        update_gs_peak_rss(job, ctx);
         if (gs_status != 0)
             papplLogJob(job, PAPPL_LOGLEVEL_WARN,
                 "%s: apt_render: gs exited with status %d", ctx, gs_status);
@@ -2419,6 +2458,7 @@ done:
 
     if (gs) {
         int gs_status = pclose(gs);
+        update_gs_peak_rss(job, ctx);
         if (gs_status != 0)
             papplLogJob(job, PAPPL_LOGLEVEL_WARN,
                 "%s: pdf_filter: gs exited with status %d", ctx, gs_status);
