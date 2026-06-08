@@ -1062,6 +1062,108 @@ static void write_conf(const supply_baselines_t *b)
     rename(tmp, SUPPLY_CONF_PATH);
 }
 
+/* Render a sysstat memory time-series table on the supplies page.
+ * Runs sadf over all available daily sa files, parses the semicolon-delimited
+ * output, and emits an HTML table.  Rows where used RAM exceeds Pi Zero 2W
+ * thresholds (512 MB total) are colour-coded:
+ *   > 384 MB (75%)  — red    — too close for comfort
+ *   > 256 MB (50%)  — amber  — borderline
+ * Handles the no-data-yet case gracefully. */
+static void render_sar_memory_table(pappl_client_t *client)
+{
+    /* Iterate all sa[0-9][0-9] files in day-number order. */
+    FILE *fp = popen(
+        "for f in $(ls /var/log/sysstat/sa[0-9][0-9] 2>/dev/null); do "
+        "  sadf -d \"$f\" -- -r 2>/dev/null; "
+        "done", "r");
+    if (!fp) {
+        papplClientHTMLPuts(client,
+            "          <p><em>Could not run sadf.</em></p>\n");
+        return;
+    }
+
+    int nrows = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        /* Skip header comments and LINUX-RESTART sentinel lines. */
+        if (line[0] == '#' || strstr(line, "LINUX-RESTART") ||
+                strstr(line, "LINUX RESTART"))
+            continue;
+
+        /* Split on ';' in-place.  We need at least 7 fields:
+         * [0]=host [1]=interval [2]=timestamp [3]=kbmemfree
+         * [4]=kbavail [5]=kbmemused [6]=%memused               */
+        char *f[7];
+        int nf = 0;
+        char *p = line;
+        while (nf < 7) {
+            f[nf++] = p;
+            char *semi = strchr(p, ';');
+            if (!semi) break;
+            *semi = '\0';
+            p = semi + 1;
+        }
+        if (nf < 7) continue;
+
+        /* Strip trailing " UTC" and whitespace from timestamp. */
+        char ts[32];
+        snprintf(ts, sizeof(ts), "%s", f[2]);
+        char *utc = strstr(ts, " UTC");
+        if (utc) *utc = '\0';
+
+        long used_mb  = atol(f[5]) / 1024;
+        long avail_mb = atol(f[4]) / 1024;
+        /* %memused may be "N/A" on restart lines — skip those. */
+        if (f[6][0] == 'N') continue;
+        double pct = strtod(f[6], NULL);
+
+        if (nrows == 0) {
+            /* Emit table header on first real data row. */
+            papplClientHTMLPuts(client,
+                "          <h3>System memory history</h3>\n"
+                "          <p style=\"font-size:0.85em;color:#555\">"
+                "Pi Zero 2W has 512&nbsp;MB total &mdash; "
+                "<span style=\"background:#ffe8a0;padding:0 3px\">amber</span> "
+                "&gt;256&nbsp;MB, "
+                "<span style=\"background:#ffb3b3;padding:0 3px\">red</span> "
+                "&gt;384&nbsp;MB.</p>\n"
+                "          <div style=\"overflow-x:auto\">\n"
+                "          <table style=\"font-size:0.85em;border-collapse:collapse\">\n"
+                "          <thead><tr>"
+                "<th style=\"padding:3px 8px;text-align:left\">Time (UTC)</th>"
+                "<th style=\"padding:3px 8px;text-align:right\">Used&nbsp;MB</th>"
+                "<th style=\"padding:3px 8px;text-align:right\">Avail&nbsp;MB</th>"
+                "<th style=\"padding:3px 8px;text-align:right\">%%&nbsp;used</th>"
+                "</tr></thead><tbody>\n");
+        }
+
+        const char *bg = "";
+        if      (used_mb > 384) bg = " style=\"background:#ffb3b3\"";
+        else if (used_mb > 256) bg = " style=\"background:#ffe8a0\"";
+
+        papplClientHTMLPrintf(client,
+            "          <tr%s>"
+            "<td style=\"padding:2px 8px\">%s</td>"
+            "<td style=\"padding:2px 8px;text-align:right\">%ld</td>"
+            "<td style=\"padding:2px 8px;text-align:right\">%ld</td>"
+            "<td style=\"padding:2px 8px;text-align:right\">%.1f%%</td>"
+            "</tr>\n",
+            bg, ts, used_mb, avail_mb, pct);
+        nrows++;
+    }
+    pclose(fp);
+
+    if (nrows == 0) {
+        papplClientHTMLPuts(client,
+            "          <p><em>No sysstat samples yet &mdash; "
+            "data is collected every 10&nbsp;minutes.</em></p>\n");
+        return;
+    }
+
+    papplClientHTMLPuts(client,
+        "          </tbody></table></div>\n");
+}
+
 /* Read current system RAM from /proc/meminfo.
  * Sets *used_kb = MemTotal - MemAvailable, *total_kb = MemTotal.
  * Returns true if both fields were found. */
@@ -1728,12 +1830,12 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
             papplClientHTMLPrintf(client,
                 "          <p>System memory: in use <strong>%ld MB</strong>"
                 " of <strong>%ld MB</strong>"
-                " &middot; job-peak <strong>%ld MB</strong>"
-                " &middot; <code>sar -r</code> for history</p>\n",
+                " &middot; job-peak <strong>%ld MB</strong></p>\n",
                 sys_used / 1024, sys_total / 1024,
                 conf.peak_system_kb / 1024);
         }
     }
+    render_sar_memory_table(client);
 
     char supplies_path[256];
     papplPrinterGetPath(printer, "supplies", supplies_path,
