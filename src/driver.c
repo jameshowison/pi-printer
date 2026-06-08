@@ -976,6 +976,7 @@ typedef struct {
     int  pjl_online;         /* last ONLINE= value */
     long pjl_poll_time;      /* unix timestamp of last successful poll */
     long peak_rss_kb;        /* lifetime peak RSS in kB, 0 = never recorded */
+    long peak_system_kb;     /* lifetime peak system RAM used, kB; 0 = never sampled */
 } supply_baselines_t;
 
 static void read_baselines(supply_baselines_t *b)
@@ -991,6 +992,7 @@ static void read_baselines(supply_baselines_t *b)
     b->pjl_online       = 0;
     b->pjl_poll_time    = 0;
     b->peak_rss_kb      = 0;
+    b->peak_system_kb   = 0;
 
     FILE *f = fopen(SUPPLY_CONF_PATH, "r");
     if (!f)
@@ -1029,6 +1031,8 @@ static void read_baselines(supply_baselines_t *b)
             b->pjl_poll_time = lval;
         else if (strcmp(key, "peak_rss_kb") == 0)
             b->peak_rss_kb = lval;
+        else if (strcmp(key, "peak_system_kb") == 0)
+            b->peak_system_kb = lval;
     }
     fclose(f);
 }
@@ -1048,14 +1052,40 @@ static void write_conf(const supply_baselines_t *b)
             "toner_reset_time=%ld\ndrum_reset_time=%ld\n"
             "toner_rated_pages=%ld\n"
             "pjl_code=%d\npjl_display=%s\npjl_online=%d\npjl_poll_time=%ld\n"
-            "peak_rss_kb=%ld\n",
+            "peak_rss_kb=%ld\npeak_system_kb=%ld\n",
             b->toner_baseline, b->drum_baseline, b->last_page_count,
             b->toner_reset_time, b->drum_reset_time,
             b->toner_rated_pages,
             b->pjl_code, b->pjl_display, b->pjl_online, b->pjl_poll_time,
-            b->peak_rss_kb);
+            b->peak_rss_kb, b->peak_system_kb);
     fclose(f);
     rename(tmp, SUPPLY_CONF_PATH);
+}
+
+/* Read current system RAM from /proc/meminfo.
+ * Sets *used_kb = MemTotal - MemAvailable, *total_kb = MemTotal.
+ * Returns true if both fields were found. */
+static bool read_system_ram_kb(long *used_kb, long *total_kb)
+{
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f)
+        return false;
+    long mem_total = -1, mem_available = -1;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "MemTotal:", 9) == 0)
+            mem_total = strtol(line + 9, NULL, 10);
+        else if (strncmp(line, "MemAvailable:", 13) == 0)
+            mem_available = strtol(line + 13, NULL, 10);
+        if (mem_total >= 0 && mem_available >= 0)
+            break;
+    }
+    fclose(f);
+    if (mem_total < 0 || mem_available < 0)
+        return false;
+    *total_kb = mem_total;
+    *used_kb  = mem_total - mem_available;
+    return true;
 }
 
 /* Call immediately after pclose(gs). Reads peak child RSS via getrusage,
@@ -1215,6 +1245,12 @@ static void hl5170dn_poll_status(pappl_printer_t *printer,
         sc.pjl_poll_time = (long)time(NULL);
         if (page_count >= 0)
             sc.last_page_count = page_count;
+        {
+            long sys_used = -1, sys_total = -1;
+            if (read_system_ram_kb(&sys_used, &sys_total) &&
+                    sys_used > sc.peak_system_kb)
+                sc.peak_system_kb = sys_used;
+        }
         write_conf(&sc);
     }
 
@@ -1681,6 +1717,22 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
                 " &middot; session peak <strong>%ld MB</strong>"
                 " &middot; lifetime peak <strong>%ld MB</strong></p>\n",
                 vm_rss / 1024, vm_hwm / 1024, conf.peak_rss_kb / 1024);
+    }
+    {
+        long sys_used = -1, sys_total = -1;
+        if (read_system_ram_kb(&sys_used, &sys_total)) {
+            if (sys_used > conf.peak_system_kb) {
+                conf.peak_system_kb = sys_used;
+                write_conf(&conf);
+            }
+            papplClientHTMLPrintf(client,
+                "          <p>System memory: in use <strong>%ld MB</strong>"
+                " of <strong>%ld MB</strong>"
+                " &middot; job-peak <strong>%ld MB</strong>"
+                " &middot; <code>sar -r</code> for history</p>\n",
+                sys_used / 1024, sys_total / 1024,
+                conf.peak_system_kb / 1024);
+        }
     }
 
     char supplies_path[256];
