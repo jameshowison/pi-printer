@@ -913,6 +913,9 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
     return true;
 }
 
+static void hl5170dn_poll_status(pappl_printer_t *printer,
+                                  pappl_device_t  *device);
+
 static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
                               pappl_device_t *device)
 {
@@ -926,6 +929,10 @@ static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
         jd->ctx, (long)(time(NULL) - jd->start_time));
 
     pjl_write_job_trailer(device, /*restore_powersave=*/true);
+
+    /* Poll status now, while the USB session is still open.  This is the only
+     * time supply levels can have changed, so we never need to poll at idle. */
+    hl5170dn_poll_status(papplJobGetPrinter(job), device);
 
     if (jd->pgm_fp)      { fclose(jd->pgm_fp); jd->pgm_fp = NULL; }
     if (jd->pgm_path[0]) { unlink(jd->pgm_path); jd->pgm_path[0] = '\0'; }
@@ -1118,17 +1125,13 @@ static const pjl_code_info_t *pjl_code_lookup(int code)
     return NULL;
 }
 
-static bool hl5170dn_status(pappl_printer_t *printer)
+/* Poll the printer for status and supply levels over an already-open device.
+ * Called once at job end, while the USB session is still active.  Supply
+ * levels only change during a print job, so there is no reason to poll at
+ * any other time. */
+static void hl5170dn_poll_status(pappl_printer_t *printer,
+                                  pappl_device_t  *device)
 {
-    /* Open USB device for PJL back-channel query.
-     * Returns NULL if device is busy (job in progress) — that's fine. */
-    pappl_device_t *device = papplPrinterOpenDevice(printer);
-    if (!device) {
-        papplLogPrinter(printer, PAPPL_LOGLEVEL_DEBUG,
-            "status: device busy, skipping PJL poll");
-        return true;
-    }
-
     /* Send @PJL INFO STATUS and @PJL INFO PAGECOUNT in one session. */
     static const char query[] =
         "\033%-12345X@PJL\r\n"
@@ -1145,28 +1148,23 @@ static bool hl5170dn_status(pappl_printer_t *printer)
     ssize_t bytes = papplDeviceRead(device, buf, sizeof(buf) - 1);
 
     if (bytes <= 0) {
-        papplPrinterCloseDevice(printer);
         papplLogPrinter(printer, PAPPL_LOGLEVEL_WARN,
             "status: no response from printer (bytes=%ld)", (long)bytes);
-        return true;
+        return;
     }
     buf[bytes] = '\0';
 
-    /* If PAGECOUNT not yet in buffer, try one more read for the second packet. */
     if (!strstr(buf, "PAGECOUNT=")) {
         char    buf2[1024];
         ssize_t bytes2 = papplDeviceRead(device, buf2, sizeof(buf2) - 1);
         if (bytes2 > 0) {
             buf2[bytes2] = '\0';
-            /* Append to buf if space allows, otherwise just search buf2. */
             if ((size_t)(bytes + bytes2) < sizeof(buf) - 1) {
                 memcpy(buf + bytes, buf2, (size_t)bytes2 + 1);
                 bytes += bytes2;
             } else {
-                /* buf2 is separate; copy PAGECOUNT= value if found. */
                 char *pc = strstr(buf2, "PAGECOUNT=");
                 if (pc) {
-                    /* Append just the PAGECOUNT= token to buf. */
                     size_t avail = sizeof(buf) - 1 - (size_t)bytes;
                     size_t tlen  = strlen(pc);
                     if (tlen < avail) {
@@ -1178,9 +1176,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         }
     }
 
-    papplPrinterCloseDevice(printer);
-
-    /* Parse CODE=, DISPLAY=, ONLINE=, and PAGECOUNT= from the combined buffer. */
+    /* Parse CODE=, DISPLAY=, ONLINE=, and PAGECOUNT=. */
     int  code       = -1;
     bool online     = false;
     long page_count = -1;
@@ -1207,8 +1203,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         "status: CODE=%d DISPLAY=\"%s\" ONLINE=%s PAGECOUNT=%ld",
         code, display, online ? "TRUE" : "FALSE", page_count);
 
-    /* Persist the status fields immediately so the web UI has fresh data
-     * even when the printer returns no page count (e.g. error state). */
+    /* Persist so the cache-replay path has fresh data. */
     {
         supply_baselines_t sc;
         read_baselines(&sc);
@@ -1223,7 +1218,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         write_conf(&sc);
     }
 
-    /* Map PJL status codes to specific printer-state-reasons. */
+    /* Map PJL status codes to printer-state-reasons. */
     pappl_preason_t add    = PAPPL_PREASON_NONE;
     pappl_preason_t remove = PAPPL_PREASON_COVER_OPEN |
                              PAPPL_PREASON_MEDIA_EMPTY |
@@ -1245,17 +1240,10 @@ static bool hl5170dn_status(pappl_printer_t *printer)
                 add = PAPPL_PREASON_OTHER;
             break;
     }
-    /* When the printer is offline due to an error, tell clients it won't
-     * accept jobs. Normal sleep/power-save (ONLINE=FALSE, code < 40001)
-     * is not considered an error so we don't set OFFLINE there. */
     if (!online && code >= 40001 && code <= 40999)
         add |= PAPPL_PREASON_OFFLINE;
     papplPrinterSetReasons(printer, add, remove);
 
-    /* Compute and set supply levels only when we have a real page count.
-     * If page_count is still -1 (e.g. printer asleep and second read also
-     * returned nothing), leave PAPPL's existing supply values untouched so
-     * a previously-recorded good reading is not overwritten with unknowns. */
     if (page_count >= 0) {
         supply_baselines_t baselines;
         read_baselines(&baselines);
@@ -1263,7 +1251,6 @@ static bool hl5170dn_status(pappl_printer_t *printer)
         pappl_supply_t supplies[2];
         memset(supplies, 0, sizeof(supplies));
 
-        /* Toner cartridge (TN-540 or TN-570 depending on user setting). */
         supplies[0].color       = PAPPL_SUPPLY_COLOR_BLACK;
         supplies[0].is_consumed = true;
         supplies[0].type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
@@ -1271,21 +1258,95 @@ static bool hl5170dn_status(pappl_printer_t *printer)
                 sizeof(supplies[0].description) - 1);
         supplies[0].level = supply_level(page_count, baselines.toner_baseline,
                                          baselines.toner_rated_pages);
-
-        /* Clamp toner level when printer signals low/very-low.  Use 3% for
-         * toner-empty (not 0) because shaking may temporarily recover it. */
         if (code == 40038 && supplies[0].level > 3)
             supplies[0].level = 3;
         else if (code == 40039 && supplies[0].level > 10)
             supplies[0].level = 10;
 
-        /* Drum unit (DR-580, 25000-page rated life). */
         supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
         supplies[1].is_consumed = true;
         supplies[1].type        = PAPPL_SUPPLY_TYPE_OPC;
         strncpy(supplies[1].description, "Drum Unit",
                 sizeof(supplies[1].description) - 1);
         supplies[1].level = supply_level(page_count, baselines.drum_baseline,
+                                         DRUM_RATED_PAGES);
+        if (code == 40050 && supplies[1].level > 0)
+            supplies[1].level = 0;
+
+        papplPrinterSetSupplies(printer, 2, supplies);
+    }
+}
+
+/* Status callback — serves cached data from the last job-end poll.
+ * Never touches USB: supply levels only change during printing, so there is
+ * no need to wake the printer on every Get-Printer-Attributes query. */
+static bool hl5170dn_status(pappl_printer_t *printer)
+{
+    supply_baselines_t cached;
+    read_baselines(&cached);
+
+    /* No poll has run yet (first ever run before any job). */
+    if (cached.pjl_poll_time == 0)
+        return true;
+
+    papplLogPrinter(printer, PAPPL_LOGLEVEL_DEBUG,
+        "status: replaying cached state (CODE=%d, last poll %lds ago)",
+        cached.pjl_code,
+        (long)(time(NULL) - cached.pjl_poll_time));
+
+    /* Re-apply cached printer-state-reasons. */
+    int code = cached.pjl_code;
+    bool online = (cached.pjl_online != 0);
+
+    pappl_preason_t add    = PAPPL_PREASON_NONE;
+    pappl_preason_t remove = PAPPL_PREASON_COVER_OPEN |
+                             PAPPL_PREASON_MEDIA_EMPTY |
+                             PAPPL_PREASON_MEDIA_JAM |
+                             PAPPL_PREASON_TONER_LOW |
+                             PAPPL_PREASON_TONER_EMPTY |
+                             PAPPL_PREASON_MARKER_SUPPLY_EMPTY |
+                             PAPPL_PREASON_OFFLINE |
+                             PAPPL_PREASON_OTHER;
+    switch (code) {
+        case 40021: add = PAPPL_PREASON_MEDIA_EMPTY;         break;
+        case 40022: add = PAPPL_PREASON_MEDIA_JAM;           break;
+        case 40023: add = PAPPL_PREASON_COVER_OPEN;          break;
+        case 40038: add = PAPPL_PREASON_TONER_EMPTY;         break;
+        case 40039: add = PAPPL_PREASON_TONER_LOW;           break;
+        case 40050: add = PAPPL_PREASON_MARKER_SUPPLY_EMPTY; break;
+        default:
+            if (code >= 40001 && code <= 40999)
+                add = PAPPL_PREASON_OTHER;
+            break;
+    }
+    if (!online && code >= 40001 && code <= 40999)
+        add |= PAPPL_PREASON_OFFLINE;
+    papplPrinterSetReasons(printer, add, remove);
+
+    /* Re-apply cached supply levels. */
+    long page_count = cached.last_page_count;
+    if (page_count >= 0) {
+        pappl_supply_t supplies[2];
+        memset(supplies, 0, sizeof(supplies));
+
+        supplies[0].color       = PAPPL_SUPPLY_COLOR_BLACK;
+        supplies[0].is_consumed = true;
+        supplies[0].type        = PAPPL_SUPPLY_TYPE_TONER_CARTRIDGE;
+        strncpy(supplies[0].description, "Black Toner Cartridge",
+                sizeof(supplies[0].description) - 1);
+        supplies[0].level = supply_level(page_count, cached.toner_baseline,
+                                         cached.toner_rated_pages);
+        if (code == 40038 && supplies[0].level > 3)
+            supplies[0].level = 3;
+        else if (code == 40039 && supplies[0].level > 10)
+            supplies[0].level = 10;
+
+        supplies[1].color       = PAPPL_SUPPLY_COLOR_BLACK;
+        supplies[1].is_consumed = true;
+        supplies[1].type        = PAPPL_SUPPLY_TYPE_OPC;
+        strncpy(supplies[1].description, "Drum Unit",
+                sizeof(supplies[1].description) - 1);
+        supplies[1].level = supply_level(page_count, cached.drum_baseline,
                                          DRUM_RATED_PAGES);
         if (code == 40050 && supplies[1].level > 0)
             supplies[1].level = 0;
