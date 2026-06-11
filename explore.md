@@ -315,7 +315,170 @@ harness, not from scratch.
 
 ---
 
-## 8. What "done" looks like (status)
+## 8. macOS driver re-auth on every deploy
+
+After the project was nominally done, every `pi-printer-deploy` started
+triggering a macOS admin-password prompt the next time a Mac tried to
+print. Investigating this turned into the cleanest example of how a
+single IPP attribute can drive seemingly-unrelated client UX, and how
+PAPPL's defaults aren't quite right for an iterative-deploy workflow.
+
+### Symptom
+
+Every redeploy of `hl5170dn-printer-app` caused macOS Print Center to
+ask for an admin password ("printtool wants to make changes") before
+the job would print. Frequency: every deploy, no exceptions.
+
+### Ruled-out hypotheses
+
+- **Bonjour UUID rotation** — `pappl/system.c:_papplSystemMakeUUID()`
+  derives a v3 UUID from `_PAPPL_PRINTER_:hostname:port:printer_name`.
+  Stable across restarts as long as none of those change.
+- **State-file wipe** — `pi-printer-deploy` does
+  `rm -f /tmp/hl5170dn-printer-app*.state`, but the actual state lives
+  at `/var/lib/hl5170dn-printer-app/hl5170dn-printer-app.state` (via
+  `Environment=XDG_CONFIG_HOME=…` in the service unit). The `rm` is
+  dead code; state was preserved.
+- **TLS cert rotation** — `PAPPL_SOPTIONS_NO_TLS` is set, no certs.
+- **DNS-SD TXT record drift** — fields are built deterministically from
+  `driver_data` (`pappl/dnssd.c:531–560`). Verified byte-identical
+  across restarts via `dns-sd -L`.
+- **`printer-firmware-string-version`** — was suspect because
+  `DRIVER_VERSION` embedded `GIT_HASH` and is published as that IPP
+  attribute. Stabilizing it (split `IPP_FIRMWARE_VERSION` from
+  `DRIVER_VERSION`, bumped `APP_VERSION` to 0.5.0 as a deliberate
+  release marker, kept the hash only in the footer/log) did not
+  fix the prompt.
+
+### Root cause: `printer-config-change-date-time`
+
+Captured `Get-Printer-Attributes` before and after a deploy and
+diffed. Exactly one configuration-significant attribute changed:
+
+```
+< printer-config-change-date-time = 2026-06-11T15:01:04Z
+> printer-config-change-date-time = 2026-06-11T15:02:44Z
+```
+
+In `pappl/printer.c:357`:
+
+```c
+printer->config_time = printer->start_time = time(NULL);
+```
+
+PAPPL initializes `config_time` to wall-clock on every `papplPrinterCreate`
+and never persists it. macOS treats a forward jump in
+`printer-config-change-date-time` (RFC 8011 §5.4.27) as "printer
+reconfigured → revalidate driver", which surfaces as the auth prompt.
+
+### Fix part 1: persist `config_time` in PAPPL
+
+Vendored PAPPL at `/home/tuttle/pappl` was already a fork
+(`feat/device-read-with-timeout` carried the `papplDeviceReadTimed`
+patch). A new branch `pi-printer-dev` was created on top of that to
+carry pi-printer-specific PAPPL changes, leaving `master` and the
+device-read branch unchanged. Two patches now live on it:
+
+1. **`bfb9c1e` — persist `printer->config_time` across restarts.**
+   In `pappl/system-loadsave.c`, save `ConfigTime %ld` alongside
+   `ImpressionsCompleted` and parse it back on load. Three-line
+   change.
+2. **`8a72121` — public setter `papplPrinterSetConfigTime`.**
+   Needed for part 2 below; private struct fields can't be touched
+   from outside libpappl.
+
+Verified: stop service, inject `ConfigTime 1700000000` into the state
+file, restart, query IPP → attribute reads `2023-11-14T22:13:20Z`.
+Idle restart cycles preserve it byte-for-byte.
+
+### Side effect: capability changes go unnoticed
+
+Stabilizing `config_time` solved the prompt-on-every-deploy problem
+but introduced the opposite failure mode: if a deploy *actually*
+changes the advertised capability surface (URF list, supported sides,
+new resolutions, etc.), macOS will keep using its cached driver
+profile because `config_time` no longer moves. The capability values
+come from `driver_cb`, which doesn't bump `config_time` — they're
+constructed fresh on every startup but aren't reflected anywhere
+persistent.
+
+### Fix part 2: runtime capability fingerprint
+
+Hash the actual IPP attributes that macOS reads. Allowlist of
+`*-supported` attribute names plus `printer-make-and-model`, sorted
+by attribute name (PAPPL doesn't guarantee insertion order),
+serialised via `ippAttributeString`, plus the `color_supported`,
+`sides_supported`, and `kind` scalars from `driver_data`. SHA-256 the
+buffer. Persist at `/var/lib/hl5170dn-printer-app/caps.fp`.
+
+Defence-in-depth against time leakage:
+
+1. Iterate `papplPrinterGetDriverAttributes()` only.
+   Time-flavoured attrs (`printer-up-time`, `printer-current-time`,
+   `*-state-change-date-time`, and `printer-config-change-date-time`
+   itself) are constructed on the fly in `pappl/printer-ipp.c`
+   response handlers — they're never in `driver_attrs`.
+2. Explicit allowlist, no wildcarding.
+3. `*-default` attrs are excluded; user-driven default changes already
+   flow through PAPPL setters that bump `config_time` themselves, so
+   including them would double-count.
+
+Hook: one-shot timer at `t+2s` via `papplSystemAddTimerCallback`.
+Calling `SetConfigTime` directly from `printer_create_cb` doesn't
+work — it runs from inside `_papplSystemLoadState` *before* our
+`ConfigTime` line is parsed, so the load clobbers the bump. The
+timer runs after the load and DNS-SD registration have finished.
+
+Log line on every startup makes deploys auditable:
+
+```
+capabilities fingerprint <hex> — unchanged, preserving printer-config-change-date-time
+capabilities fingerprint <hex> — changed (was <old-hex>), bumping printer-config-change-date-time
+```
+
+Plus `make bump-config` as a manual override (stop service, rewrite
+the `ConfigTime` line, delete `caps.fp`, restart) for forcing a
+refresh during dev or testing the macOS auth path itself.
+
+### Verification
+
+| Scenario | Expected | Result |
+|---|---|---|
+| Edit a comment, deploy | attribute preserved, log says `unchanged` | ✓ |
+| Add `PAPPL_IDENTIFY_ACTIONS_FLASH` to `identify_supported`, deploy | attribute advances, log says `changed` | ✓ |
+| Revert that change, deploy | attribute advances, fingerprint returns to original value | ✓ |
+| Second no-op deploy | stable | ✓ |
+| `make bump-config` | attribute advances on demand | ✓ |
+| macOS prints after no-op deploy | no auth prompt | ✓ |
+
+### Files touched
+
+- `/home/tuttle/pappl/pappl/system-loadsave.c` — persist `config_time`.
+- `/home/tuttle/pappl/pappl/printer-accessors.c`,
+  `pappl/printer.h`, `pappl/libpappl1.def` — new
+  `papplPrinterSetConfigTime` setter.
+- `src/driver.c` — `compute_caps_fingerprint`,
+  `caps_fingerprint_timer_cb`, `check_caps_fingerprint`.
+- `src/main.c` — split `IPP_FIRMWARE_VERSION` from `DRIVER_VERSION`;
+  bumped `APP_VERSION` to `0.5.0`; call `check_caps_fingerprint`
+  from `printer_create_cb`.
+- `Makefile` — `bump-config` target.
+
+### Why this matters beyond this project
+
+`printer-config-change-date-time` is one of those IPP attributes that
+nothing in the docs flags as "client-behaviour-significant", but it
+controls macOS's "this printer needs admin attention" UX. The
+default PAPPL behaviour (`time(NULL)` on every restart, never
+persisted) is fine for a one-shot install but actively user-hostile
+for iterative development. The fix is a 3-line state-file
+round-trip; the diagnosis took two hours of attribute-diffing because
+every plausible hypothesis (UUID, TLS, TXT record, firmware string)
+ruled itself out before we got to the right one.
+
+---
+
+## 9. What "done" looks like (status)
 
 From the PRD's done-checklist:
 
@@ -336,7 +499,7 @@ From the PRD's done-checklist:
 
 ---
 
-## 9. Lessons that generalize
+## 10. Lessons that generalize
 
 - **Don't replace working algorithms without identifying what's wrong with
   them first.** The blue-noise regression cost 8 days because the existing
