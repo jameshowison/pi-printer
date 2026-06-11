@@ -1,12 +1,19 @@
 #include <pappl/pappl.h>
 #include <unistd.h>
 
-#define APP_VERSION  "0.1.0"
+#define APP_VERSION  "0.5.0"
 #ifdef GIT_HASH
 #  define DRIVER_VERSION  APP_VERSION "-" GIT_HASH
 #else
 #  define DRIVER_VERSION  APP_VERSION
 #endif
+/* IPP_FIRMWARE_VERSION is what we publish to papplMainloop and therefore to the IPP
+ * attribute printer-firmware-string-version. It MUST stay stable across
+ * rebuilds — macOS treats a changed firmware-version as a printer update and
+ * prompts for admin auth to refresh the driver. Bump APP_VERSION only on a
+ * deliberate release. The git hash still appears in the footer (visible on
+ * the supplies page) via DRIVER_VERSION below. */
+#define IPP_FIRMWARE_VERSION  APP_VERSION
 #define DRIVER_NAME  "hl5170dn"
 #define PRINTER_NAME "hl5170dn"
 
@@ -128,7 +135,7 @@ static pappl_system_t *system_cb(int num_options, cups_option_t *options,
 int main(int argc, char *argv[])
 {
     return papplMainloop(argc, argv,
-        DRIVER_VERSION,
+        IPP_FIRMWARE_VERSION,
         APP_FOOTER_HTML,/* footer_html — non-NULL to bypass PAPPL's
                            localised default footer (crashes in 1.4 when
                            no localisation strings are registered). */
