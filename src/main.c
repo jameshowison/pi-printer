@@ -18,7 +18,8 @@
 #define PRINTER_NAME "hl5170dn"
 
 /* USB URI confirmed by Investigation 3 (papplDeviceRead probe).
- * Serial L4J624176 is hard-coded; replace if the printer is swapped. */
+ * Serial L4J624176 is hard-coded; replace if the printer is swapped.
+ * (Built against patched PAPPL pi-printer-dev: persists config_time.) */
 #define DEVICE_URI   "usb://Brother/HL-5170DN%20series?serial=L4J624176"
 
 /* Defined in driver.c */
