@@ -969,7 +969,7 @@ static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
     papplLogJob(job, PAPPL_LOGLEVEL_INFO, "%s: end job (elapsed %lds)",
         jd->ctx, (long)(time(NULL) - jd->start_time));
 
-    pjl_write_job_trailer(device, /*restore_powersave=*/true);
+    pjl_write_job_close(device, /*restore_powersave=*/true);
 
     /* Poll status now, while the USB session is still open.  At this point
      * the printer is busy physically printing what's left in its PCL buffer
@@ -2950,7 +2950,16 @@ jobs_done:
             int target_impressions = (int)pagenum;
             time_t last_progress = time(NULL);
             int    last_seen      = jd_wait->last_impressions_reported;
-            const int no_progress_timeout_s = 60;
+            /* No-progress timeout (not total).  Once EOJ has flushed the
+             * duplexer, the printer emits a PAGE event every few seconds
+             * while sheets are moving — silence longer than this means a
+             * real fault (jam, offline), not normal duplex ejection. */
+            const int no_progress_timeout_s = 20;
+
+            /* Send PJL EOJ now so the engine flushes any sheet held in the
+             * duplexer on odd-page duplex jobs.  Must precede tail-wait or
+             * the final PAGE event will never arrive. */
+            pjl_write_job_eoj(device);
 
             papplLogJob(job, PAPPL_LOGLEVEL_INFO,
                 "%s: tail-wait: %d/%d impressions, draining back-channel",

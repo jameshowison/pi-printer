@@ -19,5 +19,11 @@ typedef struct {
 /* Emit UEL + all PJL SET commands + ENTER LANGUAGE=PCL.  Flushes. */
 void pjl_write_job_header(pappl_device_t *dev, const pjl_job_params_t *p);
 
-/* Emit UEL + EOJ + optional POWERSAVE=ON restore.  Flushes. */
-void pjl_write_job_trailer(pappl_device_t *dev, bool restore_powersave);
+/* Emit UEL + EOJ to flush any sheet held in the duplexer.  Leaves USTATUS
+ * PAGE enabled so the ejected page can still report on the back-channel.
+ * Called from pdf_filter_cb before tail-wait. */
+void pjl_write_job_eoj(pappl_device_t *dev);
+
+/* Emit USTATUSOFF + optional POWERSAVE=ON + final UEL to close the PJL
+ * session.  Called from rendjob_cb after tail-wait. */
+void pjl_write_job_close(pappl_device_t *dev, bool restore_powersave);

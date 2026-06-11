@@ -72,17 +72,24 @@ void pjl_write_job_header(pappl_device_t *dev, const pjl_job_params_t *p)
     papplDeviceFlush(dev);
 }
 
-void pjl_write_job_trailer(pappl_device_t *dev, bool restore_powersave)
+void pjl_write_job_eoj(pappl_device_t *dev)
+{
+    /* UEL exits PCL back to PJL, then EOJ tells the engine the job is
+     * complete — this is what flushes a sheet held in the duplexer on
+     * odd-page duplex jobs.  USTATUS PAGE is left enabled so the ejected
+     * sheet still produces a back-channel event during tail-wait. */
+    papplDeviceWrite(dev, UEL, UEL_LEN);
+    papplDeviceWrite(dev, "@PJL EOJ\r\n", 10);
+    papplDeviceFlush(dev);
+}
+
+void pjl_write_job_close(pappl_device_t *dev, bool restore_powersave)
 {
     char buf[128];
     int  n;
 
-    /* UEL exits PCL back to PJL. */
-    papplDeviceWrite(dev, UEL, UEL_LEN);
-
     n = snprintf(buf, sizeof(buf),
         "@PJL USTATUSOFF\r\n"
-        "@PJL EOJ\r\n"
         "%s",
         restore_powersave ? "@PJL SET POWERSAVE=ON\r\n" : "");
     papplDeviceWrite(dev, buf, (size_t)n);
