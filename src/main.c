@@ -17,7 +17,8 @@
 #define DRIVER_NAME  "hl5170dn"
 #define PRINTER_NAME "hl5170dn"
 
-/* USB URI confirmed by Investigation 3 (papplDeviceRead probe). */
+/* USB URI confirmed by Investigation 3 (papplDeviceRead probe).
+ * Serial L4J624176 is hard-coded; replace if the printer is swapped. */
 #define DEVICE_URI   "usb://Brother/HL-5170DN%20series?serial=L4J624176"
 
 /* Defined in driver.c */
