@@ -53,6 +53,19 @@ void pjl_write_job_header(pappl_device_t *dev, const pjl_job_params_t *p)
         papplDeviceWrite(dev, buf, (size_t)n);
     }
 
+    /* Enable unsolicited status so the printer pushes back-channel updates during the job.
+     * DEVICE=VERBOSE fires on any status change; TIMED=5 fires every 5 seconds;
+     * PAGE=ON fires on each physical page completion (manual §7.6.3 says EOJ
+     * resets the counter; empirical behaviour is still to be confirmed by the
+     * raw-logging reader thread).  Drained continuously by a dedicated reader
+     * thread in pdf_filter_cb so events are captured in real time, not buffered
+     * up and drained in bursts. */
+    n = snprintf(buf, sizeof(buf),
+        "@PJL USTATUS DEVICE = VERBOSE\r\n"
+        "@PJL USTATUS TIMED = 5\r\n"
+        "@PJL USTATUS PAGE = ON\r\n");
+    papplDeviceWrite(dev, buf, (size_t)n);
+
     n = snprintf(buf, sizeof(buf), "@PJL ENTER LANGUAGE=PCL\r\n");
     papplDeviceWrite(dev, buf, (size_t)n);
 
@@ -68,6 +81,7 @@ void pjl_write_job_trailer(pappl_device_t *dev, bool restore_powersave)
     papplDeviceWrite(dev, UEL, UEL_LEN);
 
     n = snprintf(buf, sizeof(buf),
+        "@PJL USTATUSOFF\r\n"
         "@PJL EOJ\r\n"
         "%s",
         restore_powersave ? "@PJL SET POWERSAVE=ON\r\n" : "");

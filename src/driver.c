@@ -98,6 +98,34 @@ typedef struct {
     char           pgm_path[64];   /* /tmp/hl5170dn-raster-<jobid>-<page>.pgm */
     FILE          *pgm_fp;         /* open for write during rwriteline_cb */
     unsigned       pgm_content_h;  /* rows written into the PGM */
+
+    /* USTATUS PAGE physical-page tracking — driven by @PJL USTATUS PAGE responses
+     * the printer pushes on each actual page ejection.  Used to call
+     * papplJobSetImpressionsCompleted so macOS shows real "X of N" progress.
+     * USTATUS PAGE counts *physical sheets*; for duplex, each sheet = 2 impressions.
+     *
+     * The HL-5170DN reports CUMULATIVE PAGE counts that don't reset across jobs
+     * (despite the manual saying EOJ resets the counter — empirically it doesn't).
+     * phys_page_baseline captures the first PAGE value seen in this job so that
+     * job-relative sheet count = phys_page - phys_page_baseline. */
+    int            pages_printed;       /* job-relative sheet count (after baseline subtraction) */
+    int            phys_page_baseline;  /* first absolute PAGE value seen this job; -1 = unset */
+    bool           duplex;              /* set in rstartjob from options->sides */
+
+    /* papplJobSetImpressionsCompleted is an ADDER, not a setter.  Track the last
+     * cumulative value we sent so we can pass deltas. */
+    int            last_impressions_reported;
+
+    /* Tail-wait progress is driven by @PJL INFO PAGECOUNT polling — the printer's
+     * lifetime ejected-sheet counter.  pagecount_baseline is the count captured
+     * before this job started; job-relative sheets = current - baseline.
+     * -1 sentinel = not captured yet (will be set lazily from first tail-wait query). */
+    int            pagecount_baseline;
+
+    /* Wall-clock timestamp of last back-channel drain.  Used to rate-limit
+     * the interleaved short-timeout reads in the streaming loop so we don't
+     * peek too often. */
+    time_t          last_drain_time;
 } hl5170dn_job_t;
 
 /* ---- Phase 4: rich job-context prefix --------------------------------- */
@@ -400,6 +428,10 @@ static void pjl_params_from_options(const pappl_pr_options_t *opts,
 
 /* ---- Raster callbacks -------------------------------------------------- */
 
+static void hl5170dn_poll_status(pappl_printer_t *printer,
+                                  pappl_device_t  *device,
+                                  bool             offline_on_no_response);
+
 static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
                                 pappl_device_t *device)
 {
@@ -501,8 +533,13 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
     pjl_job_params_t pjl;
     pjl_params_from_options(options, &pjl);
 
-    jd->start_time = time(NULL);
-    jd->resolution = pjl.resolution;
+    jd->start_time                = time(NULL);
+    jd->resolution                = pjl.resolution;
+    jd->duplex                    = pjl.duplex;
+    jd->phys_page_baseline        = -1; /* captured from first USTATUS PAGE event */
+    jd->last_impressions_reported = 0;  /* PAPPL counter starts at 0 */
+    jd->pagecount_baseline        = -1; /* legacy — INFO PAGECOUNT polling abandoned */
+    jd->last_drain_time           = 0;  /* drain on first opportunity */
     /* halftone_buf and line_buf are NULL/0 from calloc; allocated in rstartpage */
 
     papplJobSetData(job, jd);
@@ -527,6 +564,13 @@ static bool hl5170dn_rstartjob(pappl_job_t *job, pappl_pr_options_t *options,
         options->media.left_margin, options->media.right_margin,
         options->media.top_margin, options->media.bottom_margin,
         (int)options->print_scaling);
+
+    /* Poll printer state at job-start so the cache is fresh before we render.
+     * Detects paper-out / offline before wasting CPU on GS.  The PAGECOUNT
+     * baseline for tail-wait is captured in pdf_filter_cb after this returns
+     * (supply_baselines_t is defined further down in the file). */
+    hl5170dn_poll_status(papplJobGetPrinter(job), device,
+                         /*offline_on_no_response=*/true);
 
     pjl_write_job_header(device, &pjl);
     return true;
@@ -913,9 +957,6 @@ static bool hl5170dn_rendpage(pappl_job_t *job, pappl_pr_options_t *options,
     return true;
 }
 
-static void hl5170dn_poll_status(pappl_printer_t *printer,
-                                  pappl_device_t  *device);
-
 static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
                               pappl_device_t *device)
 {
@@ -930,9 +971,11 @@ static bool hl5170dn_rendjob(pappl_job_t *job, pappl_pr_options_t *options,
 
     pjl_write_job_trailer(device, /*restore_powersave=*/true);
 
-    /* Poll status now, while the USB session is still open.  This is the only
-     * time supply levels can have changed, so we never need to poll at idle. */
-    hl5170dn_poll_status(papplJobGetPrinter(job), device);
+    /* Poll status now, while the USB session is still open.  At this point
+     * the printer is busy physically printing what's left in its PCL buffer
+     * — if it doesn't respond, that's transient, not OFFLINE. */
+    hl5170dn_poll_status(papplJobGetPrinter(job), device,
+                         /*offline_on_no_response=*/false);
 
     if (jd->pgm_fp)      { fclose(jd->pgm_fp); jd->pgm_fp = NULL; }
     if (jd->pgm_path[0]) { unlink(jd->pgm_path); jd->pgm_path[0] = '\0'; }
@@ -1257,63 +1300,137 @@ static const pjl_code_info_t *pjl_code_lookup(int code)
     return NULL;
 }
 
-/* Poll the printer for status and supply levels over an already-open device.
- * Called once at job end, while the USB session is still active.  Supply
- * levels only change during a print job, so there is no reason to poll at
- * any other time. */
-static void hl5170dn_poll_status(pappl_printer_t *printer,
-                                  pappl_device_t  *device)
+
+/* Forward decl — defined just below. */
+static void apply_pjl_status_response(pappl_printer_t *printer,
+                                       const char *buf, ssize_t bytes);
+
+/* Scan a USTATUS drain buffer for @PJL USTATUS PAGE responses and return the
+ * highest page number found.  Format per manual §7.6.3:
+ *     @PJL USTATUS PAGE\r\n<N>\r\n\f
+ * Multiple packets may be concatenated; take the most recent (highest) N.
+ * Returns -1 if no PAGE packet is present. */
+static int parse_ustatus_pages_latest(const char *buf)
 {
-    /* Send @PJL INFO STATUS and @PJL INFO PAGECOUNT in one session. */
-    static const char query[] =
-        "\033%-12345X@PJL\r\n"
-        "@PJL INFO STATUS\r\n"
-        "@PJL INFO PAGECOUNT\r\n"
-        "\033%-12345X";
-    papplDeviceWrite(device, query, sizeof(query) - 1);
-    papplDeviceFlush(device);
-
-    /* Read response.  The printer may return INFO STATUS and INFO PAGECOUNT
-     * in one packet or split across two.  Do a second read if PAGECOUNT is
-     * missing from the first. */
-    char    buf[2048];
-    ssize_t bytes = papplDeviceRead(device, buf, sizeof(buf) - 1);
-
-    if (bytes <= 0) {
-        papplLogPrinter(printer, PAPPL_LOGLEVEL_WARN,
-            "status: no response from printer (bytes=%ld)", (long)bytes);
-        return;
-    }
-    buf[bytes] = '\0';
-
-    if (!strstr(buf, "PAGECOUNT=")) {
-        char    buf2[1024];
-        ssize_t bytes2 = papplDeviceRead(device, buf2, sizeof(buf2) - 1);
-        if (bytes2 > 0) {
-            buf2[bytes2] = '\0';
-            if ((size_t)(bytes + bytes2) < sizeof(buf) - 1) {
-                memcpy(buf + bytes, buf2, (size_t)bytes2 + 1);
-                bytes += bytes2;
-            } else {
-                char *pc = strstr(buf2, "PAGECOUNT=");
-                if (pc) {
-                    size_t avail = sizeof(buf) - 1 - (size_t)bytes;
-                    size_t tlen  = strlen(pc);
-                    if (tlen < avail) {
-                        memcpy(buf + bytes, pc, tlen + 1);
-                        bytes += (ssize_t)tlen;
-                    }
-                }
-            }
+    int latest = -1;
+    const char *p = buf;
+    while ((p = strstr(p, "@PJL USTATUS PAGE")) != NULL) {
+        p += 17;                          /* past "@PJL USTATUS PAGE" */
+        while (*p == '\r' || *p == '\n') p++;
+        if (*p >= '0' && *p <= '9') {
+            int n = atoi(p);
+            if (n > latest) latest = n;
         }
+        p++;                              /* keep scanning */
+    }
+    return latest;
+}
+
+/* Apply a USTATUS PAGE event to job state and macOS-visible impressions.
+ *
+ * Empirical finding from job 14 (9-page duplex, 3 sheets ejected before paper
+ * error): USTATUS PAGE values were 2, 4, 6 — i.e. the printer fires PAGE
+ * events with the cumulative *impression* count (sides imaged), not the sheet
+ * count.  For duplex, each sheet contributes 2 to that count.  The printer
+ * resets USTATUS PAGE per job at EOJ (manual §7.6.3), so PAGE values are
+ * job-relative and small.
+ *
+ * Therefore: impressions-completed = PAGE value directly, no duplex multiplier,
+ * no baseline subtraction needed.  Cap at target to handle any over-firing
+ * (e.g. a duplex job with a blank back side may still increment PAGE).
+ *
+ * The phys_page_baseline field is kept for diagnostic logging of the very
+ * first event we see (which is typically 1 for simplex or 2 for duplex —
+ * the latter because the printer batches both-sides events into one USB
+ * packet and our parser returns the higher value).
+ *
+ * `cap`: if > 0, impressions are capped at that value (used by streaming-phase
+ * callers to bound the value at the running logical-page count).  Pass 0
+ * (or INT_MAX) for "no cap".
+ *
+ * Returns true if impressions were updated. */
+static bool update_impressions_from_ustatus(pappl_job_t *job,
+                                             hl5170dn_job_t *jd,
+                                             const char *buf,
+                                             int cap,
+                                             const char *log_ctx,
+                                             const char *log_phase)
+{
+    int phys_page = parse_ustatus_pages_latest(buf);
+    if (phys_page <= 0 || !jd)
+        return false;
+
+    if (jd->phys_page_baseline < 0) {
+        jd->phys_page_baseline = phys_page;       /* purely diagnostic */
+        papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+            "%s: %s: USTATUS PAGE first event = %d "
+            "(treating as job-relative impressions)",
+            log_ctx, log_phase, phys_page);
     }
 
-    /* Parse CODE=, DISPLAY=, ONLINE=, and PAGECOUNT=. */
+    int impressions = phys_page;
+    if (cap > 0 && impressions > cap)
+        impressions = cap;
+
+    if (impressions <= jd->last_impressions_reported)
+        return false;
+    jd->pages_printed = impressions;
+
+    /* papplJobSetImpressionsCompleted ADDS its argument; send the delta. */
+    int delta = impressions - jd->last_impressions_reported;
+    if (delta <= 0)
+        return false;
+    papplJobSetImpressionsCompleted(job, delta);
+    jd->last_impressions_reported = impressions;
+
+    papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+        "%s: %s: PAGE=%d → impressions=%d/%d (+%d)",
+        log_ctx, log_phase, phys_page,
+        impressions, cap > 0 ? cap : phys_page, delta);
+    return true;
+}
+
+/* Drain any back-channel USTATUS data from the USB IN endpoint with a short
+ * timeout.  Single-threaded — must only be called from the same thread that
+ * does papplDeviceWrite (the main job thread).  This is the CUPS USB pattern:
+ * interleave short-timeout IN reads between OUT chunks, treating timeout as
+ * "nothing to read right now."
+ *
+ * `cap` is forwarded to update_impressions_from_ustatus to bound the
+ * impressions count (typically the current pagenum).
+ *
+ * Requires the PAPPL feat/device-read-with-timeout branch
+ * (`papplDeviceReadTimed`). */
+static void drain_back_channel(pappl_job_t *job, pappl_device_t *device,
+                                hl5170dn_job_t *jd, int cap,
+                                int timeout_ms, const char *log_ctx,
+                                const char *log_phase)
+{
+    char    buf[2048];
+    ssize_t n = papplDeviceReadTimed(device, buf, sizeof(buf) - 1, timeout_ms);
+    if (n > 0) {
+        buf[n] = '\0';
+        apply_pjl_status_response(papplJobGetPrinter(job), buf, n);
+        update_impressions_from_ustatus(job, jd, buf, cap,
+                                        log_ctx, log_phase);
+    }
+    /* n <= 0: nothing to read in the timeout window — continue silently. */
+}
+
+/* Parse a PJL status response buffer (INFO STATUS, USTATUS TIMED, or USTATUS DEVICE)
+ * and apply the result to the PAPPL printer state and the on-disk cache.
+ * PAGECOUNT= is optional — USTATUS responses don't include it. */
+static void apply_pjl_status_response(pappl_printer_t *printer,
+                                       const char *buf, ssize_t bytes)
+{
+    (void)bytes;
+
     int  code       = -1;
     bool online     = false;
     long page_count = -1;
     char display[64] = "";
-    char *p;
+    const char *p;
+
     if ((p = strstr(buf, "CODE=")) != NULL)
         code = atoi(p + 5);
     if ((p = strstr(buf, "ONLINE=")) != NULL)
@@ -1322,9 +1439,13 @@ static void hl5170dn_poll_status(pappl_printer_t *printer,
         page_count = atol(p + 10);
     if ((p = strstr(buf, "DISPLAY=")) != NULL) {
         p += 8;
-        if (*p == '"') p++;
-        char *end = p;
-        while (*end && *end != '"' && *end != '\r' && *end != '\n') end++;
+        /* USTATUS DEVICE uses single quotes; INFO STATUS uses double quotes. */
+        char quote = (*p == '"' || *p == '\'') ? *p++ : 0;
+        const char *end = p;
+        while (*end && *end != '\r' && *end != '\n') {
+            if (quote && *end == quote) break;
+            end++;
+        }
         size_t len = (size_t)(end - p);
         if (len >= sizeof(display)) len = sizeof(display) - 1;
         memcpy(display, p, len);
@@ -1378,7 +1499,7 @@ static void hl5170dn_poll_status(pappl_printer_t *printer,
                 add = PAPPL_PREASON_OTHER;
             break;
     }
-    if (!online && code >= 40001 && code <= 40999)
+    if (!online)
         add |= PAPPL_PREASON_OFFLINE;
     papplPrinterSetReasons(printer, add, remove);
 
@@ -1413,6 +1534,87 @@ static void hl5170dn_poll_status(pappl_printer_t *printer,
 
         papplPrinterSetSupplies(printer, 2, supplies);
     }
+}
+
+/* Poll the printer for status and supply levels over an already-open device.
+ * Called at job start and job end while the USB session is active.
+ *
+ * offline_on_no_response: true for pre-job poll (printer should be responsive
+ * at job start; silence really does mean offline).  false for post-job poll
+ * (printer is busy physically printing the buffered PCL we just sent; it
+ * won't service PJL queries until that finishes — silence is transient). */
+static void hl5170dn_poll_status(pappl_printer_t *printer,
+                                  pappl_device_t  *device,
+                                  bool             offline_on_no_response)
+{
+    /* Send @PJL INFO STATUS and @PJL INFO PAGECOUNT in one session. */
+    static const char query[] =
+        "\033%-12345X@PJL\r\n"
+        "@PJL INFO STATUS\r\n"
+        "@PJL INFO PAGECOUNT\r\n"
+        "\033%-12345X";
+    papplDeviceWrite(device, query, sizeof(query) - 1);
+    papplDeviceFlush(device);
+
+    /* Read response.  The printer may return INFO STATUS and INFO PAGECOUNT
+     * in one packet or split across two.  Do a second read if PAGECOUNT is
+     * missing from the first. */
+    char    buf[2048];
+    ssize_t bytes = papplDeviceRead(device, buf, sizeof(buf) - 1);
+
+    if (bytes <= 0) {
+        if (offline_on_no_response) {
+            papplLogPrinter(printer, PAPPL_LOGLEVEL_WARN,
+                "status: no response from printer (bytes=%ld) — marking OFFLINE",
+                (long)bytes);
+            supply_baselines_t sc;
+            read_baselines(&sc);
+            sc.pjl_online    = 0;
+            sc.pjl_poll_time = (long)time(NULL);
+            write_conf(&sc);
+            pappl_preason_t no_resp_remove = PAPPL_PREASON_COVER_OPEN |
+                                             PAPPL_PREASON_MEDIA_EMPTY |
+                                             PAPPL_PREASON_MEDIA_JAM   |
+                                             PAPPL_PREASON_TONER_LOW   |
+                                             PAPPL_PREASON_TONER_EMPTY |
+                                             PAPPL_PREASON_MARKER_SUPPLY_EMPTY |
+                                             PAPPL_PREASON_OFFLINE     |
+                                             PAPPL_PREASON_OTHER;
+            papplPrinterSetReasons(printer, PAPPL_PREASON_OFFLINE, no_resp_remove);
+        } else {
+            /* Post-job: printer is busy processing the PCL buffer.  Don't
+             * mutate cache/reasons — leave the mid-job USTATUS state intact. */
+            papplLogPrinter(printer, PAPPL_LOGLEVEL_INFO,
+                "status: no response at job-end (printer busy printing buffer); "
+                "leaving cached state intact");
+        }
+        return;
+    }
+    buf[bytes] = '\0';
+
+    if (!strstr(buf, "PAGECOUNT=")) {
+        char    buf2[1024];
+        ssize_t bytes2 = papplDeviceRead(device, buf2, sizeof(buf2) - 1);
+        if (bytes2 > 0) {
+            buf2[bytes2] = '\0';
+            if ((size_t)(bytes + bytes2) < sizeof(buf) - 1) {
+                memcpy(buf + bytes, buf2, (size_t)bytes2 + 1);
+                bytes += bytes2;
+            } else {
+                char *pc = strstr(buf2, "PAGECOUNT=");
+                if (pc) {
+                    size_t avail = sizeof(buf) - 1 - (size_t)bytes;
+                    size_t tlen  = strlen(pc);
+                    if (tlen < avail) {
+                        memcpy(buf + bytes, pc, tlen + 1);
+                        bytes += (ssize_t)tlen;
+                    }
+                }
+            }
+        }
+    }
+
+    apply_pjl_status_response(printer, buf, bytes);
 }
 
 /* Status callback — serves cached data from the last job-end poll.
@@ -1457,7 +1659,7 @@ static bool hl5170dn_status(pappl_printer_t *printer)
                 add = PAPPL_PREASON_OTHER;
             break;
     }
-    if (!online && code >= 40001 && code <= 40999)
+    if (!online)
         add |= PAPPL_PREASON_OFFLINE;
     papplPrinterSetReasons(printer, add, remove);
 
@@ -1619,12 +1821,15 @@ static void render_status_panel(pappl_client_t *client,
 {
     const pjl_code_info_t *info = pjl_code_lookup(conf->pjl_code);
 
-    /* Panel header colour: grey=never polled, red=error, green=ok/low. */
+    bool is_offline = (conf->pjl_poll_time > 0 && !conf->pjl_online);
+    bool is_error   = (conf->pjl_code >= 40001 && conf->pjl_code <= 40999 &&
+                       conf->pjl_code != 40039);
+
+    /* Panel header colour: grey=never polled, red=error/offline, green=ok. */
     const char *hdr_color;
     if (conf->pjl_poll_time == 0)
         hdr_color = "#888";
-    else if (conf->pjl_code >= 40001 && conf->pjl_code <= 40999 &&
-             conf->pjl_code != 40039)
+    else if (is_offline || is_error)
         hdr_color = "#c22";
     else
         hdr_color = "#2a2";
@@ -1640,7 +1845,9 @@ static void render_status_panel(pappl_client_t *client,
     /* Overall indicator dot in header. */
     if (conf->pjl_poll_time == 0)
         papplClientHTMLPuts(client, "<span>&#9675; Unknown</span>\n");
-    else if (hdr_color[1] == 'c')
+    else if (is_offline)
+        papplClientHTMLPuts(client, "<span>&#9679; Offline</span>\n");
+    else if (is_error)
         papplClientHTMLPuts(client, "<span>&#9679; Error</span>\n");
     else
         papplClientHTMLPuts(client, "<span>&#9679; OK</span>\n");
@@ -1658,17 +1865,26 @@ static void render_status_panel(pappl_client_t *client,
             "            <div style=\"padding:1em\">\n"
             "            <table>\n<tbody>\n");
 
+        /* "Printer reports" — the DISPLAY string is the printer's own self-
+         * description in plain text (the HL-5170DN has no LCD, but the firmware
+         * still populates DISPLAY with status strings).  Surface it prominently. */
         if (conf->pjl_display[0])
             papplClientHTMLPrintf(client,
                 "<tr><th style=\"text-align:right;padding-right:1em\">"
-                "LCD display</th><td><strong>%s</strong></td></tr>\n",
+                "Printer reports</th>"
+                "<td><strong>&ldquo;%s&rdquo;</strong></td></tr>\n",
                 conf->pjl_display);
+
+        /* When offline disagrees with the cached code (e.g. ONLINE=FALSE arrived
+         * without a fresh CODE), mute the code — it's stale, not current truth. */
+        const char *code_style =
+            (is_offline && !is_error) ? " style=\"color:#888\"" : "";
 
         if (info) {
             papplClientHTMLPrintf(client,
                 "<tr><th style=\"text-align:right;padding-right:1em\">"
-                "Code</th><td>%d &mdash; %s</td></tr>\n",
-                conf->pjl_code, info->description);
+                "Code</th><td%s>%d &mdash; %s</td></tr>\n",
+                code_style, conf->pjl_code, info->description);
             if (info->action[0])
                 papplClientHTMLPrintf(client,
                     "<tr><th style=\"text-align:right;padding-right:1em\">"
@@ -1677,31 +1893,48 @@ static void render_status_panel(pappl_client_t *client,
         } else if (conf->pjl_code > 0) {
             papplClientHTMLPrintf(client,
                 "<tr><th style=\"text-align:right;padding-right:1em\">"
-                "Code</th><td>%d &mdash; (unknown status)</td></tr>\n",
-                conf->pjl_code);
+                "Code</th><td%s>%d &mdash; (unknown status)</td></tr>\n",
+                code_style, conf->pjl_code);
         }
 
-        /* Last polled time. */
+        /* Last polled time — absolute + relative.  Mute when stale (>60s). */
         {
             char tbuf[32];
-            time_t t = (time_t)conf->pjl_poll_time;
+            time_t now = time(NULL);
+            time_t t   = (time_t)conf->pjl_poll_time;
             struct tm *tm = localtime(&t);
-            strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", tm);
+            long age = (long)(now - t);
+            strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", tm);
+
+            const char *age_style = (age > 60) ? " style=\"color:#888\"" : "";
+            char age_str[64];
+            if (age < 60)
+                snprintf(age_str, sizeof(age_str), "%lds ago", age);
+            else if (age < 3600)
+                snprintf(age_str, sizeof(age_str), "%ldm ago", age / 60);
+            else
+                snprintf(age_str, sizeof(age_str), "%ldh ago", age / 3600);
+
             papplClientHTMLPrintf(client,
                 "<tr><th style=\"text-align:right;padding-right:1em\">"
-                "Last polled</th><td>%s</td></tr>\n", tbuf);
+                "Last polled</th><td%s>%s (%s)</td></tr>\n",
+                age_style, tbuf, age_str);
         }
 
         papplClientHTMLPuts(client, "</tbody>\n</table>\n");
 
         /* LED diagram. */
-        if (info) {
+        if (info || is_offline) {
             papplClientHTMLPuts(client,
                 "<p style=\"margin-top:0.8em\"><strong>LEDs:</strong>&nbsp;");
-            render_led(client, "Status", info->led_status);
-            render_led(client, "Toner",  info->led_toner);
-            render_led(client, "Drum",   info->led_drum);
-            render_led(client, "Paper",  info->led_paper);
+            render_led(client, "Status",
+                       is_offline ? "red-blink" : info->led_status);
+            render_led(client, "Toner",
+                       (info && !is_offline) ? info->led_toner : "off");
+            render_led(client, "Drum",
+                       (info && !is_offline) ? info->led_drum  : "off");
+            render_led(client, "Paper",
+                       (info && !is_offline) ? info->led_paper : "off");
             papplClientHTMLPuts(client, "</p>\n");
         }
 
@@ -1782,7 +2015,7 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
         if (conf.pjl_code == 40050 && drum_pct  > 0)  drum_pct  = 0;
     }
 
-    papplClientHTMLPrinterHeader(client, printer, "Supplies", 0, NULL, NULL);
+    papplClientHTMLPrinterHeader(client, printer, "Supplies", 5, NULL, NULL);
 
     papplClientHTMLPuts(client, "          <div class=\"section\">\n");
 
@@ -2423,6 +2656,11 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
             jd_mark->is_pdf_path = true;
     }
 
+    /* USTATUS PAGE=ON is now active in the printer (sent by
+     * pjl_write_job_header inside rstartjob_cb above).  Back-channel data
+     * will be drained inline from the streaming row loop via the CUPS USB
+     * pattern: short-timeout papplDeviceReadTimed peeks between OUT chunks. */
+
     {
         hl5170dn_job_t *jd = papplJobGetData(job);
 
@@ -2632,6 +2870,18 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
                                                   "\x1b*b%uW", (unsigned)enc);
                     papplDeviceWrite(device, pcl_hdr, (size_t)pcl_hdr_len);
                     papplDeviceWrite(device, jd->line_buf, enc);
+
+                    /* Interleaved back-channel drain: at least once per second
+                     * during streaming, peek for USTATUS PAGE events.  Cap
+                     * impressions at current pagenum (1-based for in-flight
+                     * page).  5 ms timeout — non-blocking peek. */
+                    time_t now = time(NULL);
+                    if (now != jd->last_drain_time) {
+                        drain_back_channel(job, device, jd,
+                                           (int)(pagenum + 1),
+                                           /*timeout_ms=*/5, ctx, "row");
+                        jd->last_drain_time = now;
+                    }
                 }
             }
         }
@@ -2655,6 +2905,19 @@ static bool pdf_filter_cb(pappl_job_t *job, pappl_device_t *device, void *cbdata
 
         if (page_started)
             pagenum++;
+
+        /* Drain back-channel between pages — same-thread, short timeout so we
+         * don't stall the next page's data flow.  Capped at current pagenum
+         * so macOS never sees impressions ahead of pages we've actually sent. */
+        if (page_started && !papplJobIsCanceled(job)) {
+            hl5170dn_job_t *jd_drain = papplJobGetData(job);
+            if (jd_drain) {
+                drain_back_channel(job, device, jd_drain, (int)pagenum,
+                                   /*timeout_ms=*/50, ctx, "stream");
+                jd_drain->last_drain_time = time(NULL);
+            }
+        }
+
         if (!page_ok || papplJobIsCanceled(job))
             break;
     }
@@ -2663,11 +2926,72 @@ jobs_done:
     ok = (pagenum > 0);
     papplLogJob(job, PAPPL_LOGLEVEL_INFO,
         "%s: pdf_filter: %s — %u page(s)", ctx, ok ? "ok" : "FAILED", pagenum);
+
+    /* Set job-impressions total so macOS Print Center has the denominator for
+     * "X of N" display.  macOS doesn't include job-impressions in Create-Job,
+     * so PAPPL's default is 0; one impression per logical PDF page is the IPP
+     * convention.  Doing this here (not at job start) means we use the
+     * authoritative page count GS actually produced. */
+    if (ok)
+        papplJobSetImpressions(job, (int)pagenum);
     if (papplJobIsCanceled(job))
         papplLogJob(job, PAPPL_LOGLEVEL_INFO,
             "%s: pdf_filter: cancelled after %u complete page(s)", ctx, pagenum);
 
+    /* Tail-wait: hold pdf_filter_cb open while physical pages are still being
+     * ejected.  Now that the streaming loop is done, the main thread isn't
+     * writing PCL — we can safely use a longer back-channel read timeout.
+     * Loop: short sleep, drain back-channel, check progress / cancel /
+     * timeout.  Keeps the IPP job state in `processing` so macOS Print
+     * Center has time to render progress. */
+    if (ok && !papplJobIsCanceled(job)) {
+        hl5170dn_job_t *jd_wait = papplJobGetData(job);
+        if (jd_wait) {
+            int target_impressions = (int)pagenum;
+            time_t last_progress = time(NULL);
+            int    last_seen      = jd_wait->last_impressions_reported;
+            const int no_progress_timeout_s = 60;
+
+            papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                "%s: tail-wait: %d/%d impressions, draining back-channel",
+                ctx, last_seen, target_impressions);
+
+            while (1) {
+                if (papplJobIsCanceled(job)) break;
+                if (jd_wait->last_impressions_reported >= target_impressions)
+                    break;
+                if ((time(NULL) - last_progress) >= no_progress_timeout_s)
+                    break;
+
+                /* 500 ms timeout — long enough to capture a USTATUS push,
+                 * short enough to be responsive to cancel/timeout. */
+                drain_back_channel(job, device, jd_wait, target_impressions,
+                                   500, ctx, "tail");
+
+                if (jd_wait->last_impressions_reported != last_seen) {
+                    last_progress = time(NULL);
+                    last_seen     = jd_wait->last_impressions_reported;
+                }
+            }
+
+            int final = jd_wait->last_impressions_reported;
+            if (final >= target_impressions)
+                papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                    "%s: tail-wait: complete — all %d impressions printed",
+                    ctx, target_impressions);
+            else if (papplJobIsCanceled(job))
+                papplLogJob(job, PAPPL_LOGLEVEL_INFO,
+                    "%s: tail-wait: cancelled at %d/%d impressions",
+                    ctx, final, target_impressions);
+            else
+                papplLogJob(job, PAPPL_LOGLEVEL_WARN,
+                    "%s: tail-wait: no progress for %ds — bailing at %d/%d",
+                    ctx, no_progress_timeout_s, final, target_impressions);
+        }
+    }
+
 done:
+
     if (job_started)
         drv.rendjob_cb(job, options, device);
 
