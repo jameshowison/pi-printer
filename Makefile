@@ -14,7 +14,7 @@ TARGET  = hl5170dn-printer-app
 SRCS = src/main.c src/driver.c src/pjl.c src/packbits.c
 OBJS = $(SRCS:.c=.o)
 
-.PHONY: all clean install redeploy pdfs
+.PHONY: all clean install redeploy pdfs bump-config
 
 all: $(TARGET)
 
@@ -62,6 +62,19 @@ clean:
 
 redeploy: $(TARGET)
 	sudo /usr/local/sbin/pi-printer-deploy
+
+# Force macOS to refresh its cached driver profile on next print.
+# Clears the capability fingerprint so the next service start will detect
+# a mismatch and bump printer-config-change-date-time. Also rewrites the
+# ConfigTime line in the state file directly, so a print issued without
+# a service restart still sees the new value.
+bump-config:
+	sudo systemctl stop hl5170dn-printer-app
+	sudo sed -i "s/^ConfigTime .*/ConfigTime $$(date +%s)/" \
+	    /var/lib/hl5170dn-printer-app/hl5170dn-printer-app.state
+	sudo rm -f /var/lib/hl5170dn-printer-app/caps.fp
+	sudo systemctl start hl5170dn-printer-app
+	@echo "ConfigTime bumped, caps.fp cleared."
 
 install: $(TARGET)
 	systemctl stop hl5170dn-printer-app || true

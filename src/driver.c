@@ -1006,6 +1006,7 @@ static void hl5170dn_identify(pappl_printer_t *printer,
 #define TONER_RATED_TN540  3300   /* TN-540 standard    */
 #define SUPPLY_CONF_DIR    "/var/lib/hl5170dn-printer-app"
 #define SUPPLY_CONF_PATH   "/var/lib/hl5170dn-printer-app/supply-baselines.conf"
+#define CAPS_FP_PATH       "/var/lib/hl5170dn-printer-app/caps.fp"
 
 typedef struct {
     long toner_baseline;
@@ -1103,6 +1104,163 @@ static void write_conf(const supply_baselines_t *b)
             b->peak_rss_kb, b->peak_system_kb);
     fclose(f);
     rename(tmp, SUPPLY_CONF_PATH);
+}
+
+/* ---- Capability fingerprint -------------------------------------------
+ *
+ * Hash the IPP-advertised driver attributes that macOS uses to decide
+ * whether a printer needs a driver refresh. If the hash matches what was
+ * persisted on the last deploy, leave printer-config-change-date-time alone
+ * (PAPPL's load already restored the saved ConfigTime). If it differs,
+ * call papplPrinterSetConfigTime(now) so the next IPP query advances the
+ * attribute and macOS knows to refresh.
+ *
+ * Defence-in-depth against time leakage into the hash:
+ *   1. Iterate only the driver_attrs ipp_t (capability surface). Runtime
+ *      time-stamps (printer-up-time, printer-current-time, *-date-time,
+ *      printer-state-reasons) live in printer->attrs and are constructed
+ *      on the fly during IPP responses; they are never written here.
+ *   2. Filter to an explicit allowlist of "*-supported" attribute names.
+ *   3. Sort by attribute name before hashing — PAPPL does not guarantee
+ *      insertion order is stable across builds.
+ */
+
+static const char * const CAPS_ALLOWLIST[] = {
+    "document-format-supported",
+    "urf-supported",
+    "pwg-raster-document-resolution-supported",
+    "sides-supported",
+    "media-supported",
+    "print-color-mode-supported",
+    "printer-resolution-supported",
+    "print-quality-supported",
+    "identify-actions-supported",
+    "printer-make-and-model",
+};
+#define CAPS_ALLOWLIST_N (sizeof(CAPS_ALLOWLIST)/sizeof(CAPS_ALLOWLIST[0]))
+
+static int caps_name_cmp(const void *a, const void *b)
+{
+    const char *na = ippGetName(*(ipp_attribute_t * const *)a);
+    const char *nb = ippGetName(*(ipp_attribute_t * const *)b);
+    return strcmp(na ? na : "", nb ? nb : "");
+}
+
+static void compute_caps_fingerprint(pappl_printer_t *printer,
+                                     char out_hex[65])
+{
+    ipp_t *attrs = papplPrinterGetDriverAttributes(printer);
+    pappl_pr_driver_data_t data;
+    papplPrinterGetDriverData(printer, &data);
+
+    /* Collect allowlisted attrs into a fixed array, then sort by name. */
+    ipp_attribute_t *picked[CAPS_ALLOWLIST_N];
+    size_t npicked = 0;
+    for (size_t i = 0; i < CAPS_ALLOWLIST_N; i++) {
+        ipp_attribute_t *a = ippFindAttribute(attrs, CAPS_ALLOWLIST[i],
+                                              IPP_TAG_ZERO);
+        if (a)
+            picked[npicked++] = a;
+    }
+    qsort(picked, npicked, sizeof(picked[0]), caps_name_cmp);
+
+    /* Serialise. Use a stack buffer; the allowlist values fit easily. */
+    char buf[8192];
+    size_t off = 0;
+    for (size_t i = 0; i < npicked; i++) {
+        const char *name = ippGetName(picked[i]);
+        char valbuf[2048];
+        ippAttributeString(picked[i], valbuf, sizeof(valbuf));
+        int n = snprintf(buf + off, sizeof(buf) - off, "%s=%s\n",
+                         name ? name : "", valbuf);
+        if (n < 0 || (size_t)n >= sizeof(buf) - off)
+            break;
+        off += (size_t)n;
+    }
+
+    /* Driver-data scalars that drive DNS-SD TXT fields macOS reads. */
+    int n = snprintf(buf + off, sizeof(buf) - off,
+                     "color_supported=%u\nsides_supported=%u\nkind=%u\n",
+                     (unsigned)data.color_supported,
+                     (unsigned)data.sides_supported,
+                     (unsigned)data.kind);
+    if (n > 0 && (size_t)n < sizeof(buf) - off)
+        off += (size_t)n;
+
+    unsigned char sha[32];
+    cupsHashData("sha2-256", (unsigned char *)buf, off, sha, sizeof(sha));
+    for (int i = 0; i < 32; i++)
+        snprintf(out_hex + i * 2, 3, "%02x", sha[i]);
+    out_hex[64] = '\0';
+}
+
+static bool read_caps_fp(char out[65])
+{
+    FILE *f = fopen(CAPS_FP_PATH, "r");
+    if (!f)
+        return false;
+    size_t r = fread(out, 1, 64, f);
+    fclose(f);
+    if (r != 64)
+        return false;
+    out[64] = '\0';
+    /* Reject anything that isn't hex. */
+    for (int i = 0; i < 64; i++) {
+        char c = out[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+static void write_caps_fp(const char *hex)
+{
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", CAPS_FP_PATH);
+    mkdir(SUPPLY_CONF_DIR, 0755);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    fputs(hex, f);
+    fclose(f);
+    rename(tmp, CAPS_FP_PATH);
+}
+
+static bool caps_fingerprint_timer_cb(pappl_system_t *system, void *cb_data)
+{
+    pappl_printer_t *printer = cb_data;
+    char cur[65];
+    char prev[65] = {0};
+    bool have_prev = read_caps_fp(prev);
+
+    compute_caps_fingerprint(printer, cur);
+
+    if (have_prev && strcmp(cur, prev) == 0) {
+        papplLog(system, PAPPL_LOGLEVEL_INFO,
+                 "capabilities fingerprint %s — unchanged, "
+                 "preserving printer-config-change-date-time", cur);
+        return false;
+    }
+
+    papplLog(system, PAPPL_LOGLEVEL_INFO,
+             "capabilities fingerprint %s — changed (was %s), "
+             "bumping printer-config-change-date-time", cur,
+             prev[0] ? prev : "<none>");
+    papplPrinterSetConfigTime(printer, time(NULL));
+    write_caps_fp(cur);
+    return false;  /* one-shot */
+}
+
+/* Defer the check until after state load completes. printer_create_cb runs
+ * from inside papplPrinterCreate during _papplSystemLoadState, BEFORE the
+ * ConfigTime line in the state file is parsed — so a SetConfigTime call here
+ * would be clobbered by the subsequent load. A one-shot timer at t+2s fires
+ * once the main loop is running and the state file has been fully consumed. */
+void check_caps_fingerprint(pappl_printer_t *printer)
+{
+    pappl_system_t *system = papplPrinterGetSystem(printer);
+    papplSystemAddTimerCallback(system, time(NULL) + 2, 0,
+                                caps_fingerprint_timer_cb, printer);
 }
 
 /* Render a sysstat memory time-series table on the supplies page.

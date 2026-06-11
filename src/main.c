@@ -29,6 +29,7 @@ extern bool driver_cb(pappl_system_t *system, const char *driver_name,
 extern void register_pdf_filter(pappl_system_t *system);
 extern void register_supply_reset_route(pappl_system_t *system,
     pappl_printer_t *printer);
+extern void check_caps_fingerprint(pappl_printer_t *printer);
 
 /* File-scope so system_cb can reference it when registering drivers. */
 static pappl_pr_driver_t drivers[] = {
@@ -48,6 +49,8 @@ static void printer_create_cb(pappl_printer_t *printer, void *data)
 
     papplSystemAddResourceFile(system, "/navicon.png", "image/png",
                                "/usr/local/share/hl5170dn/icon-48.png");
+
+    check_caps_fingerprint(printer);
 }
 
 static pappl_system_t *system_cb(int num_options, cups_option_t *options,
