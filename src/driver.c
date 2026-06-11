@@ -2019,6 +2019,12 @@ static bool hl5170dn_web_supplies(pappl_client_t  *client,
 
     papplClientHTMLPuts(client, "          <div class=\"section\">\n");
 
+#ifdef GIT_HASH
+    papplClientHTMLPrintf(client,
+        "          <p style=\"font-size:0.85em;color:#555\">Build: "
+        "<code>%s</code></p>\n", GIT_HASH);
+#endif
+
     render_status_panel(client, &conf);
 
     if (conf.last_page_count >= 0)
